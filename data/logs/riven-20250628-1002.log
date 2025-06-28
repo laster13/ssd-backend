@@ -1,0 +1,5 @@
+25-06-28 10:02:22 | 🤖 PROGRAM   | program.start - SSDv2 v0.1.0 starting!
+25-06-28 10:02:22 | 📰 INFO      | program.initialize_services - Initialized services: ['health']
+25-06-28 10:02:22 | 🐞 DEBUG     | program._schedule_functions - Scheduled log_cleaner every 3600 seconds.
+25-06-28 10:02:22 | ✔️  SUCCESS   | program.start - SSDv2 est lance!
+25-06-28 10:02:22 | 📰 INFO      | main.<module> - SSD a bien demarre

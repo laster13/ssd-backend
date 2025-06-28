@@ -1,0 +1,29 @@
+[tool.poetry]
+name = "ssd-api-clean"
+version = "0.1.0"
+description = "Backend API épuré pour exécution de scripts et gestion JSON"
+authors = ["TonNom <ton.email@example.com>"]
+readme = "README.md"
+
+# Indique à Poetry que les modules sont dans src/
+packages = [{ include = "program", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.110.0"
+uvicorn = "^0.29.0"
+pydantic = "^2.6.0"
+aiofiles = "^23.2.1"
+loguru = "^0.7.3"
+python-dotenv = "^1.0.1"
+scalar-fastapi = "^1.0.3"
+kink = "^0.8.1"
+sse-starlette = "^2.3.6"
+apscheduler = "^3.11.0"
+rich = "^14.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+

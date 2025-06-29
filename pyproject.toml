@@ -2,7 +2,7 @@
 name = "ssd-api-clean"
 version = "0.1.0"
 description = "Backend API épuré pour exécution de scripts et gestion JSON"
-authors = ["laster13]
+authors = ["laster13"]
 readme = "README.md"
 packages = [{ include = "program", from = "src" }]
 

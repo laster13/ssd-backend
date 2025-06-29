@@ -16,7 +16,7 @@ class Observable(BaseModel):
             self.__class__._notify_observers()
 
 
-# Modèle utilisateur
+# ModÃ¨le utilisateur
 class UtilisateurModel(Observable):
     username: str = ""
     email: str = ""

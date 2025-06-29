@@ -17,7 +17,7 @@ class DummyService:
     def __init__(self, key: str):
         self.key = key
         self.initialized = True
-        self.services = {}  # sous-services éventuels
+        self.services = {}  # sous-services Ã©ventuels
 
 
 class Program(threading.Thread):

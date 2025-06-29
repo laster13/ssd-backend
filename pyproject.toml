@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "ssd-api-clean"
 version = "0.1.0"
-description = "Backend API épuré pour exécution de scripts et gestion JSON"
+description = "Backend API Ã©purÃ© pour exÃ©cution de scripts et gestion JSON"
 authors = ["laster13]
 readme = "README.md"
 packages = [{ include = "program", from = "src" }]

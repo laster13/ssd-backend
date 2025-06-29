@@ -72,7 +72,7 @@ class Program(threading.Thread):
         self.scheduler.start()
         super().start()
 
-        logger.success("SSDv2 est lance!")
+        logger.success("SSDv2 est bien lancé!")
         self.initialized = True
 
     def _schedule_functions(self):
@@ -104,4 +104,4 @@ class Program(threading.Thread):
 
         if hasattr(self, "scheduler") and self.scheduler.running:
             self.scheduler.shutdown(wait=False)
-        logger.log("PROGRAM", "SSDv2 est stoppe")
+        logger.log("PROGRAM", "SSDv2 est stoppé")

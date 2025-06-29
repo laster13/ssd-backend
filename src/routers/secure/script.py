@@ -17,7 +17,7 @@ USER = os.getenv("USER") or os.getlogin()
 SCRIPTS_DIR = f"/home/{USER}/projet-ssd/ssd-frontend/scripts"
 YAML_PATH = f"/home/{USER}/.ansible/inventories/group_vars/all.yml"
 VAULT_PASSWORD_FILE = f"/home/{USER}/.vault_pass"
-BACKEND_JSON_PATH = f"/home/{USER}/projet-ssd/ssd/data/settings.json"
+BACKEND_JSON_PATH = f"/home/{USER}/projet-ssd/ssd-backend/data/settings.json"
 FRONTEND_JSON_PATH = f"/home/{USER}/projet-ssd/ssd-frontend/static/settings.json"
 
 # Chargement initial des données JSON

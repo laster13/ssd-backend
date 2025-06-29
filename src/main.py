@@ -36,4 +36,4 @@ app.program.start()
 # Inclusion des routes FastAPI
 app.include_router(app_router)
 
-logger.info("SSD a bien demarre")
+logger.info("SSD a bien demarré")

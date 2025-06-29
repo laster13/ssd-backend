@@ -10,7 +10,7 @@ from routers import app_router
 load_dotenv()
 
 app = FastAPI(
-    title="Riven",
+    title="SSD",
     summary="A media management system.",
     version=get_version(),
     redoc_url=None,

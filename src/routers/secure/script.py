@@ -1,3 +1,4 @@
+
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
@@ -123,4 +124,22 @@ async def update_config():
         # Log de l'erreur pour analyse
         print(f"Erreur lors de la mise à jour : {str(e)}")
         raise HTTPException(status_code=500, detail=f"Erreur lors de la mise à jour : {str(e)}")
+
+@router.get("/domains")
+async def get_domains():
+    try:
+        data = load_json_from_file(BACKEND_JSON_PATH)
+
+        if "utilisateur" not in data or "domain" not in data["utilisateur"]:
+            raise HTTPException(status_code=500, detail="'utilisateur.domain' manquant")
+        if "dossiers" not in data or "domaine" not in data["dossiers"]:
+            raise HTTPException(status_code=500, detail="'dossiers.domaine' manquant")
+
+        base_domain = data["utilisateur"]["domain"]
+        app_domains = data["dossiers"]["domaine"]
+
+        return {app: f"{sub}.{base_domain}" for app, sub in app_domains.items()}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lecture JSON : {str(e)}")
 

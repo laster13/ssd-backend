@@ -15,6 +15,12 @@ class Observable(BaseModel):
         if self.__class__._notify_observers:
             self.__class__._notify_observers()
 
+# Modèle mediaserver
+class PlexModel(Observable):
+    token: str = ""
+    login: str = ""
+    password: str = ""
+    enabled: bool = False
 
 # Modèle utilisateur
 class UtilisateurModel(Observable):
@@ -54,6 +60,7 @@ class AppModel(Observable):
     cloudflare: CloudflareModel = CloudflareModel()
     dossiers: DossierModel = DossierModel()
     applications: List[ApplicationModel] = []
+    plex: PlexModel = PlexModel()
 
     def __init__(self, **data: Any):
         super().__init__(**data)

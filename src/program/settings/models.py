@@ -15,12 +15,20 @@ class Observable(BaseModel):
         if self.__class__._notify_observers:
             self.__class__._notify_observers()
 
-# Modèle mediaserver
+# Modèle Plex
 class PlexModel(Observable):
     token: str = ""
     login: str = ""
     password: str = ""
     enabled: bool = False
+
+class JellyfinModel(Observable):
+    enabled: bool = False
+    api_key: str = ""
+
+class EmbyModel(Observable):
+    enabled: bool = False
+    api_key: str = ""
 
 # Modèle utilisateur
 class UtilisateurModel(Observable):
@@ -61,6 +69,8 @@ class AppModel(Observable):
     dossiers: DossierModel = DossierModel()
     applications: List[ApplicationModel] = []
     plex: PlexModel = PlexModel()
+    jellyfin: JellyfinModel = JellyfinModel()
+    emby: EmbyModel = EmbyModel()
 
     def __init__(self, **data: Any):
         super().__init__(**data)

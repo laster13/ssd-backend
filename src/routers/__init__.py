@@ -6,6 +6,10 @@ from program.settings.manager import settings_manager
 from routers.secure.default import router as default_router
 from routers.secure.settings import router as settings_router
 from routers.secure.script import router as script_router
+from routers.secure.backup import router as backup_router
+from routers.secure.docker import router as docker_router
+
+
 from routers.models.shared import RootResponse
 
 API_VERSION = "v1"
@@ -21,3 +25,6 @@ async def root(_: Request) -> RootResponse:
 app_router.include_router(default_router)
 app_router.include_router(settings_router)
 app_router.include_router(script_router)
+app_router.include_router(backup_router)
+app_router.include_router(docker_router)
+

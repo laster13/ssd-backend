@@ -24,7 +24,7 @@ def setup_logger(level):
     logs_dir_path = data_dir_path / "logs"
     os.makedirs(logs_dir_path, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M")
-    log_filename = logs_dir_path / f"riven-{timestamp}.log"
+    log_filename = logs_dir_path / f"ssd-{timestamp}.log"
 
     # Helper function to get log settings from environment or use default
     def get_log_settings(name, default_color, default_icon):
@@ -106,7 +106,7 @@ def log_cleaner():
     cleaned = False
     try:
         logs_dir_path = data_dir_path / "logs"
-        for log_file in logs_dir_path.glob("riven-*.log"):
+        for log_file in logs_dir_path.glob("ssd-*.log"):
             # remove files older than 8 hours
             if (datetime.now() - datetime.fromtimestamp(log_file.stat().st_mtime)).total_seconds() / 3600 > 8:
                 log_file.unlink()

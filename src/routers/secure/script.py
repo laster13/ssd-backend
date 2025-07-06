@@ -11,6 +11,7 @@ from program.settings.manager import settings_manager
 from sse_starlette.sse import EventSourceResponse
 import time
 import asyncio
+import docker
 
 
 USER = os.getenv("USER") or os.getlogin()
@@ -142,4 +143,18 @@ async def get_domains():
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur lecture JSON : {str(e)}")
+
+@router.get("/rdtclient-status", tags=["Status"])
+async def rdtclient_status():
+    try:
+        client = docker.from_env()
+        container = client.containers.get("rdtclient")  # nom du conteneur Docker
+        status = container.status  # "running", "exited", etc.
+    except docker.errors.NotFound:
+        status = "not_found"
+    except Exception as e:
+        status = f"error: {str(e)}"
+
+    return {"service": "rdtclient", "status": status}
+
 

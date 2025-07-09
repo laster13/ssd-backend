@@ -94,7 +94,7 @@ def get_folders():
     return scan_folders()
 
 # 📄 GET /docker : lire les horaires planifiés
-@router.get("/")
+@router.get("")
 def get_schedules():
     return load_config()
 

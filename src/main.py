@@ -1,11 +1,12 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from loguru import logger
 from dotenv import load_dotenv
+from loguru import logger
 
 from program import Program
 from program.settings.models import get_version
 from routers import app_router
+from program.file_watcher import start_all_watchers
 
 load_dotenv()
 
@@ -20,20 +21,24 @@ app = FastAPI(
     },
 )
 
-# Middleware CORS
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=".*",
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialisation du programme principal
+# Programme principal
 app.program = Program()
 app.program.start()
 
-# Inclusion des routes FastAPI
+@app.on_event("startup")
+def launch_watchers():
+    start_all_watchers()
+
+# Inclusion des routes sans préfixe
 app.include_router(app_router)
 
-logger.info("SSD a bien demarré")
+logger.info("SSD a bien démarré")

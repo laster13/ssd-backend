@@ -88,7 +88,7 @@ def startup_event():
 async def get_media_folders():
     return scan_folders()
 
-
+@router.get("")
 @router.get("/")
 async def get_schedules():
     return load_config()

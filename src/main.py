@@ -1,7 +1,33 @@
-from fastapi import FastAPI, Request
+import os
+import sys
+
+# 🔽 Ajoute ça immédiatement après les imports système
+os.environ["FORCE_COLOR"] = "1"
+os.environ["PYTHONUNBUFFERED"] = "1"
+
+import logging
+from loguru import logger
+
+# Intercepteur pour basculer logging → loguru
+class InterceptHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelname
+        logger.log(level, record.getMessage())
+
+# Active loguru pour tous les logs standards
+logging.basicConfig(handlers=[InterceptHandler()], level=0)
+for name in ["uvicorn", "uvicorn.error", "uvicorn.access"]:
+    logging.getLogger(name).handlers = [InterceptHandler()]
+
+# ⛔ Supprime les logs DEBUG de watchdog
+logging.getLogger("watchdog").setLevel(logging.WARNING)
+
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-from loguru import logger
 
 from program import Program
 from program.settings.models import get_version
@@ -38,7 +64,7 @@ app.program.start()
 def launch_watchers():
     start_all_watchers()
 
-# Inclusion des routes sans préfixe
+# Inclusion des routes
 app.include_router(app_router)
 
 logger.info("SSD a bien démarré")

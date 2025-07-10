@@ -61,7 +61,7 @@ def setup_logger(level):
 
     # Default log levels
     debug_color, debug_icon = get_log_settings("DEBUG", "98C1D9", "🐞")
-    info_color, info_icon = get_log_settings("INFO", "818589", "📰")
+    info_color, info_icon = get_log_settings("INFO", "1ABC9C", "📰")
     warning_color, warning_icon = get_log_settings("WARNING", "ffcc00", "⚠️ ")
     critical_color, critical_icon = get_log_settings("CRITICAL", "ff0000", "")
     success_color, success_icon = get_log_settings("SUCCESS", "00ff00", "✔️ ")
@@ -74,7 +74,7 @@ def setup_logger(level):
 
     # Log format to match the old log format, but with color
     log_format = (
-        "<fg #818589>{time:YY-MM-DD} {time:HH:mm:ss}</fg #818589> | "
+        "<fg #818589>{time:DD-MM-YYYY HH:mm:ss}</fg #818589> | "
         "<level>{level.icon}</level> <level>{level: <9}</level> | "
         "<fg #990066>{module}</fg #990066>.<fg #990066>{function}</fg #990066> - <level>{message}</level>"
     )
@@ -87,6 +87,7 @@ def setup_logger(level):
             "backtrace": False,
             "diagnose": False,
             "enqueue": True,
+            "colorize": True,
         },
         {
             "sink": log_filename,

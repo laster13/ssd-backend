@@ -5,30 +5,34 @@ from pathlib import Path
 from datetime import datetime
 import shutil
 import json
-import os
 import getpass
-from pathlib import Path
 
+from loguru import logger
 
 router = APIRouter(prefix="/media-backups", tags=["MediaBackups"])
 scheduler = AsyncIOScheduler()
 
 USER = getpass.getuser()
-
 MEDIAS_PATH = Path(f"/home/{USER}/Medias")
 SETTINGS_FILE = Path("data/backup.json")
 BACKUP_ROOT = Path(f"/home/{USER}/Backups")
 
 
 def scan_folders():
+    if not MEDIAS_PATH.exists():
+        logger.warning(f"Le dossier {MEDIAS_PATH} est introuvable.")
+        return []
     return [f.name for f in MEDIAS_PATH.iterdir() if f.is_dir()]
 
 
 def load_config():
     if SETTINGS_FILE.exists():
-        with open(SETTINGS_FILE) as f:
-            settings = json.load(f)
-            return settings.get("schedules", {})
+        try:
+            with open(SETTINGS_FILE) as f:
+                settings = json.load(f)
+                return settings.get("schedules", {})
+        except json.JSONDecodeError:
+            logger.error("Fichier JSON invalide : data/backup.json")
     return {}
 
 
@@ -36,36 +40,43 @@ def save_config(schedules):
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     settings = {}
     if SETTINGS_FILE.exists():
-        with open(SETTINGS_FILE) as f:
-            settings = json.load(f)
+        try:
+            with open(SETTINGS_FILE) as f:
+                settings = json.load(f)
+        except json.JSONDecodeError:
+            logger.warning("Fichier JSON corrompu, il sera réinitialisé.")
 
     settings["schedules"] = schedules
 
     with open(SETTINGS_FILE, "w") as f:
         json.dump(settings, f, indent=2)
+    logger.success("Configuration des sauvegardes enregistrée.")
 
 
 def run_backup(subfolder):
     source = MEDIAS_PATH / subfolder
     if not source.exists():
-        print(f"[⚠] Dossier introuvable: {source}")
+        logger.warning(f"Dossier introuvable : {source}")
         return
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     dest_dir = BACKUP_ROOT / subfolder
     dest_dir.mkdir(parents=True, exist_ok=True)
-    archive_path = dest_dir / f"{subfolder}_{ts}.tar.gz"
+    archive_path = dest_dir / f"{subfolder}_{timestamp}.tar.gz"
+
     shutil.make_archive(str(archive_path).replace(".tar.gz", ""), 'gztar', str(source))
-    print(f"[✔] Backup de {subfolder} créée → {archive_path}")
+    logger.success(f"Backup de {subfolder} créée → {archive_path}")
 
 
 def schedule_all():
     scheduler.remove_all_jobs()
     config = load_config()
+
     for name, sched in config.items():
         if isinstance(sched, dict):
             day = sched.get("day")
             hour = sched.get("hour")
+
             if day is not None and hour is not None:
                 def create_job(folder=name):
                     return lambda: run_backup(folder)
@@ -75,6 +86,7 @@ def schedule_all():
                     CronTrigger(day_of_week=day, hour=hour),
                     id=name
                 )
+                logger.debug(f"Tâche planifiée : {name} ({day=}, {hour=})")
 
 
 @router.on_event("startup")
@@ -82,11 +94,13 @@ def startup_event():
     schedule_all()
     if not scheduler.running:
         scheduler.start()
+        logger.info("Planificateur (scheduler) démarré")
 
 
 @router.get("/scan")
 async def get_media_folders():
     return scan_folders()
+
 
 @router.get("")
 @router.get("/")

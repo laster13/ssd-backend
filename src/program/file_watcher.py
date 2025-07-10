@@ -5,10 +5,11 @@ import subprocess
 import json
 import asyncio
 from pathlib import Path
+from loguru import logger
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from program.managers.sse_manager import sse_manager
 
+from program.managers.sse_manager import sse_manager
 from .json_manager import update_json_files
 from routers.secure.symlinks import scan_symlinks, symlink_store, load_config
 
@@ -29,24 +30,23 @@ class YAMLFileEventHandler(FileSystemEventHandler):
                     if "input is not vault encrypted data" in result.stderr:
                         return
                     else:
-                        print(f"[Watcher] Erreur ansible-vault : {result.stderr}")
+                        logger.error(f"🔐 Erreur ansible-vault : {result.stderr}")
                         return
 
                 decrypted_yaml_content = result.stdout
                 update_json_files(decrypted_yaml_content)
-                print("[Watcher] YAML mis à jour avec succès")
+                logger.success("📘 YAML mis à jour avec succès")
 
             except Exception as e:
-                print(f"[Watcher] Exception YAML: {e}")
+                logger.exception(f"💥 Exception YAML: {e}")
 
 
 def start_yaml_watcher():
-    print("[Watcher] YAML watcher started")
+    logger.info("🛰️ YAML watcher démarré")
     observer = Observer()
     observer.schedule(YAMLFileEventHandler(), path=os.path.dirname(YAML_PATH), recursive=False)
-    print(f"[Watcher] Surveillance active sur : {YAML_PATH}")
+    logger.info(f"📍 Surveillance active sur : {YAML_PATH}")
     observer.start()
-    print(f"[Watcher] YAML watcher démarré sur {YAML_PATH}")
 
     try:
         while True:
@@ -67,7 +67,7 @@ class SymlinkEventHandler(FileSystemEventHandler):
         if event.is_directory:
             return
 
-        print(f"[Watcher] Événement détecté : {event.event_type} -> {event.src_path}")
+        logger.debug(f"📂 Événement détecté : {event.event_type} -> {event.src_path}")
         self._debounce_refresh()
 
     def _debounce_refresh(self, delay=2):
@@ -83,41 +83,40 @@ class SymlinkEventHandler(FileSystemEventHandler):
             symlink_store.clear()
             symlink_store.extend(symlinks_data)
 
-            print(f"[Watcher] symlink_store mis à jour ({len(symlinks_data)} symlinks)")
-
+            logger.success(f"🔗 symlink_store mis à jour ({len(symlinks_data)} symlinks)")
             sse_manager.publish_event("symlink_update", json.dumps({"count": len(symlinks_data)}))
 
         except Exception as e:
-            print(f"[Watcher] Erreur dans le watcher symlinks : {e}")
+            logger.exception(f"💥 Erreur dans le watcher symlinks : {e}")
 
 
 def start_symlink_watcher():
-    print("[Watcher] Symlink watcher started")
+    logger.info("🛰️ Symlink watcher démarré")
     try:
         config = load_config()
         links_dir = Path(config["links_dir"])
         if not links_dir.exists():
-            print(f"[Watcher] Dossier symlink introuvable : {links_dir}")
+            logger.warning(f"⚠️ Dossier symlink introuvable : {links_dir}")
             return
 
         observer = Observer()
         observer.schedule(SymlinkEventHandler(), path=str(links_dir), recursive=False)
         observer.start()
-        print(f"[Watcher] Symlink watcher actif sur {links_dir.resolve()}")
+        logger.info(f"📍 Symlink watcher actif sur {links_dir.resolve()}")
 
         while True:
-            print("[Watcher] Symlink thread actif...")
+            logger.debug("📡 Symlink thread actif...")
             time.sleep(30)
 
     except KeyboardInterrupt:
         observer.stop()
     except Exception as e:
-        print(f"[Watcher] Erreur lors du démarrage du watcher symlink : {e}")
+        logger.exception(f"💥 Erreur lors du démarrage du watcher symlink : {e}")
     observer.join()
 
 # --- Lancer les deux watchers dans des threads ---
 
 def start_all_watchers():
-    print("[Watcher] Lancement des watchers...")
+    logger.info("🚀 Lancement des watchers YAML + Symlink...")
     threading.Thread(target=start_yaml_watcher, daemon=True).start()
     threading.Thread(target=start_symlink_watcher, daemon=True).start()

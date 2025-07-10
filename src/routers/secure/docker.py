@@ -6,10 +6,10 @@ from datetime import datetime
 import shutil
 import json
 import getpass
-from pathlib import Path
+
+from loguru import logger
 
 USER = getpass.getuser()
-
 
 router = APIRouter(prefix="/docker", tags=["DockerBackups"])
 scheduler = AsyncIOScheduler()
@@ -18,20 +18,26 @@ DOCKER_CONFIGS_PATH = Path(f"/home/{USER}/seedbox/docker/{USER}")
 SETTINGS_FILE = Path("data/backup.json")
 BACKUP_ROOT = Path(f"/home/{USER}/Backups")
 
+
 # 🔍 Scanner les répertoires Docker (containers)
 def scan_folders():
+    if not DOCKER_CONFIGS_PATH.exists():
+        logger.warning(f"Dossier introuvable : {DOCKER_CONFIGS_PATH}")
+        return []
     return [f.name for f in DOCKER_CONFIGS_PATH.iterdir() if f.is_dir()]
+
 
 # 🔄 Charger les planifications Docker
 def load_config():
     if SETTINGS_FILE.exists():
-        with open(SETTINGS_FILE) as f:
-            try:
+        try:
+            with open(SETTINGS_FILE) as f:
                 settings = json.load(f)
                 return settings.get("docker_schedules", {})
-            except json.JSONDecodeError:
-                return {}
+        except json.JSONDecodeError:
+            logger.error("Fichier JSON invalide : data/backup.json")
     return {}
+
 
 # 💾 Sauvegarder les planifications Docker
 def save_config(docker_schedules):
@@ -39,36 +45,40 @@ def save_config(docker_schedules):
     settings = {}
 
     if SETTINGS_FILE.exists():
-        with open(SETTINGS_FILE) as f:
-            try:
+        try:
+            with open(SETTINGS_FILE) as f:
                 settings = json.load(f)
-            except json.JSONDecodeError:
-                settings = {}
+        except json.JSONDecodeError:
+            logger.warning("Fichier JSON corrompu, réinitialisation.")
 
     settings["docker_schedules"] = docker_schedules
 
     with open(SETTINGS_FILE, "w") as f:
         json.dump(settings, f, indent=2)
+    logger.success("Planification Docker sauvegardée.")
+
 
 # ⚙️ Exécuter une sauvegarde immédiate
 def run_backup(name):
     source = DOCKER_CONFIGS_PATH / name
     if not source.exists():
-        print(f"[⚠] Dossier Docker introuvable: {source}")
+        logger.warning(f"Dossier Docker introuvable : {source}")
         return
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     dest_dir = BACKUP_ROOT / "docker" / name
     dest_dir.mkdir(parents=True, exist_ok=True)
-    backup_path = dest_dir / f"{name}_{timestamp}.tar.gz"
+    archive_path = dest_dir / f"{name}_{timestamp}.tar.gz"
 
-    shutil.make_archive(str(backup_path).replace(".tar.gz", ""), 'gztar', str(source))
-    print(f"[✔] Sauvegarde créée pour {name} → {backup_path}")
+    shutil.make_archive(str(archive_path).replace(".tar.gz", ""), 'gztar', str(source))
+    logger.success(f"Sauvegarde créée pour {name} → {archive_path}")
+
 
 # ⏰ Programmer toutes les sauvegardes planifiées
 def schedule_all():
     scheduler.remove_all_jobs()
     config = load_config()
+
     for name, sched in config.items():
         if isinstance(sched, dict):
             day = sched.get("day")
@@ -76,27 +86,34 @@ def schedule_all():
             if day is not None and hour is not None:
                 def job(name=name):
                     return lambda: run_backup(name)
+
                 scheduler.add_job(
                     job(),
                     CronTrigger(day_of_week=day, hour=hour),
                     id=f"docker_{name}"
                 )
+                logger.debug(f"Tâche Docker planifiée : {name} ({day=}, {hour=})")
+
 
 @router.on_event("startup")
 def on_startup():
     schedule_all()
     if not scheduler.running:
         scheduler.start()
+        logger.info("Scheduler Docker démarré.")
+
 
 # 🔍 GET /docker/scan : liste des containers
 @router.get("/scan")
 def get_folders():
     return scan_folders()
 
+
 # 📄 GET /docker : lire les horaires planifiés
 @router.get("")
 def get_schedules():
     return load_config()
+
 
 # 💾 POST /docker/schedule : enregistrer une planification
 @router.post("/schedule")
@@ -114,6 +131,7 @@ def save_schedule(data: dict):
     schedule_all()
     return {"message": f"Sauvegarde planifiée pour {name}"}
 
+
 # ▶️ POST /docker/run : lancer une sauvegarde immédiate
 @router.post("/run")
 def run_now(data: dict):
@@ -122,6 +140,7 @@ def run_now(data: dict):
         raise HTTPException(status_code=404, detail="Dossier Docker introuvable")
     run_backup(name)
     return {"message": f"Sauvegarde lancée pour {name}"}
+
 
 # ❌ DELETE /docker/schedule/{name} : supprimer une planification
 @router.delete("/schedule/{name}")
@@ -134,4 +153,3 @@ def delete_schedule(name: str):
     save_config(config)
     schedule_all()
     return {"message": f"Planification supprimée pour {name}"}
-

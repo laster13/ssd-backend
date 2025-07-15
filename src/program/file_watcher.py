@@ -94,25 +94,39 @@ def start_symlink_watcher():
     logger.info("🛰️ Symlink watcher démarré")
     try:
         config = load_config()
-        links_dir = Path(config["links_dir"])
-        if not links_dir.exists():
-            logger.warning(f"⚠️ Dossier symlink introuvable : {links_dir}")
+        links_dirs = config.get("links_dirs", [])
+
+        if not links_dirs:
+            logger.warning("⚠️ Aucun répertoire dans 'links_dirs'")
             return
 
-        observer = Observer()
-        observer.schedule(SymlinkEventHandler(), path=str(links_dir), recursive=False)
-        observer.start()
-        logger.info(f"📍 Symlink watcher actif sur {links_dir.resolve()}")
+        observers = []
+
+        for dir_path in links_dirs:
+            path = Path(dir_path)
+            if not path.exists():
+                logger.warning(f"⚠️ Dossier symlink introuvable : {path}")
+                continue
+
+            observer = Observer()
+            observer.schedule(SymlinkEventHandler(), path=str(path), recursive=True)
+            observer.start()
+            observers.append(observer)
+
+            logger.info(f"📍 Symlink watcher actif sur {path.resolve()}")
 
         while True:
             logger.debug("📡 Symlink thread actif...")
             time.sleep(30)
 
     except KeyboardInterrupt:
-        observer.stop()
+        for obs in observers:
+            obs.stop()
     except Exception as e:
         logger.exception(f"💥 Erreur lors du démarrage du watcher symlink : {e}")
-    observer.join()
+
+    for obs in observers:
+        obs.join()
 
 # --- Lancer les deux watchers dans des threads ---
 

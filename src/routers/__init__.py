@@ -9,7 +9,6 @@ from routers.secure.script import router as script_router
 from routers.secure.backup import router as backup_router
 from routers.secure.docker import router as docker_router
 from routers.secure.symlinks import router as symlinks_router
-from routers.secure.arrs import router as arrs_router
 
 
 
@@ -31,4 +30,3 @@ app_router.include_router(script_router)
 app_router.include_router(backup_router)
 app_router.include_router(docker_router)
 app_router.include_router(symlinks_router)
-app_router.include_router(arrs_router)

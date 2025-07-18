@@ -132,7 +132,6 @@ def create_progress_bar(total_items: int) -> tuple[Progress, Console]:
     )
     return progress, console
 
-
 console = Console()
 log_level = "DEBUG" if settings_manager.settings.debug else "INFO"
 setup_logger(log_level)

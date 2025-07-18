@@ -183,3 +183,62 @@ class SonarrService:
             logger.error(f"❌ Erreur lors du POST SeriesSearch : {e}")
             raise
 
+
+
+    def get_missing_seasons(self, series_id: int) -> list[int]:
+        """
+        Retourne la liste des numéros de saisons où il manque au moins un épisode pour une série donnée.
+        """
+        try:
+            response = requests.get(
+                f"{self.base_url}/episode?seriesId={series_id}",
+                headers=self.headers
+            )
+            response.raise_for_status()
+            episodes = response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ Erreur lors du GET /episode : {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+        # Filtrer les épisodes manquants
+        missing_episodes = [ep for ep in episodes if not ep.get("hasFile", True)]
+
+        # Extraire les numéros de saison uniques
+        missing_seasons = sorted(set(ep["seasonNumber"] for ep in missing_episodes))
+
+        logger.debug(f"📌 Saisons manquantes pour série {series_id} : {missing_seasons}")
+        return missing_seasons
+
+    def get_all_series_with_missing_seasons(self) -> list[dict]:
+        """
+        Retourne une liste de séries qui ont au moins une saison avec des épisodes manquants.
+        Chaque entrée contient : id, title, missing_seasons
+        """
+        try:
+            response = requests.get(f"{self.base_url}/series", headers=self.headers)
+            response.raise_for_status()
+            all_series = response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ Erreur lors du GET /series : {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+        result = []
+        for series in all_series:
+            series_id = series.get("id")
+            title = series.get("title")
+
+            try:
+                missing_seasons = self.get_missing_seasons(series_id)
+            except Exception as e:
+                logger.warning(f"⚠️ Impossible d'analyser la série {title} (ID={series_id}) : {e}")
+                continue
+
+            if missing_seasons:
+                result.append({
+                    "id": series_id,
+                    "title": title,
+                    "missing_seasons": missing_seasons
+                })
+
+        logger.info(f"📊 Séries avec saisons manquantes : {len(result)} trouvées")
+        return result

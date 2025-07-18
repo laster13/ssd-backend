@@ -67,7 +67,7 @@ class SymlinkEventHandler(FileSystemEventHandler):
         if event.is_directory:
             return
 
-        logger.debug(f"📂 Événement détecté : {event.event_type} -> {event.src_path}")
+        logger.success(f"📂 Événement détecté : {event.event_type} -> {event.src_path}")
         self._debounce_refresh()
 
     def _debounce_refresh(self, delay=2):

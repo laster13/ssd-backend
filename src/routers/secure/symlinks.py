@@ -15,6 +15,7 @@ from fastapi import status
 import asyncio
 import httpx
 
+sonarr = SonarrService()
 
 router = APIRouter(prefix="/symlinks", tags=["Symlinks"])
 
@@ -127,13 +128,14 @@ def list_symlinks(
     order: Optional[str] = "asc",
     orphans: Optional[bool] = False,
     folder: Optional[str] = None,
+    all: bool = False  # ⬅️ ajout
 ):
     if not symlink_store:
         raise HTTPException(status_code=503, detail="Cache vide, lancez un scan d'abord.")
 
-    items = symlink_store.copy()  # ✅ initialise d'abord items
+    items = symlink_store.copy()
 
-    # 🔽 Puis applique le filtre folder s’il est là
+    # 🔽 Filtre par dossier
     if folder:
         try:
             config = load_config()
@@ -146,7 +148,7 @@ def list_symlinks(
             logger.error(f"Erreur filtre folder={folder} : {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Erreur dossier {folder}")
 
-    # 🧠 Ensuite seulement : autres filtres (search, orphans, tri, etc.)
+    # 🔍 Filtres search et orphelins
     if search:
         search_lower = search.lower()
         items = [i for i in items if search_lower in i["symlink"].lower() or search_lower in i["target"].lower()]
@@ -159,9 +161,13 @@ def list_symlinks(
         items.sort(key=lambda x: x[sort], reverse=reverse)
 
     total = len(items)
-    start = (page - 1) * limit
-    end = start + limit
-    paginated = items[start:end]
+
+    if not all:
+        start = (page - 1) * limit
+        end = start + limit
+        paginated = items[start:end]
+    else:
+        paginated = items  # ⬅️ ignore pagination si all=True
 
     logger.info(f"✅ Renvoi du cache mémoire — page {page} ({len(paginated)} éléments)")
 
@@ -499,7 +505,7 @@ async def delete_symlink_sonarr(
         logger.debug(f"🔄 Rafraîchissement de la série ID={series_id}")
         sonarr.refresh_series(series_id)
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(5)
 
         logger.debug(f"🔍 Lancement de la recherche manuelle pour ID={series_id}")
         sonarr.search_missing_episodes(series_id)
@@ -587,7 +593,7 @@ async def delete_sonarr_season(
 
         # Rafraîchissement + recherche
         sonarr.refresh_series(series_id)
-        await asyncio.sleep(5)
+        await asyncio.sleep(2)
         sonarr.search_missing_episodes(series_id)
 
         logger.info(f"✅ Rafraîchissement et recherche lancés pour {cleaned_series}")
@@ -707,3 +713,88 @@ async def delete_broken_sonarr_symlinks(
         "errors": errors
     }
 
+@router.post("/repair-missing-seasons")
+async def repair_missing_seasons(
+    folder: Optional[str] = None,
+    sonarr: SonarrService = Depends(SonarrService)
+):
+    logger.info("🛠️ Réparation des saisons manquantes demandée")
+
+    if not symlink_store:
+        raise HTTPException(status_code=503, detail="Cache vide, lancez un scan d'abord.")
+
+    config = load_config()
+    base_links_dir = Path(config.get("links_dirs", ["/"])[0]).resolve()
+
+    # Filtrage par dossier (si fourni)
+    if folder:
+        folder_path = (base_links_dir / folder).resolve()
+        items = [i for i in symlink_store if i["symlink"].startswith(str(folder_path))]
+    else:
+        items = symlink_store.copy()
+
+    deleted_count = 0
+    errors = []
+
+    try:
+        missing_list = sonarr.get_all_series_with_missing_seasons()
+    except Exception as e:
+        logger.error(f"❌ Erreur récupération séries : {e}")
+        raise HTTPException(status_code=500, detail="Erreur récupération des séries avec saisons manquantes")
+
+    for entry in missing_list:
+        series_id = entry["id"]
+        series_title = entry["title"]
+        missing_seasons = entry["missing_seasons"]
+
+        logger.info(f"📺 Série '{series_title}' - Saisons manquantes : {missing_seasons}")
+
+        # 🔍 Trouve les symlinks liés à cette série
+        matching_items = [i for i in items if series_title.lower() in i["symlink"].lower()]
+        if not matching_items:
+            logger.warning(f"⚠️ Aucun symlink trouvé pour : {series_title}")
+            continue
+
+        for season_num in missing_seasons:
+            pattern = f"S{season_num:02}"  # S01, S02, ...
+            filtered_symlinks = [
+                i for i in matching_items if pattern.lower() in i["symlink"].lower()
+            ]
+
+            for item in filtered_symlinks:
+                symlink_path = Path(item["symlink"])
+
+                if not str(symlink_path).startswith(str(base_links_dir)):
+                    logger.warning(f"⛔ Chemin interdit (hors links_dir) : {symlink_path}")
+                    continue
+
+                try:
+                    if symlink_path.exists() and symlink_path.is_symlink():
+                        symlink_path.unlink()
+                        logger.success(f"🗑️ Symlink supprimé avec succès : {symlink_path}")
+                        deleted_count += 1
+                except Exception as e:
+                    logger.warning(f"⚠️ Erreur suppression symlink {symlink_path}: {e}")
+                    errors.append(str(symlink_path))
+
+            # 🛰️ Appel API interne pour relancer la recherche manuelle sur la saison
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    resp = await client.post(
+                        "http://localhost:8080/api/v1/symlinks/delete-sonarr-season",
+                        params={"series_name": series_title, "season_number": season_num}
+                    )
+                    if resp.status_code != 200:
+                        logger.warning(f"❌ Appel delete-sonarr-season échoué : {resp.text}")
+                        errors.append(f"{series_title} - S{season_num:02}")
+            except Exception as e:
+                logger.error(f"❌ Erreur HTTPX : {e}")
+                errors.append(f"{series_title} - S{season_num:02}")
+
+    sse_manager.publish_event("symlink_update", json.dumps({"event": "refreshed"}))
+
+    return {
+        "message": "Saisons manquantes traitées",
+        "symlinks_deleted": deleted_count,
+        "errors": errors
+    }

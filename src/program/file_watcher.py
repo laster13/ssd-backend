@@ -67,7 +67,7 @@ class SymlinkEventHandler(FileSystemEventHandler):
         if event.is_directory:
             return
 
-        logger.success(f"📂 Événement détecté : {event.event_type} -> {event.src_path}")
+        logger.debug(f"📂 Événement détecté : {event.event_type} -> {event.src_path}")
         self._debounce_refresh()
 
     def _debounce_refresh(self, delay=2):
@@ -84,6 +84,7 @@ class SymlinkEventHandler(FileSystemEventHandler):
             symlink_store.extend(symlinks_data)
 
             logger.success(f"🔗 symlink_store mis à jour ({len(symlinks_data)} symlinks)")
+            asyncio.run(asyncio.sleep(0.1))
             sse_manager.publish_event("symlink_update", json.dumps({"count": len(symlinks_data)}))
 
         except Exception as e:
@@ -101,6 +102,20 @@ def start_symlink_watcher():
             return
 
         observers = []
+
+        # ✅ Scan initial AVANT d'attendre un événement
+        symlinks_data = scan_symlinks()
+        symlink_store.clear()
+        symlink_store.extend(symlinks_data)
+
+        logger.success(f"✔️ Scan initial terminé — {len(symlinks_data)} symlinks chargés")
+
+        # ✅ Envoi d’un événement SSE pour notifier le frontend
+        sse_manager.publish_event("symlink_update", json.dumps({
+            "event": "initial_scan",
+            "message": "Scan initial terminé",
+            "count": len(symlinks_data)
+        }))
 
         for dir_path in links_dirs:
             path = Path(dir_path)
@@ -127,8 +142,6 @@ def start_symlink_watcher():
 
     for obs in observers:
         obs.join()
-
-# --- Lancer les deux watchers dans des threads ---
 
 def start_all_watchers():
     logger.info("🚀 Lancement des watchers YAML + Symlink...")

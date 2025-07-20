@@ -65,14 +65,6 @@ app.program.start()
 def launch_watchers():
     start_all_watchers()
 
-    try:
-        data = scan_symlinks()
-        symlink_store.clear()
-        symlink_store.extend(data)
-        logger.success(f"🔁 Scan initial terminé — {len(data)} symlinks chargés")
-    except Exception as e:
-        logger.warning(f"⚠️ Échec du scan initial : {e}")
-
 # Inclusion des routes
 app.include_router(app_router)
 

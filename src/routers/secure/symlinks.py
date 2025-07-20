@@ -798,3 +798,30 @@ async def repair_missing_seasons(
         "symlinks_deleted": deleted_count,
         "errors": errors
     }
+
+@router.get("/duplicates")
+def list_duplicates():
+    """
+    Retourne les symlinks en doublon (même cible avec ref_count > 1).
+    """
+    if not symlink_store:
+        raise HTTPException(status_code=503, detail="Cache vide, lancez un scan d'abord.")
+
+    # Groupement par cible
+    target_map = {}
+    for item in symlink_store:
+        target = item["target"]
+        if item["ref_count"] > 1:
+            target_map.setdefault(target, []).append(item)
+
+    # On ne garde que les cibles avec plus d'un symlink
+    duplicates = []
+    for items in target_map.values():
+        if len(items) > 1:
+            duplicates.extend(items)
+
+    return {
+        "total": len(duplicates),
+        "data": duplicates
+    }
+

@@ -5,6 +5,8 @@ from typing import Optional
 import re
 from fastapi import HTTPException
 import logging
+from program.utils.text_utils import normalize_name, clean_movie_name
+
 
 RADARR_PORT = 7878
 SONARR_PORT = 8989
@@ -28,49 +30,58 @@ class RadarrService:
         self.headers = {"X-Api-Key": self.api_key}
 
     def get_movie_by_clean_title(self, raw_name: str):
-        """
-        Recherche un film dans Radarr à partir d'un nom brut (ex: 'The Green Hornet (2011) {imdb-tt1234567}').
-        Nettoie le nom, extrait le titre + année, et cherche un match exact dans Radarr.
-        """
-        logger.debug(f"🔍 Titre brut reçu : {raw_name}")
+        logger.debug(f"📥 Titre brut reçu : {raw_name}")
 
-        # Retirer la partie {imdb-ttxxxxxxx}
-        cleaned_name = re.sub(r"\{imdb-tt\d{7}\}", "", raw_name).strip()
-        logger.debug(f"🧹 Titre nettoyé : {cleaned_name}")
+        # 🔧 Nettoyage brut
+        cleaned_name = re.sub(r"\s*\{imdb-tt\d{7,8}\}", "", raw_name).strip()
+        logger.debug(f"🧼 Titre nettoyé transmis à Radarr : {cleaned_name}")
 
-        # Extraire l'année entre parenthèses
         title_match = re.match(r"^(.*?)(?:\s+\((\d{4})\))?$", cleaned_name)
         if not title_match:
-            logger.warning(f"❗ Nom de film mal formaté : {cleaned_name}")
+            logger.warning("❌ Échec du parsing du titre avec l’année")
             return None
 
         base_title = title_match.group(1).strip()
         year = int(title_match.group(2)) if title_match.group(2) else None
-
-        logger.debug(f"🔠 Titre sans année : {base_title}")
-        if year:
-            logger.debug(f"📅 Année extraite : {year}")
+        logger.debug(f"🔎 Recherche dans Radarr : base_title='{base_title}' | year={year}")
 
         try:
-            response = requests.get(
-                f"{self.base_url}/movie",
-                headers=self.headers,
-                params={"searchTerm": base_title}
-            )
-            response.raise_for_status()
-            movies = response.json()
+            res = requests.get(f"{self.base_url}/movie", headers=self.headers)
+            res.raise_for_status()
+            all_movies = res.json()
+            logger.debug(f"🎬 {len(all_movies)} films récupérés depuis Radarr")
         except requests.exceptions.RequestException as e:
-            logger.error(f"❌ Erreur API Radarr : {e}")
-            raise HTTPException(status_code=500, detail="Erreur lors de la requête Radarr")
+            logger.error(f"🌐 Erreur requête GET /movie : {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
 
-        # Recherche exacte
-        for movie in movies:
-            if movie["title"].lower() == base_title.lower():
-                if year is None or movie.get("year") == year:
-                    logger.debug(f"✅ Film trouvé : {movie['title']} ({movie.get('year')}) — ID Radarr : {movie['id']}")
+        for movie in all_movies:
+            radarr_title = movie["title"].strip().lower()
+            radarr_base_match = re.match(r"^(.*?)(?:\s+\((\d{4})\))?$", radarr_title)
+            radarr_base_title = radarr_base_match.group(1).strip() if radarr_base_match else radarr_title
+            radarr_year = movie.get("year")
+
+            if normalize_name(radarr_base_title) == normalize_name(base_title):
+                if year is None or radarr_year == year:
+                    logger.debug(f"✅ Film trouvé par nom : {movie['title']} ({radarr_year})")
                     return movie
 
-        logger.warning(f"⚠️ Aucun film correspondant à '{base_title}' ({year}) trouvé dans Radarr.")
+        # 🔄 Fallback IMDb ID
+        imdb_match = re.search(r"imdb-(tt\d{7,8})", raw_name)
+        if imdb_match:
+            imdb_id = imdb_match.group(1)
+            logger.debug(f"🆘 Fallback IMDb — Recherche via ID : {imdb_id}")
+            try:
+                lookup_url = f"{self.base_url}/movie/lookup/imdb?imdbId={imdb_id}"
+                res = requests.get(lookup_url, headers=self.headers)
+                res.raise_for_status()
+                movie = res.json()
+                if movie and "title" in movie:
+                    logger.debug(f"✅ Film trouvé via IMDb : {movie['title']} ({movie.get('year')})")
+                    return movie
+            except requests.exceptions.RequestException as e:
+                logger.error(f"🌐 Erreur lookup IMDb : {e}", exc_info=True)
+
+        logger.warning(f"❗ Aucune correspondance trouvée pour : {base_title} (année={year})")
         return None
 
     def refresh_movie(self, movie_id: int):
@@ -183,8 +194,6 @@ class SonarrService:
             logger.error(f"❌ Erreur lors du POST SeriesSearch : {e}")
             raise
 
-
-
     def get_missing_seasons(self, series_id: int) -> list[int]:
         """
         Retourne la liste des numéros de saisons où il manque au moins un épisode pour une série donnée.
@@ -206,13 +215,13 @@ class SonarrService:
         # Extraire les numéros de saison uniques
         missing_seasons = sorted(set(ep["seasonNumber"] for ep in missing_episodes))
 
-        logger.debug(f"📌 Saisons manquantes pour série {series_id} : {missing_seasons}")
+        # logger.debug(f"📌 Saisons manquantes pour série {series_id} : {missing_seasons}")
         return missing_seasons
 
     def get_all_series_with_missing_seasons(self) -> list[dict]:
         """
-        Retourne une liste de séries qui ont au moins une saison avec des épisodes manquants.
-        Chaque entrée contient : id, title, missing_seasons
+        Retourne une liste de séries qui ont au moins une saison avec des épisodes manquants
+        (hors saison 0). Chaque entrée contient : id, title, missing_seasons
         """
         try:
             response = requests.get(f"{self.base_url}/series", headers=self.headers)
@@ -223,6 +232,8 @@ class SonarrService:
             raise HTTPException(status_code=500, detail=str(e))
 
         result = []
+        total_seasons = 0
+
         for series in all_series:
             series_id = series.get("id")
             title = series.get("title")
@@ -233,12 +244,79 @@ class SonarrService:
                 logger.warning(f"⚠️ Impossible d'analyser la série {title} (ID={series_id}) : {e}")
                 continue
 
-            if missing_seasons:
+            # ❌ Exclure la saison 0
+            valid_missing_seasons = [s for s in missing_seasons if s != 0]
+
+            if valid_missing_seasons:
                 result.append({
                     "id": series_id,
                     "title": title,
-                    "missing_seasons": missing_seasons
+                    "missing_seasons": valid_missing_seasons
                 })
+                total_seasons += len(valid_missing_seasons)
 
-        logger.info(f"📊 Séries avec saisons manquantes : {len(result)} trouvées")
+        logger.info(f"📊 Séries avec saisons manquantes (hors saison 0) : {len(result)}")
+        logger.info(f"📊 Total de saisons manquantes (hors saison 0) : {total_seasons}")
+
         return result
+
+    def search_season(self, series_id: int, season_number: int):
+        """
+        Lance une recherche pour tous les épisodes de la saison spécifiée (sans toucher aux autres saisons).
+        """
+        # logger.debug(f"🔎 Recherche de la saison {season_number} pour la série ID={series_id}")
+        try:
+            response = requests.post(
+                f"{self.base_url}/command",
+                headers=self.headers,
+                json={
+                    "name": "SeasonSearch",
+                    "seriesId": series_id,
+                    "seasonNumber": season_number
+                }
+            )
+            response.raise_for_status()
+            logger.info(f"✅ Recherche envoyée pour saison {season_number} (série ID={series_id})")
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ Erreur lors du SeasonSearch : {e}")
+            raise
+
+    def get_all_episodes(self, series_id: int) -> list[dict]:
+        """Récupère tous les épisodes d'une série depuis l'API Sonarr"""
+        try:
+            response = requests.get(
+                f"{self.base_url}/episode",
+                params={"seriesId": series_id},
+                headers=self.headers,
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, list):
+                logger.warning(f"⚠️ Format inattendu reçu pour les épisodes (ID={series_id}) : {data}")
+                return []
+            return data
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ Erreur récupération épisodes pour la série ID={series_id} : {e}", exc_info=True)
+            return []
+
+    def get_all_series(self) -> list[dict]:
+        """Récupère toutes les séries configurées dans Sonarr"""
+        try:
+            response = requests.get(
+                f"{self.base_url}/series",
+                headers=self.headers,
+                timeout=10
+            )
+            response.raise_for_status()
+            series_list = response.json()
+            if not isinstance(series_list, list):
+                logger.warning(f"⚠️ Format inattendu reçu pour les séries : {series_list}")
+                return []
+            return series_list
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ Erreur lors du GET /series : {e}", exc_info=True)
+            return []
+
+

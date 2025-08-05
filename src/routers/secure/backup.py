@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from pathlib import Path
@@ -6,6 +6,8 @@ from datetime import datetime
 import shutil
 import json
 import getpass
+from zoneinfo import ZoneInfo
+
 
 from loguru import logger
 
@@ -59,7 +61,7 @@ def run_backup(subfolder):
         logger.warning(f"Dossier introuvable : {source}")
         return
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(ZoneInfo("Europe/Paris")).strftime("%d%m%Y_%H%M%S")
     dest_dir = BACKUP_ROOT / subfolder
     dest_dir.mkdir(parents=True, exist_ok=True)
     archive_path = dest_dir / f"{subfolder}_{timestamp}.tar.gz"
@@ -131,3 +133,38 @@ async def run_now(data: dict):
         raise HTTPException(status_code=404, detail="Dossier inexistant")
     run_backup(name)
     return {"message": f"Backup lancée pour {name}"}
+
+@router.post("/restore")
+async def restore_backup(data: dict):
+    name = data.get("name")
+    filename = data.get("file")
+
+    if not name or not filename:
+        raise HTTPException(status_code=400, detail="Paramètres manquants")
+
+    archive_path = BACKUP_ROOT / name / filename
+    target_path = MEDIAS_PATH / name
+
+    if not archive_path.exists():
+        raise HTTPException(status_code=404, detail="Archive introuvable")
+
+    if target_path.exists():
+        shutil.rmtree(target_path)
+        logger.debug(f"🧹 Ancien dossier supprimé : {target_path}")
+
+    shutil.unpack_archive(str(archive_path), str(target_path))
+    extracted = list(target_path.rglob("*"))
+    logger.success(f"✅ Restauration de {filename} → {target_path}")
+    logger.info(f"{len(extracted)} fichiers extraits")
+
+    return {"message": f"{filename} restaurée dans {name}"}
+
+@router.get("/backups/{name}/")
+async def list_backups(name: str):
+    backup_dir = BACKUP_ROOT / name
+    if not backup_dir.exists():
+        return []
+
+    archives = sorted([f.name for f in backup_dir.glob("*.tar.gz")])
+    return archives
+

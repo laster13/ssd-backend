@@ -14,6 +14,10 @@ from src.services.fonctions_arrs import RadarrService, SonarrService
 from fastapi import status
 import asyncio
 import httpx
+import unicodedata
+import re
+from datetime import datetime
+from program.utils.text_utils import normalize_name, clean_movie_name, clean_series_name
 
 sonarr = SonarrService()
 
@@ -50,7 +54,6 @@ def save_config(data):
 
 def scan_symlinks():
     config = load_config()
-    logger.debug(f"🧾 Config chargée : {config}")
 
     links_dirs = [Path(d) for d in config["links_dirs"]]
     mount_dirs = [Path(d).resolve() for d in config["mount_dirs"]]
@@ -192,21 +195,6 @@ def trigger_scan():
         logger.error(f"Erreur scan symlinks: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-def clean_movie_name(raw_name: str) -> str:
-    """
-    Nettoie le nom d’un film :
-    - Supprime l’année entre parenthèses : (1999)
-    - Supprime toute balise IMDb même mal fermée : {imdb-tt1234567, {imdb-tt12345678}, etc.
-    - Supprime les espaces superflus
-    """
-    # Supprimer l’année (ex : (2022))
-    cleaned = re.sub(r'\s*\(\d{4}\)', '', raw_name)
-
-    # Supprimer les balises IMDb (même mal fermées)
-    cleaned = re.sub(r'\s*\{imdb-tt\d{7,8}[^\}]*\}?', '', cleaned)
-
-    return cleaned.strip()
-
 @router.delete("/delete/{symlink_path:path}")
 async def delete_symlink(
     symlink_path: str,
@@ -214,52 +202,54 @@ async def delete_symlink(
 ):
     logger.debug("🔧 Début de la suppression du symlink")
 
-    decoded_symlink_path = urllib.parse.unquote(symlink_path)
-    logger.debug(f"📥 Chemin symlink brut : {symlink_path}")
-    logger.debug(f"📥 Chemin symlink décodé : {decoded_symlink_path}")
-
-    config = load_config()
-    links_dirs = [Path(d).resolve() for d in config["links_dirs"]]
-    logger.debug(f"📁 Répertoires autorisés (links_dirs) : {links_dirs}")
-
-    full_path = None
-    for links_dir in links_dirs:
-        candidate = links_dir / decoded_symlink_path
-        if candidate.exists() or candidate.is_symlink():
-            full_path = candidate
-            break
-
-    if not full_path:
-        logger.warning(f"❌ Chemin en dehors des links_dirs : {decoded_symlink_path}")
-        raise HTTPException(status_code=400, detail="Chemin invalide ou hors des répertoires autorisés")
-
-    symlink_path = full_path
-    logger.debug(f"📌 Chemin absolu reconstruit : {symlink_path}")
-
     try:
+        decoded_symlink_path = urllib.parse.unquote(symlink_path)
+        logger.debug(f"📥 Chemin symlink brut : {symlink_path}")
+        logger.debug(f"📥 Chemin symlink décodé : {decoded_symlink_path}")
+
+        config = load_config()
+        links_dirs = [Path(d).resolve() for d in config["links_dirs"]]
+        logger.debug(f"📁 Répertoires autorisés (links_dirs) : {links_dirs}")
+
+        full_path = None
+        for links_dir in links_dirs:
+            candidate = links_dir / decoded_symlink_path
+            if candidate.exists() or candidate.is_symlink():
+                full_path = candidate
+                break
+
+        if not full_path:
+            logger.warning(f"❌ Chemin en dehors des links_dirs : {decoded_symlink_path}")
+            raise HTTPException(status_code=400, detail="Chemin invalide ou hors des répertoires autorisés")
+
+        symlink_path = full_path
+        logger.debug(f"📌 Chemin absolu reconstruit : {symlink_path}")
+
         if not symlink_path.is_symlink():
             logger.warning(f"⚠️ Le lien symbolique n'existe pas : {symlink_path}")
             raise HTTPException(status_code=404, detail="Lien symbolique introuvable")
 
         symlink_path.unlink()
-        logger.info(f"🗑️ Lien supprimé avec succès : {symlink_path}")
+        logger.success(f"🗑️ Lien symbolique supprimé avec succès : {symlink_path}")
 
         target_path = symlink_path.resolve(strict=False)
         logger.debug(f"📍 Chemin de la cible (non strict) : {target_path}")
 
         # 🆕 Utilisation du nom du dossier parent
         raw_name = symlink_path.parent.name
-        logger.debug(f"🎬 Nom brut : {raw_name}")
+        logger.debug(f"🎬 Nom brut récupéré : {raw_name}")
 
-        def clean_movie_title(name: str) -> str:
-            name = re.sub(r'\s*\{imdb-tt\d{7,8}[^\}]*\}?', '', name)  # IMDb mal fermé
-            name = re.sub(r'\s*\(\d{4}\)', '', name)  # année
-            return name.strip()
+        # Assure que la fonction clean_movie_name existe
+        if 'clean_movie_name' not in globals():
+            raise RuntimeError("La fonction 'clean_movie_name' est manquante ou non importée")
 
-        cleaned_title = clean_movie_title(raw_name)
-        logger.debug(f"🧼 Titre nettoyé transmis à Radarr : {cleaned_title}")
+        cleaned_title = clean_movie_name(raw_name)
+        logger.debug(f"🧼 Titre nettoyé : {cleaned_title}")
 
-        logger.debug(f"🔍 Recherche du film : {cleaned_title}")
+        normalized_cleaned = normalize_name(cleaned_title)
+        logger.debug(f"🔠 Titre normalisé : {normalized_cleaned}")
+
+        logger.debug(f"🔍 Recherche du film dans Radarr : {cleaned_title}")
         movie = radarr.get_movie_by_clean_title(cleaned_title)
 
         if not movie:
@@ -267,29 +257,32 @@ async def delete_symlink(
             raise HTTPException(status_code=404, detail=f"Aucun film trouvé avec le nom : {cleaned_title}")
 
         movie_id = movie["id"]
-        logger.info(f"🎯 Film trouvé : {movie['title']} ({movie.get('year')}) — ID : {movie_id}")
+        logger.info(f"🎯 Film trouvé : {movie.get('title', 'Inconnu')} ({movie.get('year', '?')}) — ID : {movie_id}")
 
         try:
+            logger.debug("🔄 Rafraîchissement du film dans Radarr")
             radarr.refresh_movie(movie_id)
-            logger.info(f"✅ Rafraîchissement réussi pour : {movie['title']}")
+            logger.info(f"✅ Rafraîchissement réussi pour : {movie.get('title', 'Inconnu')}")
         except Exception as e:
-            logger.error(f"❌ Échec du rafraîchissement : {e}", exc_info=True)
+            logger.error(f"❌ Erreur lors du rafraîchissement : {type(e).__name__} — {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Erreur rafraîchissement : {e}")
 
         try:
+            logger.debug("⏱️ Pause avant lancement recherche")
             await asyncio.sleep(2)
+            logger.debug("📡 Lancement recherche de téléchargement manquant")
             radarr.search_missing_movie(movie_id)
-            logger.info(f"📥 Recherche de téléchargement lancée pour : {movie['title']}")
+            logger.info(f"📥 Recherche de téléchargement lancée pour : {movie.get('title', 'Inconnu')}")
         except Exception as e:
-            logger.error(f"❌ Échec de la recherche de téléchargement : {e}", exc_info=True)
+            logger.error(f"❌ Erreur pendant la recherche : {type(e).__name__} — {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Erreur recherche : {e}")
 
     except HTTPException as e:
-        logger.error(f"🚨 HTTPException capturée : {e.detail}")
+        logger.error(f"🚨 HTTPException capturée : {type(e).__name__} — {e.detail}", exc_info=True)
         raise e
     except Exception as e:
-        logger.error("💥 Exception inattendue capturée", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Erreur interne : {str(e)}")
+        logger.error(f"💥 Exception inattendue capturée : {type(e).__name__} — {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Erreur interne : {type(e).__name__} — {str(e)}")
 
     logger.info("✅ Suppression et actions Radarr terminées")
     return {"message": "Symlink supprimé et traitement Radarr effectué avec succès."}
@@ -333,6 +326,7 @@ async def delete_broken_symlinks(
     folder: Optional[str] = None,
     radarr: RadarrService = Depends(RadarrService)
 ):
+
     logger.info("🚀 Suppression en masse des symlinks cassés demandée")
 
     if not symlink_store:
@@ -347,7 +341,7 @@ async def delete_broken_symlinks(
         folder_path = (base_links_dir / folder).resolve()
         items = [i for i in items if i["symlink"].startswith(str(folder_path))]
 
-    # Filtrer uniquement les cassés
+    # Filtrer uniquement les symlinks cassés
     broken_symlinks = [i for i in items if i["ref_count"] == 0]
     if not broken_symlinks:
         return {"message": "Aucun symlink cassé à supprimer", "deleted": 0}
@@ -357,34 +351,44 @@ async def delete_broken_symlinks(
     deleted_count = 0
     errors = []
 
+    try:
+        all_movies = radarr.get_all_movies()
+    except Exception as e:
+        logger.error(f"❌ Erreur récupération films Radarr : {e}")
+        raise HTTPException(status_code=500, detail="Erreur récupération des films")
+
     for item in broken_symlinks:
         try:
-            # Reconstruire le chemin complet
             symlink_path = Path(item["symlink"])
             if not symlink_path.is_symlink():
                 logger.warning(f"⛔ Pas un symlink valide : {symlink_path}")
                 continue
 
-            # Supprimer le symlink
             symlink_path.unlink()
             logger.success(f"🗑️ Supprimé : {symlink_path}")
             deleted_count += 1
 
-            # Traitement Radarr
+            # Nettoyage + matching
             raw_name = symlink_path.parent.name
-            cleaned_name = clean_movie_name(raw_name)
-            title_without_year = re.sub(r'\s*\(\d{4}\)', '', cleaned_name).strip()
-            movie = radarr.get_movie_by_clean_title(title_without_year)
+            cleaned = clean_movie_name(raw_name)
+            normalized_cleaned = normalize_name(cleaned)
 
-            if not movie:
-                logger.warning(f"❗ Aucun film trouvé dans Radarr : {title_without_year}")
+            logger.debug(f"🎬 Nom brut = {raw_name} → nettoyé = {cleaned} → normalisé = {normalized_cleaned}")
+
+            match = next(
+                (m for m in all_movies if normalize_name(m["title"]) in normalized_cleaned),
+                None
+            )
+
+            if not match:
+                logger.warning(f"❗ Aucun film trouvé pour : {cleaned}")
                 continue
 
-            movie_id = movie["id"]
+            movie_id = match["id"]
             radarr.refresh_movie(movie_id)
             await asyncio.sleep(2)
             radarr.search_missing_movie(movie_id)
-            logger.info(f"📥 Recherche relancée pour : {movie['title']}")
+            logger.info(f"📥 Recherche relancée pour : {match['title']}")
 
         except Exception as e:
             error_msg = f"Erreur {item['symlink']}: {str(e)}"
@@ -399,26 +403,6 @@ async def delete_broken_symlinks(
         "deleted": deleted_count,
         "errors": errors
     }
-
-def clean_series_name(raw_name: str) -> str:
-    """
-    Nettoie le nom de la série :
-    - Supprime les balises IMDb même mal formées : {imdb-tt1234567}, {imdb-tt1234567, {imdb-tt1234567... etc.
-    - Conserve l'année entre parenthèses si elle existe.
-    - Supprime les espaces superflus autour.
-    - Nettoie les espaces multiples internes.
-    """
-    # Supprime tout ce qui ressemble à une balise IMDb, même mal formée
-    cleaned = re.sub(r'\s*\{imdb-tt\d{7,8}[^\}]*\}?', '', raw_name)
-
-    # Supprime les parenthèses vides ou résidus (facultatif, mais utile)
-    cleaned = re.sub(r'\(\s*\)', '', cleaned)
-
-    # Réduit les espaces multiples
-    cleaned = re.sub(r'\s+', ' ', cleaned)
-
-    # Supprime les espaces en trop en début/fin
-    return cleaned.strip()
 
 
 @router.delete("/delete-sonarr/{symlink_path:path}")
@@ -474,11 +458,10 @@ async def delete_symlink_sonarr(
         logger.debug(f"📁 Dossier série : {series_dir}")
 
         series_folder_name = series_dir.name
-        logger.debug(f"📺 Nom brut du dossier série : {series_folder_name}")
 
         # Nettoyage du nom
-        cleaned = re.sub(r'\s*\{imdb-tt\d{7}\}', '', series_folder_name).strip()
-        logger.debug(f"🧼 Nom nettoyé : {cleaned}")
+        cleaned = clean_series_name(series_folder_name)
+        normalized_cleaned = normalize_name(cleaned)
 
         # Extraction du titre et année éventuelle
         match = re.match(r"^(.*?)(?:\s+\((\d{4})\))?$", cleaned)
@@ -487,10 +470,6 @@ async def delete_symlink_sonarr(
 
         base_title = match.group(1).strip()
         year = int(match.group(2)) if match.group(2) else None
-
-        logger.debug(f"📥 Titre brut reçu : {series_folder_name}")
-        logger.debug(f"🧼 Titre nettoyé transmis à Sonarr : {cleaned}")
-        logger.debug(f"🔎 Recherche dans Sonarr : base_title='{base_title}' | year={year}")
 
         # Récupération de la série
         series = sonarr.get_series_by_clean_title(cleaned)
@@ -573,37 +552,113 @@ async def delete_sonarr_season(
     season_number: int = Query(..., description="Numéro de la saison"),
     sonarr: SonarrService = Depends(SonarrService)
 ):
-    """
-    Rafraîchit la série et lance une recherche des épisodes manquants pour la saison donnée.
-    À utiliser uniquement après suppression physique des symlinks correspondants.
-    """
-    logger.info(f"🔁 Rafraîchissement + recherche pour : {series_name} | Saison {season_number}")
+    logger.info(f"🔁 [delete-sonarr-season] Traitement saison {season_number} pour : {series_name}")
 
-    # Nettoyage léger du nom (retrait de {imdb-tt...})
-    cleaned_series = re.sub(r'\s*\{imdb-tt\d{7,}\}', '', series_name).strip()
+    cleaned_series = clean_series_name(series_name)
+    normalized_cleaned = normalize_name(cleaned_series)
+
+    logger.debug(f"🧼 Nom nettoyé : {cleaned_series}")
+    logger.debug(f"🔎 Clé de recherche normalisée : {normalized_cleaned}")
 
     try:
-        # Récupération de la série via Sonarr
-        series = sonarr.get_series_by_clean_title(cleaned_series)
-        if not series:
-            raise HTTPException(status_code=404, detail="Série introuvable")
+        all_series = sonarr.get_all_series()
+        logger.debug(f"📚 {len(all_series)} séries récupérées depuis Sonarr")
+    except Exception as e:
+        logger.error(f"❌ Erreur récupération séries Sonarr : {e}")
+        raise HTTPException(status_code=500, detail="Erreur récupération séries Sonarr")
 
-        series_id = series["id"]
-        logger.info(f"📺 Série trouvée : {series['title']} (ID={series_id})")
+    match = next(
+        (s for s in all_series if normalize_name(s["title"]) in normalized_cleaned),
+        None
+    )
 
-        # Rafraîchissement + recherche
+    if not match:
+        logger.warning(f"❗ Série introuvable dans Sonarr pour : {cleaned_series}")
+        raise HTTPException(status_code=404, detail="Série introuvable")
+
+    series_id = match["id"]
+    logger.info(f"📺 Série trouvée : {match['title']} (ID={series_id})")
+
+    try:
+        logger.debug(f"🔄 Rafraîchissement de la série ID={series_id}")
+        sonarr.refresh_series(series_id)
+        await asyncio.sleep(2)
+
+        logger.debug(f"🔍 Recherche manuelle des épisodes manquants pour ID={series_id}")
+        sonarr.search_missing_episodes(series_id)
+        logger.info(f"📥 Recherche manuelle lancée pour : {match['title']}")
+
+        await asyncio.sleep(3)
+
+        # 📁 Localisation du dossier série (dans shows/* uniquement)
+        config = load_config()
+        base_links_dir = Path(config.get("links_dirs", ["/"])[0]).resolve()
+        shows_dir = base_links_dir / "shows"
+
+        if not shows_dir.exists():
+            logger.warning(f"📁 Répertoire 'shows' introuvable dans : {base_links_dir}")
+            raise HTTPException(status_code=404, detail="Répertoire 'shows' introuvable")
+
+        all_dirs = [d for d in shows_dir.iterdir() if d.is_dir()]
+        # logger.debug(f"📁 Dossiers trouvés dans /shows : {[d.name for d in all_dirs]}")
+
+        series_dir = next(
+            (d for d in all_dirs if normalized_cleaned in normalize_name(d.name)),
+            None
+        )
+
+        if not series_dir or not series_dir.exists():
+            logger.warning("📁 Répertoire série introuvable — abandon")
+            raise HTTPException(status_code=404, detail="Répertoire série introuvable")
+
+        logger.debug(f"📁 Répertoire série localisé : {series_dir}")
+
+        # 📂 Localisation du dossier saison
+        season_dir = next(
+            (d for d in series_dir.glob(f"*{season_number:02d}*") if d.is_dir()),
+            None
+        )
+
+        if not season_dir:
+            logger.warning("📁 Répertoire de la saison introuvable — abandon")
+            raise HTTPException(status_code=404, detail="Répertoire saison introuvable")
+
+        logger.debug(f"📁 Répertoire saison localisé : {season_dir}")
+
+        valid_exts = {".mkv", ".mp4", ".m4v"}
+        remaining_files = [f for f in season_dir.iterdir() if f.is_file() and f.suffix.lower() in valid_exts]
+
+        logger.debug(f"📂 Fichiers trouvés dans la saison : {[f.name for f in remaining_files]}")
+
+        if remaining_files:
+            logger.info(f"✅ Des fichiers sont présents pour la saison {season_number}, aucune suppression nécessaire.")
+            return {
+                "message": f"Recherche relancée pour la saison {season_number} de {match['title']}. Fichiers présents."
+            }
+
+        # 🧹 Aucun fichier → on supprime les éventuels fichiers résiduels
+        logger.warning("🚫 Aucun fichier valide trouvé — nettoyage de la saison")
+
+        for f in season_dir.iterdir():
+            try:
+                f.unlink()
+                logger.info(f"🧹 Fichier supprimé : {f}")
+            except Exception as e:
+                logger.warning(f"⚠️ Échec suppression fichier {f} : {e}")
+
+        # 🔁 Relance complète
+        logger.info("📦 Relance recherche complète de la série après nettoyage")
         sonarr.refresh_series(series_id)
         await asyncio.sleep(2)
         sonarr.search_missing_episodes(series_id)
 
-        logger.info(f"✅ Rafraîchissement et recherche lancés pour {cleaned_series}")
         return {
-            "message": f"Recherche relancée pour la saison {season_number} de {cleaned_series}"
+            "message": f"✅ Saison {season_number} réinitialisée pour {match['title']} — recherche complète relancée"
         }
 
     except Exception as e:
-        logger.warning(f"⚠️ Erreur Sonarr : {e}")
-        raise HTTPException(status_code=500, detail="Erreur lors de l'appel à Sonarr")
+        logger.warning(f"⚠️ Erreur lors du traitement de la saison : {e}")
+        raise HTTPException(status_code=500, detail="Erreur traitement saison Sonarr")
 
 @router.post("/delete_broken_sonarr")
 async def delete_broken_sonarr_symlinks(
@@ -618,14 +673,26 @@ async def delete_broken_sonarr_symlinks(
     config = load_config()
     base_links_dir = Path(config.get("links_dirs", ["/"])[0]).resolve()
 
-    # Filtrage initial
+    def is_relative_to(child: Path, parent: Path) -> bool:
+        try:
+            child.relative_to(parent)
+            return True
+        except ValueError:
+            return False
+
     items = symlink_store.copy()
     if folder:
         folder_path = (base_links_dir / folder).resolve()
         items = [i for i in items if i["symlink"].startswith(str(folder_path))]
+        logger.debug(f"📁 Filtrage sur dossier : {folder_path} — {len(items)} éléments restants")
 
-    # Filtrer uniquement les symlinks cassés des séries
-    broken_symlinks = [i for i in items if i["ref_count"] == 0 and "/shows/" in i["symlink"]]
+    broken_symlinks = [
+        i for i in items
+        if i["ref_count"] == 0 and is_relative_to(Path(i["symlink"]).resolve(), base_links_dir)
+    ]
+
+    logger.debug(f"🔎 {len(broken_symlinks)} symlinks cassés trouvés dans {base_links_dir}")
+
     if not broken_symlinks:
         return {"message": "Aucun symlink cassé Sonarr à supprimer", "deleted": 0}
 
@@ -634,6 +701,13 @@ async def delete_broken_sonarr_symlinks(
     deleted_count = 0
     errors = []
 
+    try:
+        all_series = sonarr.get_all_series()
+        logger.debug(f"📚 {len(all_series)} séries récupérées depuis Sonarr")
+    except Exception as e:
+        logger.error(f"❌ Erreur récupération séries Sonarr : {e}")
+        raise HTTPException(status_code=500, detail="Erreur récupération séries Sonarr")
+
     for item in broken_symlinks:
         try:
             symlink_path = Path(item["symlink"])
@@ -641,51 +715,54 @@ async def delete_broken_sonarr_symlinks(
                 logger.warning(f"⛔ Pas un symlink valide : {symlink_path}")
                 continue
 
-            # Supprimer le symlink
+            logger.debug(f"🧹 Suppression du symlink : {symlink_path}")
             symlink_path.unlink()
             logger.success(f"🗑️ Supprimé : {symlink_path}")
             deleted_count += 1
 
-            # Extraire dossier série
             series_dir = symlink_path.parent.parent
             raw_name = series_dir.name
             cleaned = clean_series_name(raw_name)
+            normalized_cleaned = normalize_name(cleaned)
 
-            # Rechercher la série dans Sonarr
-            series = sonarr.get_series_by_clean_title(cleaned)
-            if not series:
-                logger.warning(f"❗ Aucune série trouvée dans Sonarr : {cleaned}")
+            match = next(
+                (s for s in all_series if normalize_name(s["title"]) in normalized_cleaned),
+                None
+            )
+
+            if not match:
+                logger.warning(f"❗ Aucune série trouvée pour : {cleaned}")
                 continue
 
-            series_id = series["id"]
-            logger.info(f"📺 Série Sonarr trouvée : {series['title']} (ID={series_id})")
+            series_id = match["id"]
+            logger.info(f"📺 Série trouvée : {match['title']} (ID={series_id})")
 
-            # Rafraîchir + rechercher les épisodes
+            # Rafraîchissement uniquement
+            logger.debug(f"🔄 Refresh série ID={series_id}")
             sonarr.refresh_series(series_id)
             await asyncio.sleep(2)
-            sonarr.search_missing_episodes(series_id)
-            logger.info(f"📥 Recherche relancée pour : {series['title']}")
 
-            # Vérification locale après scan
-            await asyncio.sleep(2)
             season_dir = symlink_path.parent
-            valid_extensions = {".mkv", ".mp4", ".m4v"}
+            valid_exts = {".mkv", ".mp4", ".m4v"}
 
-            remaining = [
-                f for f in season_dir.iterdir()
-                if f.suffix.lower() in valid_extensions and f.exists()
-            ]
+            try:
+                remaining = [
+                    f for f in season_dir.iterdir()
+                    if f.suffix.lower() in valid_exts and f.exists()
+                ]
+                logger.debug(f"📂 Fichiers restants dans {season_dir} : {[f.name for f in remaining]}")
+            except Exception as e:
+                logger.warning(f"⚠️ Erreur lors du scan du dossier de saison : {e}")
+                remaining = []
 
             if not remaining:
-                logger.warning("🚫 Tous les fichiers sont absents — suppression complète de la saison")
+                logger.warning("🚫 Tous les fichiers absents — suppression complète de la saison")
 
-                # Extraction robuste du numéro de saison
-                match = re.search(r"(\d{1,2})", season_dir.name)
-                if match:
-                    season_number = int(match.group(1))
+                match_season = re.search(r"(\d{1,2})", season_dir.name)
+                if match_season:
+                    season_number = int(match_season.group(1))
                     logger.debug(f"🔢 Numéro de saison extrait : {season_number}")
 
-                    # Appel à l’API delete-sonarr-season
                     try:
                         async with httpx.AsyncClient(timeout=20.0) as client:
                             response = await client.post(
@@ -696,14 +773,16 @@ async def delete_broken_sonarr_symlinks(
                                 }
                             )
                             if response.status_code != 200:
-                                logger.error(f"❌ Appel à delete-sonarr-season échoué : {response.text}")
+                                logger.error(f"❌ Appel API delete-sonarr-season échoué : {response.text}")
+                            else:
+                                logger.info(f"✅ Suppression de la saison {season_number} pour {cleaned}")
                     except Exception as e:
-                        logger.error(f"❌ Erreur appel delete-sonarr-season : {e}")
+                        logger.error(f"❌ Erreur appel API : {e}")
 
         except Exception as e:
-            error_msg = f"Erreur {item['symlink']}: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            errors.append(error_msg)
+            msg = f"Erreur {item['symlink']}: {str(e)}"
+            logger.error(msg, exc_info=True)
+            errors.append(msg)
 
     sse_manager.publish_event("symlink_update", json.dumps({"event": "refreshed"}))
 
@@ -718,6 +797,7 @@ async def repair_missing_seasons(
     folder: Optional[str] = None,
     sonarr: SonarrService = Depends(SonarrService)
 ):
+
     logger.info("🛠️ Réparation des saisons manquantes demandée")
 
     if not symlink_store:
@@ -727,11 +807,10 @@ async def repair_missing_seasons(
     base_links_dir = Path(config.get("links_dirs", ["/"])[0]).resolve()
 
     # Filtrage par dossier (si fourni)
+    items = symlink_store.copy()
     if folder:
         folder_path = (base_links_dir / folder).resolve()
-        items = [i for i in symlink_store if i["symlink"].startswith(str(folder_path))]
-    else:
-        items = symlink_store.copy()
+        items = [i for i in items if i["symlink"].startswith(str(folder_path))]
 
     deleted_count = 0
     errors = []
@@ -739,27 +818,67 @@ async def repair_missing_seasons(
     try:
         missing_list = sonarr.get_all_series_with_missing_seasons()
     except Exception as e:
-        logger.error(f"❌ Erreur récupération séries : {e}")
+        logger.error(f"❌ Erreur récupération séries : {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Erreur récupération des séries avec saisons manquantes")
 
     for entry in missing_list:
         series_id = entry["id"]
         series_title = entry["title"]
-        missing_seasons = entry["missing_seasons"]
+        raw_missing_seasons = [s for s in entry["missing_seasons"] if s != 0]
 
-        logger.info(f"📺 Série '{series_title}' - Saisons manquantes : {missing_seasons}")
+        if not raw_missing_seasons:
+            logger.info(f"📺 Série '{series_title}' - Aucune saison manquante (hors saison 0)")
+            continue
 
-        # 🔍 Trouve les symlinks liés à cette série
-        matching_items = [i for i in items if series_title.lower() in i["symlink"].lower()]
+        logger.info(f"📺 Série '{series_title}' - Saisons manquantes détectées : {raw_missing_seasons}")
+
+        # 🔎 Vérifier si les épisodes de la saison sont tous passés
+        try:
+            all_episodes = sonarr.get_all_episodes(series_id)
+        except Exception as e:
+            logger.error(f"❌ Erreur récupération épisodes pour '{series_title}': {e}", exc_info=True)
+            errors.append(f"{series_title} - episodes")
+            continue
+
+        confirmed_missing = []
+        for season_num in raw_missing_seasons:
+            season_eps = [ep for ep in all_episodes if ep.get("seasonNumber") == season_num]
+            if not season_eps:
+                confirmed_missing.append(season_num)
+                continue
+
+            future_eps = [
+                ep for ep in season_eps
+                if ep.get("airDateUtc") and ep["airDateUtc"] > datetime.utcnow().isoformat()
+            ]
+            if future_eps:
+                logger.info(f"⏳ Saison {season_num} de '{series_title}' ignorée (épisodes à venir)")
+            else:
+                confirmed_missing.append(season_num)
+
+        if not confirmed_missing:
+            logger.info(f"📺 Série '{series_title}' - Aucune saison à traiter après vérification")
+            continue
+
+        logger.info(f"📺 Série '{series_title}' - Saisons confirmées comme manquantes : {confirmed_missing}")
+
+        # 🔗 Match amélioré en nom normalisé
+        norm_title = normalize_name(series_title)
+        matching_items = [i for i in items if norm_title in normalize_name(i["symlink"])]
+
         if not matching_items:
             logger.warning(f"⚠️ Aucun symlink trouvé pour : {series_title}")
             continue
 
-        for season_num in missing_seasons:
-            pattern = f"S{season_num:02}"  # S01, S02, ...
+        for season_num in confirmed_missing:
+            logger.debug(f"🔍 Analyse de la saison {season_num} pour '{series_title}' (ID={series_id})")
+            pattern = f"S{season_num:02}"
             filtered_symlinks = [
                 i for i in matching_items if pattern.lower() in i["symlink"].lower()
             ]
+
+            if not filtered_symlinks:
+                logger.warning(f"⚠️ Aucun symlink trouvé pour la saison {season_num} de '{series_title}'")
 
             for item in filtered_symlinks:
                 symlink_path = Path(item["symlink"])
@@ -771,24 +890,20 @@ async def repair_missing_seasons(
                 try:
                     if symlink_path.exists() and symlink_path.is_symlink():
                         symlink_path.unlink()
-                        logger.success(f"🗑️ Symlink supprimé avec succès : {symlink_path}")
+                        logger.success(f"🗑️ Symlink supprimé : {symlink_path}")
                         deleted_count += 1
                 except Exception as e:
                     logger.warning(f"⚠️ Erreur suppression symlink {symlink_path}: {e}")
                     errors.append(str(symlink_path))
 
-            # 🛰️ Appel API interne pour relancer la recherche manuelle sur la saison
+            # 📥 Recherche forcée
             try:
-                async with httpx.AsyncClient(timeout=15.0) as client:
-                    resp = await client.post(
-                        "http://localhost:8080/api/v1/symlinks/delete-sonarr-season",
-                        params={"series_name": series_title, "season_number": season_num}
-                    )
-                    if resp.status_code != 200:
-                        logger.warning(f"❌ Appel delete-sonarr-season échoué : {resp.text}")
-                        errors.append(f"{series_title} - S{season_num:02}")
+                sonarr.refresh_series(series_id)
+                await asyncio.sleep(2)
+                sonarr.search_season(series_id=series_id, season_number=season_num)
+                logger.info(f"📥 Recherche relancée pour la saison {season_num} de '{series_title}'")
             except Exception as e:
-                logger.error(f"❌ Erreur HTTPX : {e}")
+                logger.error(f"❌ Échec recherche saison {season_num} de '{series_title}' : {e}", exc_info=True)
                 errors.append(f"{series_title} - S{season_num:02}")
 
     sse_manager.publish_event("symlink_update", json.dumps({"event": "refreshed"}))

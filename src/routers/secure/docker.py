@@ -6,7 +6,8 @@ from datetime import datetime
 import shutil
 import json
 import getpass
-
+from zoneinfo import ZoneInfo
+from fastapi.responses import JSONResponse
 from loguru import logger
 
 USER = getpass.getuser()
@@ -65,7 +66,7 @@ def run_backup(name):
         logger.warning(f"Dossier Docker introuvable : {source}")
         return
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(ZoneInfo("Europe/Paris")).strftime("%d%m%Y_%H%M%S")
     dest_dir = BACKUP_ROOT / "docker" / name
     dest_dir.mkdir(parents=True, exist_ok=True)
     archive_path = dest_dir / f"{name}_{timestamp}.tar.gz"
@@ -153,3 +154,68 @@ def delete_schedule(name: str):
     save_config(config)
     schedule_all()
     return {"message": f"Planification supprimée pour {name}"}
+
+@router.get("/backups/{name}/")
+def list_backups(name: str):
+    backup_dir = BACKUP_ROOT / "docker" / name
+    if not backup_dir.exists():
+        return []
+
+    backups = sorted([f.name for f in backup_dir.glob("*.tar.gz")])
+    return JSONResponse(content=backups)
+
+import time  # à mettre en haut du fichier avec les autres imports
+
+@router.post("/restore/")
+def restore_backup(data: dict):
+    import subprocess
+
+    name = data.get("name")
+    filename = data.get("file")
+
+    if not name or not filename:
+        raise HTTPException(status_code=400, detail="Paramètres manquants.")
+
+    archive_path = BACKUP_ROOT / "docker" / name / filename
+    target_path = DOCKER_CONFIGS_PATH / name
+
+    logger.debug(f"Nom du conteneur à restaurer: {name}")
+    logger.debug(f"Fichier à restaurer: {filename}")
+    logger.debug(f"Chemin archive: {archive_path}")
+    logger.debug(f"Chemin destination: {target_path}")
+
+    if not archive_path.exists():
+        raise HTTPException(status_code=404, detail="Fichier de sauvegarde introuvable.")
+
+    if target_path.exists():
+        logger.debug(f"✅ Suppression du dossier cible {target_path}")
+        shutil.rmtree(target_path)
+    else:
+        logger.warning(f"❌ Dossier à supprimer introuvable : {target_path}")
+
+    shutil.unpack_archive(str(archive_path), str(target_path))
+    logger.success(f"Sauvegarde {filename} restaurée dans {target_path}")
+
+    extracted_files = list(target_path.rglob("*"))
+    logger.info(f"{len(extracted_files)} fichiers extraits pour {name}")
+
+    # 💤 Petite pause pour éviter de redémarrer trop vite
+    logger.debug("⏳ Pause 5 secondes pour garantir la stabilité du répertoire restauré...")
+    time.sleep(5)
+
+    try:
+        result = subprocess.run(
+            ["docker", "restart", name],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        logger.success(f"🔁 Conteneur {name} redémarré avec succès")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"❌ Échec du redémarrage de {name}")
+        logger.error(f"Stderr: {e.stderr.strip()}")
+        raise HTTPException(status_code=500, detail=f"Échec du redémarrage de {name}")
+
+    return {"message": f"Sauvegarde {filename} restaurée et conteneur {name} redémarré."}
+
+

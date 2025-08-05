@@ -86,7 +86,7 @@ def setup_logger(level):
             "format": log_format,
             "backtrace": False,
             "diagnose": False,
-            "enqueue": True,
+            "enqueue": False,
             "colorize": True,
         },
         {

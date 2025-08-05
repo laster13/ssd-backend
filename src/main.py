@@ -1,15 +1,21 @@
 import os
 import sys
+from contextlib import asynccontextmanager
 from routers.secure.symlinks import scan_symlinks, symlink_store
 
-# 🔽 Ajoute ça immédiatement après les imports système
+# 🔽 Variables d'env terminal
 os.environ["FORCE_COLOR"] = "1"
 os.environ["PYTHONUNBUFFERED"] = "1"
 
 import logging
 from loguru import logger
 
-# Intercepteur pour basculer logging → loguru
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING) 
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("anyio").setLevel(logging.WARNING)
+
+# Logging bridge
 class InterceptHandler(logging.Handler):
     def emit(self, record):
         try:
@@ -18,12 +24,9 @@ class InterceptHandler(logging.Handler):
             level = record.levelname
         logger.log(level, record.getMessage())
 
-# Active loguru pour tous les logs standards
 logging.basicConfig(handlers=[InterceptHandler()], level=0)
 for name in ["uvicorn", "uvicorn.error", "uvicorn.access"]:
     logging.getLogger(name).handlers = [InterceptHandler()]
-
-# ⛔ Supprime les logs DEBUG de watchdog
 logging.getLogger("watchdog").setLevel(logging.WARNING)
 
 from fastapi import FastAPI
@@ -34,8 +37,27 @@ from program import Program
 from program.settings.models import get_version
 from routers import app_router
 from program.file_watcher import start_all_watchers
+import asyncio
 
 load_dotenv()
+
+# Watchers lancés proprement avec asyncio
+async def start_watchers_async():
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, start_all_watchers)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("🚀 SSDv2 - startup sequence...")
+    app.program = Program()
+    app.program.start()
+
+    # Lancement des watchers sans bloquer le démarrage
+    asyncio.create_task(start_watchers_async())
+
+    logger.info("SSD a bien démarré")
+    yield
+    logger.info("🛑 SSD - shutdown sequence")
 
 app = FastAPI(
     title="SSD",
@@ -46,6 +68,7 @@ app = FastAPI(
         "name": "GPL-3.0",
         "url": "https://www.gnu.org/licenses/gpl-3.0.en.html",
     },
+    lifespan=lifespan
 )
 
 # CORS
@@ -57,15 +80,5 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Programme principal
-app.program = Program()
-app.program.start()
-
-@app.on_event("startup")
-def launch_watchers():
-    start_all_watchers()
-
-# Inclusion des routes
+# Routes
 app.include_router(app_router)
-
-logger.info("SSD a bien démarré")

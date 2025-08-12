@@ -4,7 +4,7 @@ import os
 from loguru import logger
 from pydantic import ValidationError
 
-from program.settings.models import AppModel, Observable
+from program.settings.models import AppModel, Observable, SymlinkConfig, LinkDir
 from program.utils import data_dir_path
 
 
@@ -97,3 +97,85 @@ def format_validation_error(e: ValidationError) -> str:
 
 
 settings_manager = SettingsManager()
+
+class ConfigManager:
+    def __init__(self):
+        self.config_file = data_dir_path / "config.json"
+        self.config: SymlinkConfig = None
+
+        if not self.config_file.exists():
+            # Création d'une config par défaut
+            self.config = SymlinkConfig(
+                links_dirs=[],
+                mount_dirs=[],
+                radarr_api_key=None,
+                sonarr_api_key=None
+            )
+            self.config = SymlinkConfig.model_validate(
+                self.check_environment(json.loads(self.config.model_dump_json()), "SYMLINK")
+            )
+            self.save()
+        else:
+            self.load()
+
+    def check_environment(self, config_dict, prefix="", seperator="_"):
+        """
+        Remplace les valeurs par celles des variables d'environnement si présentes.
+        """
+        checked_config = {}
+        for key, value in config_dict.items():
+            if isinstance(value, dict):
+                checked_config[key] = self.check_environment(value, f"{prefix}{seperator}{key}")
+            else:
+                env_key = f"{prefix}_{key}".upper()
+                if os.getenv(env_key):
+                    env_val = os.getenv(env_key)
+                    if isinstance(value, bool):
+                        checked_config[key] = env_val.lower() in ["1", "true"]
+                    elif isinstance(value, int):
+                        checked_config[key] = int(env_val)
+                    elif isinstance(value, float):
+                        checked_config[key] = float(env_val)
+                    elif isinstance(value, list):
+                        checked_config[key] = json.loads(env_val)
+                    else:
+                        checked_config[key] = env_val
+                else:
+                    checked_config[key] = value
+        return checked_config
+
+    def load(self):
+        """
+        Charge la config depuis config.json et valide avec Pydantic.
+        """
+        try:
+            with self.config_file.open("r", encoding="utf-8") as f:
+                config_dict = json.load(f)
+                self.config = SymlinkConfig.model_validate(config_dict)
+                self.save()  # On re-sauvegarde pour garder un format propre
+        except ValidationError as e:
+            logger.error(f"Validation échouée pour config.json :\n{self.format_validation_error(e)}")
+            raise
+        except json.JSONDecodeError as e:
+            logger.error(f"Erreur JSON dans config.json : {e}")
+            raise
+        except FileNotFoundError:
+            logger.warning(f"{self.config_file} introuvable")
+            raise
+
+    def save(self):
+        """
+        Sauvegarde la config dans config.json.
+        """
+        with self.config_file.open("w", encoding="utf-8") as f:
+            f.write(self.config.model_dump_json(indent=4))
+
+    def format_validation_error(self, e: ValidationError) -> str:
+        return "\n".join(
+            f"• {'.'.join(str(x) for x in err['loc'])}: {err['msg']}"
+            for err in e.errors()
+        )
+
+
+# Initialisation globale
+config_manager = ConfigManager()

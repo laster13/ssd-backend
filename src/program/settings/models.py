@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Callable
+from typing import Any, Dict, List, Callable, Optional, Literal
 from pydantic import BaseModel, Field
 from program.utils import generate_api_key, get_version
 
@@ -76,3 +76,15 @@ class AppModel(Observable):
         super().__init__(**data)
         if self.api_key == "":
             self.api_key = generate_api_key()
+
+class LinkDir(Observable):
+    path: str
+    manager: Literal["sonarr", "radarr", "none"]
+    label: Optional[str] = None
+    projectRoute: Optional[str] = None
+
+class SymlinkConfig(Observable):
+    links_dirs: List[LinkDir] = Field(default_factory=list)
+    mount_dirs: List[str] = Field(default_factory=list)
+    radarr_api_key: Optional[str] = None
+    sonarr_api_key: Optional[str] = None

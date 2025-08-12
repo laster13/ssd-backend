@@ -9,13 +9,15 @@ from loguru import logger
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
+from program.settings.manager import config_manager
 from program.managers.sse_manager import sse_manager
 from .json_manager import update_json_files
-from routers.secure.symlinks import scan_symlinks, symlink_store, load_config
+from routers.secure.symlinks import scan_symlinks, symlink_store
 
 USER = os.getenv("USER") or os.getlogin()
 YAML_PATH = f"/home/{USER}/.ansible/inventories/group_vars/all.yml"
 VAULT_PASSWORD_FILE = f"/home/{USER}/.vault_pass"
+
 
 # --- 1. YAML watcher ---
 
@@ -24,14 +26,19 @@ class YAMLFileEventHandler(FileSystemEventHandler):
         if os.path.abspath(event.src_path) == os.path.abspath(YAML_PATH):
             try:
                 command = f"ansible-vault view {YAML_PATH} --vault-password-file {VAULT_PASSWORD_FILE}"
-                result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
+                result = subprocess.run(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    shell=True
+                )
 
                 if result.returncode != 0:
                     if "input is not vault encrypted data" in result.stderr:
                         return
-                    else:
-                        logger.error(f"🔐 Erreur ansible-vault : {result.stderr}")
-                        return
+                    logger.error(f"🔐 Erreur ansible-vault : {result.stderr}")
+                    return
 
                 decrypted_yaml_content = result.stdout
                 update_json_files(decrypted_yaml_content)
@@ -93,30 +100,29 @@ class SymlinkEventHandler(FileSystemEventHandler):
 
 def start_symlink_watcher():
     logger.info("🛰️ Symlink watcher démarré")
+    observers = []
     try:
-        config = load_config()
-        links_dirs = config.get("links_dirs", [])
+        config = config_manager.config
+        links_dirs = [ld.path for ld in config.links_dirs]  # ✅ chemins en str
 
         if not links_dirs:
             logger.warning("⚠️ Aucun répertoire dans 'links_dirs'")
             return
 
-        observers = []
-
-        # ✅ Scan initial AVANT d'attendre un événement
+        # ✅ Scan initial
         symlinks_data = scan_symlinks()
         symlink_store.clear()
         symlink_store.extend(symlinks_data)
 
         logger.success(f"✔️ Scan initial terminé — {len(symlinks_data)} symlinks chargés")
 
-        # ✅ Envoi d’un événement SSE pour notifier le frontend
         sse_manager.publish_event("symlink_update", json.dumps({
             "event": "initial_scan",
             "message": "Scan initial terminé",
             "count": len(symlinks_data)
         }))
 
+        # ✅ Watchers sur tous les links_dirs
         for dir_path in links_dirs:
             path = Path(dir_path)
             if not path.exists():
@@ -135,6 +141,7 @@ def start_symlink_watcher():
             time.sleep(30)
 
     except KeyboardInterrupt:
+        logger.info("⏹️ Arrêt du Symlink watcher")
         for obs in observers:
             obs.stop()
     except Exception as e:
@@ -142,6 +149,7 @@ def start_symlink_watcher():
 
     for obs in observers:
         obs.join()
+
 
 def start_all_watchers():
     logger.info("🚀 Lancement des watchers YAML + Symlink...")

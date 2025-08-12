@@ -1,6 +1,21 @@
 {
-  "links_dirs": [],
-  "mount_dirs": [],
-  "radarr_api_key": "",
-  "sonarr_api_key": ""
+    "links_dirs": [
+        {
+            "path": "/home/maman/Medias/shows",
+            "manager": "sonarr",
+            "label": "Séries",
+            "projectRoute": "/sonarr-fix"
+        },
+        {
+            "path": "/home/maman/Medias/movies",
+            "manager": "radarr",
+            "label": "Films",
+            "projectRoute": null
+        }
+    ],
+    "mount_dirs": [
+        "/home/maman/alldebrid/torrents"
+    ],
+    "radarr_api_key": "ffa65f3fedef45a2a420ea88e38cf3fe",
+    "sonarr_api_key": "c49d5c72dc9248fb826001843aebf1de"
 }

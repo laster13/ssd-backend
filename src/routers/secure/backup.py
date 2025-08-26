@@ -7,11 +7,13 @@ import shutil
 import json
 import getpass
 from zoneinfo import ZoneInfo
-
-
 from loguru import logger
 
-router = APIRouter(prefix="/media-backups", tags=["MediaBackups"])
+router = APIRouter(
+    prefix="/media-backups",
+    tags=["MediaBackups"],
+)
+
 scheduler = AsyncIOScheduler()
 
 USER = getpass.getuser()
@@ -20,6 +22,20 @@ SETTINGS_FILE = Path("data/backup.json")
 BACKUP_ROOT = Path(f"/home/{USER}/Backups")
 
 
+# ===== Décorateur pour gérer les slashes =====
+def route_with_slash(router: APIRouter, path: str, **kwargs):
+    """Enregistre la route avec et sans slash final."""
+    def decorator(func):
+        router.add_api_route(path, func, **kwargs)
+        if not path.endswith("/"):
+            router.add_api_route(path + "/", func, **kwargs)
+        else:
+            router.add_api_route(path.rstrip("/"), func, **kwargs)
+        return func
+    return decorator
+
+
+# ===== Fonctions utilitaires =====
 def scan_folders():
     if not MEDIAS_PATH.exists():
         logger.warning(f"Le dossier {MEDIAS_PATH} est introuvable.")
@@ -91,6 +107,7 @@ def schedule_all():
                 logger.debug(f"Tâche planifiée : {name} ({day=}, {hour=})")
 
 
+# ===== Événements =====
 @router.on_event("startup")
 def startup_event():
     schedule_all()
@@ -99,18 +116,18 @@ def startup_event():
         logger.info("Planificateur (scheduler) démarré")
 
 
-@router.get("/scan")
+# ===== Routes API avec gestion auto du slash =====
+@route_with_slash(router, "/scan", methods=["GET"])
 async def get_media_folders():
     return scan_folders()
 
 
-@router.get("")
-@router.get("/")
+@route_with_slash(router, "", methods=["GET"])
 async def get_schedules():
     return load_config()
 
 
-@router.post("/schedule")
+@route_with_slash(router, "/schedule", methods=["POST"])
 async def schedule_folder(data: dict):
     name = data.get("name")
     day = data.get("day")
@@ -126,7 +143,7 @@ async def schedule_folder(data: dict):
     return {"message": f"Sauvegarde planifiée pour {name}"}
 
 
-@router.post("/run")
+@route_with_slash(router, "/run", methods=["POST"])
 async def run_now(data: dict):
     name = data.get("name")
     if name not in scan_folders():
@@ -134,7 +151,8 @@ async def run_now(data: dict):
     run_backup(name)
     return {"message": f"Backup lancée pour {name}"}
 
-@router.post("/restore")
+
+@route_with_slash(router, "/restore", methods=["POST"])
 async def restore_backup(data: dict):
     name = data.get("name")
     filename = data.get("file")
@@ -159,7 +177,8 @@ async def restore_backup(data: dict):
 
     return {"message": f"{filename} restaurée dans {name}"}
 
-@router.get("/backups/{name}/")
+
+@route_with_slash(router, "/backups/{name}", methods=["GET"])
 async def list_backups(name: str):
     backup_dir = BACKUP_ROOT / name
     if not backup_dir.exists():
@@ -167,4 +186,3 @@ async def list_backups(name: str):
 
     archives = sorted([f.name for f in backup_dir.glob("*.tar.gz")])
     return archives
-

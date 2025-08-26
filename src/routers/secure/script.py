@@ -28,7 +28,6 @@ json_data = load_json_from_file(BACKEND_JSON_PATH)
 router = APIRouter(
     prefix="/scripts",
     tags=["scripts"],
-    responses={404: {"description": "Not found"}},
 )
 
 class ScriptModel(BaseModel):
@@ -115,7 +114,6 @@ async def update_config():
         settings_manager.save()
 
         logger.success("Configuration mise à jour avec succès.")
-        return {"message": "Configuration mise à jour avec succès."}
 
     except Exception as e:
         logger.exception("Erreur dans update-config")
@@ -141,19 +139,3 @@ async def get_domains():
     except Exception as e:
         logger.exception("Erreur lors de la récupération des domaines")
         raise HTTPException(status_code=500, detail=f"Erreur lecture JSON : {str(e)}")
-
-@router.get("/rdtclient-status", tags=["Status"])
-async def rdtclient_status():
-    try:
-        client = docker.from_env()
-        container = client.containers.get("rdtclient")
-        status = container.status
-        logger.info(f"Statut du conteneur rdtclient : {status}")
-    except docker.errors.NotFound:
-        status = "not_found"
-        logger.warning("Conteneur rdtclient introuvable.")
-    except Exception as e:
-        status = f"error: {str(e)}"
-        logger.error(f"Erreur lors de la récupération du statut rdtclient : {e}")
-
-    return {"service": "rdtclient", "status": status}

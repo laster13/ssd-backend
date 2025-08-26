@@ -1,9 +1,8 @@
 import json
 import os
-
+from pathlib import Path
 from loguru import logger
 from pydantic import ValidationError
-
 from program.settings.models import AppModel, Observable, SymlinkConfig, LinkDir
 from program.utils import data_dir_path
 
@@ -101,16 +100,17 @@ settings_manager = SettingsManager()
 class ConfigManager:
     def __init__(self):
         self.config_file = data_dir_path / "config.json"
-        self.config: SymlinkConfig = None
+        self.config: SymlinkConfig | None = None
 
         if not self.config_file.exists():
             # Création d'une config par défaut
             self.config = SymlinkConfig(
                 links_dirs=[],
-                mount_dirs=[],
+                mount_dirs=[],   # ✅ ajout ici
                 radarr_api_key=None,
                 sonarr_api_key=None
             )
+            # On applique les variables d'environnement
             self.config = SymlinkConfig.model_validate(
                 self.check_environment(json.loads(self.config.model_dump_json()), "SYMLINK")
             )
@@ -137,7 +137,11 @@ class ConfigManager:
                     elif isinstance(value, float):
                         checked_config[key] = float(env_val)
                     elif isinstance(value, list):
-                        checked_config[key] = json.loads(env_val)
+                        try:
+                            checked_config[key] = json.loads(env_val)
+                        except json.JSONDecodeError:
+                            logger.warning(f"⚠️ Impossible de parser {env_key} comme JSON")
+                            checked_config[key] = value
                     else:
                         checked_config[key] = env_val
                 else:
@@ -154,21 +158,26 @@ class ConfigManager:
                 self.config = SymlinkConfig.model_validate(config_dict)
                 self.save()  # On re-sauvegarde pour garder un format propre
         except ValidationError as e:
-            logger.error(f"Validation échouée pour config.json :\n{self.format_validation_error(e)}")
+            logger.error(f"❌ Validation échouée pour config.json :\n{self.format_validation_error(e)}")
             raise
         except json.JSONDecodeError as e:
-            logger.error(f"Erreur JSON dans config.json : {e}")
+            logger.error(f"❌ Erreur JSON dans config.json : {e}")
             raise
         except FileNotFoundError:
-            logger.warning(f"{self.config_file} introuvable")
+            logger.warning(f"⚠️ {self.config_file} introuvable")
             raise
 
     def save(self):
         """
         Sauvegarde la config dans config.json.
         """
-        with self.config_file.open("w", encoding="utf-8") as f:
-            f.write(self.config.model_dump_json(indent=4))
+        try:
+            with self.config_file.open("w", encoding="utf-8") as f:
+                f.write(self.config.model_dump_json(indent=4))
+            logger.success(f"💾 Configuration sauvegardée dans {self.config_file}")
+        except Exception as e:
+            logger.error(f"❌ Impossible de sauvegarder config.json : {e}")
+            raise
 
     def format_validation_error(self, e: ValidationError) -> str:
         return "\n".join(

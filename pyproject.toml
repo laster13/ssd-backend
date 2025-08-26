@@ -9,7 +9,7 @@ packages = [{ include = "program", from = "src" }]
 [tool.poetry.dependencies]
 python = "^3.11"
 fastapi = "^0.116.0"
-uvicorn = "0.34.3"
+uvicorn = {extras = ["standard"], version = "^0.35.0"}
 pydantic = "2.11.7"
 pydantic-core = "2.33.2"
 aiofiles = "23.2.1"
@@ -44,6 +44,10 @@ psutil = "^7.0.0"
 starlette = "0.46.0"
 httpx = "^0.28.1"
 docker = "^7.1.0"
+python-jose = {extras = ["cryptography"], version = "^3.5.0"}
+sqlalchemy = "^2.0.43"
+passlib = {extras = ["bcrypt"], version = "^1.7.4"}
+websockets = "^15.0.1"
 
 [build-system]
 requires = ["poetry-core"]

@@ -162,7 +162,7 @@ class SonarrService:
             sonarr_year = series.get("year")
 
             # Match flexible
-            if sonarr_base_title == base_title.lower():
+            if normalize_name(sonarr_base_title) == normalize_name(base_title):
                 if year is None or sonarr_year == year:
                     logger.debug(f"✅ Série trouvée : {series['title']} ({sonarr_year})")
                     return series

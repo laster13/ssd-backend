@@ -21,6 +21,13 @@ router = APIRouter(
     responses={404: {"description": "Not found"}},
 )
 
+@router.post("/complete-onboarding")
+def complete_onboarding():
+    settings = settings_manager.settings
+    if settings.firstRun:
+        settings.firstRun = False
+        settings_manager.save()
+    return {"firstRun": settings.firstRun}
 
 @router.get("/schema", operation_id="get_settings_schema")
 async def get_settings_schema() -> dict[str, Any]:

@@ -2,20 +2,23 @@
     "links_dirs": [
         {
             "path": "/home/maman/Medias/shows",
-            "manager": "sonarr",
-            "label": "Séries",
-            "projectRoute": "/sonarr-fix"
+            "manager": "sonarr"
         },
         {
             "path": "/home/maman/Medias/movies",
-            "manager": "radarr",
-            "label": "Films",
-            "projectRoute": null
+            "manager": "radarr"
+        },
+        {
+            "path": "/home/maman/Medias/anime_movies",
+            "manager": "radarr"
         }
     ],
     "mount_dirs": [
-        "/home/maman/alldebrid/torrents"
+        "/mnt/alldebrid/torrents",
+        "/home/maman/seedbox/zurg/__all__",
+        "/mnt/alldebridrd/alldebrid/torrents"
     ],
     "radarr_api_key": "ffa65f3fedef45a2a420ea88e38cf3fe",
-    "sonarr_api_key": "c49d5c72dc9248fb826001843aebf1de"
+    "sonarr_api_key": "c49d5c72dc9248fb826001843aebf1de",
+    "discord_webhook_url": "https://discord.com/api/webhooks/1409479008684609566/2oqLUYWkGbymDYtPk0BU0V-eUPCNi8bCgrAF5fxbLf990BgbF8Xl8ZDQrUF3v3J2SmEi"
 }

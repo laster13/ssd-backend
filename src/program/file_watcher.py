@@ -4,6 +4,7 @@ import threading
 import subprocess
 import json
 import asyncio
+from datetime import datetime
 from pathlib import Path
 from loguru import logger
 from watchdog.observers import Observer
@@ -13,14 +14,19 @@ from program.settings.manager import config_manager
 from program.managers.sse_manager import sse_manager
 from .json_manager import update_json_files
 from routers.secure.symlinks import scan_symlinks, symlink_store
+from program.utils.discord_notifier import send_discord_summary
 
 USER = os.getenv("USER") or os.getlogin()
 YAML_PATH = f"/home/{USER}/.ansible/inventories/group_vars/all.yml"
 VAULT_PASSWORD_FILE = f"/home/{USER}/.vault_pass"
 
+# --- Buffer Discord ---
+symlink_events_buffer = []
+last_sent_time = datetime.utcnow()
+SUMMARY_INTERVAL = 60 
+
 
 # --- 1. YAML watcher ---
-
 class YAMLFileEventHandler(FileSystemEventHandler):
     def on_modified(self, event):
         if os.path.abspath(event.src_path) == os.path.abspath(YAML_PATH):
@@ -64,17 +70,34 @@ def start_yaml_watcher():
 
 
 # --- 2. Symlink watcher ---
-
 class SymlinkEventHandler(FileSystemEventHandler):
     def __init__(self):
         self._lock = threading.Lock()
         self._timer = None
+        self.webhook_url = config_manager.config.discord_webhook_url
 
     def on_any_event(self, event):
         if event.is_directory:
             return
 
         logger.debug(f"📂 Événement détecté : {event.event_type} -> {event.src_path}")
+
+        if self.webhook_url and event.event_type in ("created", "deleted"):
+            action = "created" if event.event_type == "created" else "deleted"
+            target = None
+            try:
+                target = Path(event.src_path).resolve(strict=False)
+            except Exception:
+                pass
+
+            symlink_events_buffer.append({
+                "action": action,
+                "path": event.src_path,
+                "target": str(target) if (action == "created" and target) else None,
+                "time": datetime.utcnow()
+            })
+
+        # Refresh interne
         self._debounce_refresh()
 
     def _debounce_refresh(self, delay=2):
@@ -98,22 +121,46 @@ class SymlinkEventHandler(FileSystemEventHandler):
             logger.exception(f"💥 Erreur dans le watcher symlinks : {e}")
 
 
+# --- 3. Flush automatique Discord ---
+def start_discord_flusher():
+    def loop():
+        global last_sent_time, symlink_events_buffer
+        while True:
+            try:
+                now = datetime.utcnow()
+                if symlink_events_buffer and (now - last_sent_time).total_seconds() >= SUMMARY_INTERVAL:
+                    webhook = config_manager.config.discord_webhook_url
+                    if webhook:
+                        try:
+                            asyncio.run(send_discord_summary(webhook, symlink_events_buffer))
+                            logger.info(f"📊 Rapport Discord envoyé ({len(symlink_events_buffer)} événements)")
+                            symlink_events_buffer.clear()
+                            last_sent_time = now
+                        except Exception as e:
+                            logger.error(f"💥 Erreur envoi résumé Discord : {e}")
+                time.sleep(10)  # check toutes les 10s
+            except Exception as e:
+                logger.error(f"💥 Erreur flusher Discord : {e}")
+                time.sleep(30)
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
+# --- 4. Lancement des watchers ---
 def start_symlink_watcher():
     logger.info("🛰️ Symlink watcher démarré")
     observers = []
     try:
         config = config_manager.config
-        links_dirs = [ld.path for ld in config.links_dirs]  # ✅ chemins en str
+        links_dirs = [str(ld.path) for ld in config.links_dirs]
 
         if not links_dirs:
             logger.warning("⚠️ Aucun répertoire dans 'links_dirs'")
             return
 
-        # ✅ Scan initial
         symlinks_data = scan_symlinks()
         symlink_store.clear()
         symlink_store.extend(symlinks_data)
-
         logger.success(f"✔️ Scan initial terminé — {len(symlinks_data)} symlinks chargés")
 
         sse_manager.publish_event("symlink_update", json.dumps({
@@ -122,7 +169,6 @@ def start_symlink_watcher():
             "count": len(symlinks_data)
         }))
 
-        # ✅ Watchers sur tous les links_dirs
         for dir_path in links_dirs:
             path = Path(dir_path)
             if not path.exists():
@@ -133,7 +179,6 @@ def start_symlink_watcher():
             observer.schedule(SymlinkEventHandler(), path=str(path), recursive=True)
             observer.start()
             observers.append(observer)
-
             logger.info(f"📍 Symlink watcher actif sur {path.resolve()}")
 
         while True:
@@ -155,3 +200,4 @@ def start_all_watchers():
     logger.info("🚀 Lancement des watchers YAML + Symlink...")
     threading.Thread(target=start_yaml_watcher, daemon=True).start()
     threading.Thread(target=start_symlink_watcher, daemon=True).start()
+    start_discord_flusher()  # ✅ lance le flush automatique

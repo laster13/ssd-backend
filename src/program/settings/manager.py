@@ -15,6 +15,9 @@ class SettingsManager:
         self.filename = "settings.json"
         self.settings_file = data_dir_path / self.filename
 
+        # ✅ Crée le dossier parent au démarrage si nécessaire
+        self.settings_file.parent.mkdir(parents=True, exist_ok=True)
+
         Observable.set_notify_observers(self.notify_observers)
 
         if not self.settings_file.exists():
@@ -38,7 +41,7 @@ class SettingsManager:
         for key, value in settings.items():
             if isinstance(value, dict):
                 sub_checked_settings = self.check_environment(value, f"{prefix}{seperator}{key}")
-                checked_settings[key] = (sub_checked_settings)
+                checked_settings[key] = sub_checked_settings
             else:
                 environment_variable = f"{prefix}_{key}".upper()
                 if os.getenv(environment_variable, None):
@@ -81,6 +84,9 @@ class SettingsManager:
 
     def save(self):
         """Save settings to file, using Pydantic model for JSON serialization."""
+        # ✅ Assure la création du dossier parent
+        self.settings_file.parent.mkdir(parents=True, exist_ok=True)
+
         with open(self.settings_file, "w", encoding="utf-8") as file:
             file.write(self.settings.model_dump_json(indent=4))
 
@@ -97,18 +103,23 @@ def format_validation_error(e: ValidationError) -> str:
 
 settings_manager = SettingsManager()
 
+
 class ConfigManager:
     def __init__(self):
         self.config_file = data_dir_path / "config.json"
         self.config: SymlinkConfig | None = None
 
+        # ✅ Crée le dossier parent au démarrage si nécessaire
+        self.config_file.parent.mkdir(parents=True, exist_ok=True)
+
         if not self.config_file.exists():
             # Création d'une config par défaut
             self.config = SymlinkConfig(
                 links_dirs=[],
-                mount_dirs=[],   # ✅ ajout ici
+                mount_dirs=[],
                 radarr_api_key=None,
-                sonarr_api_key=None
+                sonarr_api_key=None,
+                discord_webhook_url=None
             )
             # On applique les variables d'environnement
             self.config = SymlinkConfig.model_validate(
@@ -119,9 +130,7 @@ class ConfigManager:
             self.load()
 
     def check_environment(self, config_dict, prefix="", seperator="_"):
-        """
-        Remplace les valeurs par celles des variables d'environnement si présentes.
-        """
+        """Remplace les valeurs par celles des variables d'environnement si présentes."""
         checked_config = {}
         for key, value in config_dict.items():
             if isinstance(value, dict):
@@ -149,9 +158,7 @@ class ConfigManager:
         return checked_config
 
     def load(self):
-        """
-        Charge la config depuis config.json et valide avec Pydantic.
-        """
+        """Charge la config depuis config.json et valide avec Pydantic."""
         try:
             with self.config_file.open("r", encoding="utf-8") as f:
                 config_dict = json.load(f)
@@ -168,10 +175,11 @@ class ConfigManager:
             raise
 
     def save(self):
-        """
-        Sauvegarde la config dans config.json.
-        """
+        """Sauvegarde la config dans config.json."""
         try:
+            # ✅ Assure la création du dossier parent
+            self.config_file.parent.mkdir(parents=True, exist_ok=True)
+
             with self.config_file.open("w", encoding="utf-8") as f:
                 f.write(self.config.model_dump_json(indent=4))
             logger.success(f"💾 Configuration sauvegardée dans {self.config_file}")

@@ -2,8 +2,8 @@ import json
 import os
 
 USER = os.getenv("USER") or os.getlogin()
-OUTPUT_JSON_PATH = f"/home/{USER}/projet-ssd/ssd-frontend/static/settings.json"
-BACKEND_JSON_PATH = f"/home/{USER}/projet-ssd/ssd-backend/data/settings.json"
+OUTPUT_JSON_PATH = f"/home/{USER}/seedbox/docker/{USER}/projet-ssd/ssd-frontend/static/settings.json"
+BACKEND_JSON_PATH = f"/home/{USER}/seedbox/docker/{USER}/projet-ssd/ssd-backend/data/settings.json"
 
 # Fonction pour mettre à jour les fichiers JSON avec le contenu décrypté du YAML
 def update_json_files(decrypted_yaml_content):

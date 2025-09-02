@@ -1,27 +1,46 @@
 import asyncio
+import json
 from typing import Any, Dict
-
+from loguru import logger
 
 class ServerSentEventManager:
     def __init__(self):
-        self.event_queues: Dict[str, asyncio.Queue] = {}
+        self.subscribers: list[asyncio.Queue] = []
 
-    def publish_event(self, event_type: str, data: Any):
-        if not data:
-            return
-        if event_type not in self.event_queues:
-            self.event_queues[event_type] = asyncio.Queue()
-        self.event_queues[event_type].put_nowait(data)
+    async def subscribe(self):
+        """Un client SSE s’abonne au flux global"""
+        queue: asyncio.Queue = asyncio.Queue()
+        self.subscribers.append(queue)
 
-    async def subscribe(self, event_type: str):
-        if event_type not in self.event_queues:
-            self.event_queues[event_type] = asyncio.Queue()
+        try:
+            while True:
+                message = await queue.get()
+                yield message
+        except asyncio.CancelledError:
+            if queue in self.subscribers:
+                self.subscribers.remove(queue)
+            raise
 
-        while True:
-            try:
-                data = await asyncio.wait_for(self.event_queues[event_type].get(), timeout=1.0)
-                yield f"{data}\n"
-            except asyncio.TimeoutError:
-                pass
+    def publish_event(self, event_type: str, data: Dict[str, Any]):
+        """
+        Publie un événement SSE vers tous les abonnés
+        - event_type devient le vrai 'event:' SSE
+        - data est directement sérialisé en JSON (sans double enveloppe)
+        """
+        try:
+            payload = json.dumps(data)
+            message = f"event: {event_type}\ndata: {payload}\n\n"
 
+            for queue in list(self.subscribers):
+                try:
+                    queue.put_nowait(message)
+                except Exception as e:
+                    logger.warning(f"⚠️ Suppression d’un subscriber mort: {e}")
+                    if queue in self.subscribers:
+                        self.subscribers.remove(queue)
+
+        except Exception as e:
+            logger.error(f"💥 Erreur publish_event SSE: {e}")
+
+# ✅ Singleton global
 sse_manager = ServerSentEventManager()

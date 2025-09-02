@@ -245,12 +245,17 @@ async def log_requests(request: Request, call_next):
         print("🔥 TRACEBACK END 🔥")
         raise
 
-    process_time = (time.time() - start_time) * 1000
-    status = response.status_code
-    size_kb = len(response.body or b"") / 1024 if hasattr(response, "body") else 0
-    client_ip = request.client.host if request.client else "unknown"
+    # ⛔ Filtrer les logs SSE
+    if request.url.path != "/api/v1/symlinks/events":
+        process_time = (time.time() - start_time) * 1000
+        status = response.status_code
+        size_kb = len(response.body or b"") / 1024 if hasattr(response, "body") else 0
+        client_ip = request.client.host if request.client else "unknown"
 
-    logger.log("API", f"{request.method} {request.url.path} ({status}) - {process_time:.2f}ms - {size_kb:.1f}KB - IP: {client_ip}")
+        logger.log(
+            "API",
+            f"{request.method} {request.url.path} ({status}) - {process_time:.2f}ms - {size_kb:.1f}KB - IP: {client_ip}"
+        )
     return response
 
 

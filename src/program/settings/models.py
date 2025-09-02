@@ -89,3 +89,4 @@ class SymlinkConfig(BaseModel):
     radarr_api_key: Optional[str] = None
     sonarr_api_key: Optional[str] = None
     discord_webhook_url: Optional[str] = None
+    tmdb_api_key: Optional[str] = None 

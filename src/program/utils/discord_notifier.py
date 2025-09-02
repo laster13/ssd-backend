@@ -133,6 +133,5 @@ async def send_discord_summary(
             async with httpx.AsyncClient(timeout=15.0) as client:
                 response = await client.post(webhook_url, json=payload)
                 response.raise_for_status()
-                print(f"✅ Rapport Discord envoyé ({len(chunk)} symlinks dans ce lot)")
         except Exception as e:
             print(f"❌ Erreur envoi Discord (rapport groupé): {e}")

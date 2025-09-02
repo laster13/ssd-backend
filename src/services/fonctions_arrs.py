@@ -120,6 +120,18 @@ class RadarrService:
             logger.error(f"❌ Erreur lors de la recherche des films manquants : {e}")
             raise HTTPException(status_code=500, detail=f"Erreur lors de la recherche des films manquants : {e}")
 
+    def get_all_movies(self):
+        """Récupère la liste complète des films depuis Radarr."""
+        try:
+            res = requests.get(f"{self.base_url}/movie", headers=self.headers)
+            res.raise_for_status()
+            movies = res.json()
+            logger.info(f"📚 {len(movies)} films récupérés depuis Radarr (get_all_movies)")
+            return movies
+        except requests.exceptions.RequestException as e:
+            logger.error(f"🌐 Erreur lors de la récupération des films : {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Erreur récupération films Radarr : {e}")
+
 class SonarrService:
     def __init__(self):
         config = load_config()
@@ -318,5 +330,15 @@ class SonarrService:
         except requests.exceptions.RequestException as e:
             logger.error(f"❌ Erreur lors du GET /series : {e}", exc_info=True)
             return []
+
+    def get_episode(self, series_id: int, season: int, episode: int) -> dict | None:
+        """
+        Récupère un épisode précis (saison + numéro) pour une série donnée.
+        """
+        episodes = self.get_all_episodes(series_id)
+        for ep in episodes:
+            if ep.get("seasonNumber") == season and ep.get("episodeNumber") == episode:
+                return ep
+        return None
 
 

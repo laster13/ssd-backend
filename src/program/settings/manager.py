@@ -119,7 +119,8 @@ class ConfigManager:
                 mount_dirs=[],
                 radarr_api_key=None,
                 sonarr_api_key=None,
-                discord_webhook_url=None
+                discord_webhook_url=None,
+                tmdb_api_key= None  
             )
             # On applique les variables d'environnement
             self.config = SymlinkConfig.model_validate(

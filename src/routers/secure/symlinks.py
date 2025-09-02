@@ -3,6 +3,7 @@ from pathlib import Path
 from collections import Counter
 from fastapi import APIRouter, HTTPException, Query, Request, Depends
 from fastapi.responses import StreamingResponse
+from fastapi.concurrency import run_in_threadpool
 import json
 import urllib.parse
 import asyncio
@@ -20,14 +21,14 @@ from program.settings.models import SymlinkConfig
 from program.utils.text_utils import normalize_name, clean_movie_name, clean_series_name
 from program.utils.discord_notifier import send_discord_message
 
-
 router = APIRouter(
     prefix="/symlinks",
     tags=["Symlinks"],
 )
+
+# ⚠️ Ne JAMAIS réassigner cette liste : toujours modifier en place (clear/extend, slices, etc.)
 symlink_store = []
 VALID_MEDIA_EXTS = {".mkv", ".mp4", ".m4v"}
-
 
 # ---------------------------
 # Utilitaires chemins & roots
@@ -59,19 +60,15 @@ def is_relative_to(child: Path, parent: Path) -> bool:
     except Exception:
         return False
 
-
 def get_roots() -> list[Path]:
     return [Path(ld.path).resolve() for ld in config_manager.config.links_dirs]
-
 
 def get_root_map() -> dict[str, Path]:
     return {Path(ld.path).name.lower(): Path(ld.path).resolve() for ld in config_manager.config.links_dirs}
 
-
 def roots_for_manager(manager_name: str) -> list[Path]:
     """Racines filtrées par manager (ex: 'sonarr' => /Medias/shows)."""
     return [Path(ld.path).resolve() for ld in config_manager.config.links_dirs if ld.manager == manager_name]
-
 
 def filter_items_by_folder(items, folder: Optional[str]):
     if not folder:
@@ -91,16 +88,12 @@ def filter_items_by_folder(items, folder: Optional[str]):
 
 @router.get("/config", response_model=SymlinkConfig)
 async def get_symlinks_config():
-    """
-    Récupérer la config symlinks depuis config.json
-    """
+    """Récupérer la config symlinks depuis config.json"""
     return config_manager.config
 
 @router.post("/config", response_model=dict)
 async def set_symlinks_config(new_config: SymlinkConfig):
-    """
-    Sauvegarder une nouvelle config symlinks dans config.json
-    """
+    """Sauvegarder une nouvelle config symlinks dans config.json"""
     try:
         config_manager.config = SymlinkConfig.model_validate(new_config.model_dump())
         config_manager.save()
@@ -111,7 +104,16 @@ async def set_symlinks_config(new_config: SymlinkConfig):
 # -------------
 # Scan symlinks
 # -------------
-def scan_symlinks():
+def scan_symlinks(radarr: RadarrService | None = None):
+    """
+    Scan des symlinks + enrichissement Radarr optimisé :
+    - Un seul appel API pour récupérer tous les films
+    - Dictionnaire {normalized_title: movie, normalized_title+year: movie} en RAM
+    - Recherche instantanée pour chaque symlink
+    - Posters Radarr corrigés avec URL publique (Traefik)
+    - Ajout de year, rating, overview, genres
+    """
+    global radarr_index
     config = config_manager.config
     links_dirs = [(Path(ld.path).resolve(), ld.manager) for ld in config.links_dirs]
     mount_dirs = [Path(d).resolve() for d in config.mount_dirs]
@@ -123,6 +125,24 @@ def scan_symlinks():
         if not mount_dir.exists():
             raise RuntimeError(f"Dossier introuvable : {mount_dir}")
 
+    # --- Construire index Radarr (si dispo)
+    radarr_index = {}
+    radarr_host = None
+    if radarr:
+        try:
+            all_movies = radarr.get_all_movies()
+            logger.info(f"📚 {len(all_movies)} films récupérés depuis Radarr")
+            for movie in all_movies:
+                cleaned = clean_movie_name(movie.get("title", ""))
+                norm = normalize_name(cleaned)
+                radarr_index[norm] = movie
+                year = movie.get("year")
+                if year:
+                    radarr_index[f"{norm}{year}"] = movie
+            radarr_host = get_traefik_host("radarr")
+        except Exception as e:
+            logger.error(f"❌ Impossible de récupérer la liste complète des films Radarr : {e}")
+
     symlinks_list = []
     for links_dir, manager in links_dirs:
         for symlink_path in links_dir.rglob("*"):
@@ -132,7 +152,6 @@ def scan_symlinks():
                 except FileNotFoundError:
                     target_path = symlink_path.resolve(strict=False)
 
-                # 🔎 Tentative de remap vers un mount_dir connu
                 matched_mount = None
                 relative_target = None
                 for mount_dir in mount_dirs:
@@ -144,34 +163,75 @@ def scan_symlinks():
                         continue
                 full_target = str(matched_mount / relative_target) if matched_mount else str(target_path)
 
-                # 🔗 relatif à la racine
                 try:
                     relative_path = str(symlink_path.resolve().relative_to(links_dir))
                 except Exception:
                     relative_path = str(symlink_path).replace(str(links_dir) + "/", "")
 
-                # 🕒 Date du symlink (mtime = dernière modif du lien)
                 stat = symlink_path.lstat()
                 created_at = datetime.fromtimestamp(stat.st_mtime).isoformat()
 
-                symlinks_list.append({
+                item = {
                     "symlink": str(symlink_path),
                     "relative_path": relative_path,
                     "target": full_target,
                     "target_exists": target_path.exists(),
                     "manager": manager,
                     "type": manager,
-                    "created_at": created_at  # 👈 ajouté
-                })
+                    "created_at": created_at
+                }
 
-    # 🔢 Comptage des cibles
+                # --- Enrichissement Radarr via index
+                if manager == "radarr" and radarr_index:
+                    raw_name = symlink_path.parent.name
+                    cleaned = clean_movie_name(raw_name)
+                    norm_cleaned = normalize_name(cleaned)
+                    movie = radarr_index.get(norm_cleaned)
+                    if movie:
+                        # Poster
+                        poster_url = None
+                        if "images" in movie:
+                            poster = next(
+                                (img.get("url") for img in movie["images"] if img.get("coverType") == "poster"),
+                                None
+                            )
+                            if poster:
+                                if poster.startswith("/"):
+                                    if radarr_host:
+                                        poster_url = f"https://{radarr_host}{poster}"
+                                    else:
+                                        poster_url = f"{radarr.base_url.rstrip('/')}{poster}"
+                                else:
+                                    poster_url = poster
+
+                        # Rating (TMDB si dispo)
+                        rating = None
+                        ratings = movie.get("ratings") or {}
+                        if isinstance(ratings, dict):
+                            tmdb_rating = ratings.get("tmdb")
+                            if isinstance(tmdb_rating, dict):
+                                rating = tmdb_rating.get("value")
+
+                        item.update({
+                            "id": movie.get("id"),
+                            "title": movie.get("title"),
+                            "tmdbId": movie.get("tmdbId"),
+                            "poster": poster_url,
+                            "year": movie.get("year"),
+                            "rating": rating,
+                            "overview": movie.get("overview"),
+                            "genres": movie.get("genres") or []
+                        })
+
+                symlinks_list.append(item)
+
     target_counts = Counter(item["target"] for item in symlinks_list if item["target_exists"])
     results = [{
         **item,
         "ref_count": target_counts.get(item["target"], 0) if item["target_exists"] else 0
     } for item in symlinks_list]
 
-    logger.success(f"{len(results)} liens symboliques scannés")
+    logger.success(f"{len(results)} symlinks scannés (Radarr index {len(radarr_index)})")
     return results
 
 # ---------------
@@ -193,10 +253,12 @@ def list_symlinks(
     - folder = nom de racine (ex: "movies" ou "shows")
     - sort = symlink | target | ref_count | created_at
     - order = asc | desc
+    - orphans = liens brisés (cible absente) → basé UNIQUEMENT sur target_exists=False
     """
     try:
         items = list(symlink_store or [])
-    except Exception as e:
+        logger.debug(f"📦 /symlinks | store_id={id(symlink_store)} | items={len(items)}")
+    except Exception:
         logger.exception("💥 Impossible de lire symlink_store")
         return {
             "total": 0,
@@ -226,17 +288,19 @@ def list_symlinks(
                 i for i in items
                 if s_low in i.get("symlink", "").lower()
                 or s_low in i.get("target", "").lower()
+                or s_low in str(i.get("title", "")).lower()
+                or s_low == str(i.get("id", ""))
+                or s_low == str(i.get("tmdbId", ""))
             ]
 
-        # ⚠️ Filtre orphelins
+        # ⚠️ Filtre orphelins (cible absente)
         if orphans:
-            items = [i for i in items if i.get("ref_count", 0) == 0]
+            items = [i for i in items if not i.get("target_exists", True)]
 
         # ↕️ Tri
         reverse = order.lower() == "desc"
         if sort in {"symlink", "target", "ref_count", "created_at"}:
             try:
-                # 🕒 pour created_at, on convertit en datetime si possible
                 if sort == "created_at":
                     items.sort(
                         key=lambda x: datetime.fromisoformat(x.get("created_at"))
@@ -263,11 +327,11 @@ def list_symlinks(
             "page": page,
             "limit": limit,
             "data": paginated,
-            "orphaned": sum(1 for i in items if i.get("ref_count", 0) == 0),
-            "unique_targets": len(set(i["target"] for i in items if i.get("ref_count", 0) > 0)),
+            "orphaned": sum(1 for i in items if not i.get("target_exists", True)),
+            "unique_targets": len(set(i["target"] for i in items if i.get("target_exists", True))),
         }
 
-    except Exception as e:
+    except Exception:
         logger.exception("💥 Erreur interne dans /symlinks")
         return {
             "total": 0,
@@ -282,29 +346,49 @@ def list_symlinks(
 # Scan
 # -----
 @router.post("/scan")
-async def trigger_scan():
+async def trigger_scan(radarr: RadarrService = Depends(RadarrService)):
+    global symlink_store
     try:
-        data = scan_symlinks()
-        symlink_store.clear()
-        symlink_store.extend(data)
-        sse_manager.publish_event("symlink_update", json.dumps({"event": "refreshed"}))
+        logger.info("🚀 [SCAN] Début du scan symlinks")
+        scanned = await run_in_threadpool(scan_symlinks, radarr)
 
-        return {"message": "Scan terminé", "count": len(data), "data": data}
+        # ✅ IMPORTANT : modifier la liste en place pour conserver la référence partagée
+        symlink_store.clear()
+        symlink_store.extend(scanned)
+
+        payload = {
+            "event": "scan_completed",
+            "count": len(symlink_store),
+        }
+        sse_manager.publish_event("symlink_update", payload)
+
+        return {
+            "message": "Scan terminé",
+            "count": len(symlink_store),
+            "data": symlink_store,
+        }
     except Exception as e:
+        logger.error(f"💥 Erreur scan: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 # ---
 # SSE
 # ---
 @router.get("/events")
-async def symlink_sse(request: Request):
+async def get_events():
     async def event_generator():
-        async for event in sse_manager.subscribe("symlink_update"):
-            if await request.is_disconnected():
-                break
-            yield f"data: {event}\n\n"
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+        async for message in sse_manager.subscribe():
+            yield message
 
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Transfer-Encoding": "chunked",
+        },
+    )
 
 # -----------------------
 # Racines (pour le front)
@@ -323,23 +407,20 @@ def list_root_folders():
             if path.exists():
                 roots.append(path.name)
         return roots
-    except Exception as e:
+    except Exception:
         logger.exception("💥 Erreur récupération dossiers racines")
         return []
 
-
 # --------------------------
-# Construction lien radarr a partir du sous domaine et du nom du film
+# Lien Radarr (UI publique)
 # --------------------------
-
 @router.get("/get-radarr-url/{symlink_path:path}")
 async def get_radarr_movie_url(
     symlink_path: str,
     radarr: RadarrService = Depends(RadarrService)
 ):
     """
-    Renvoie l'URL publique du film dans Radarr (interface web).
-    (basé uniquement sur la DB locale, comme Sonarr)
+    Renvoie l'URL publique du film dans Radarr (interface web), via Traefik.
     """
     raw_name = Path(symlink_path).stem
     cleaned = clean_movie_name(raw_name)
@@ -352,14 +433,49 @@ async def get_radarr_movie_url(
     if not title_slug:
         raise HTTPException(status_code=500, detail="Champ titleSlug manquant dans la réponse Radarr")
 
-    # 🔑 Récupération dynamique du host depuis Traefik
     host = get_traefik_host("radarr")
     if not host:
         raise HTTPException(status_code=500, detail="Impossible de déterminer l'URL publique Radarr")
 
     url = f"https://{host}/movie/{title_slug}"
-
+    logger.debug(f"🔗 Radarr URL: {url}")
     return {"url": url, "title": movie["title"]}
+
+# --------------------------
+# ID + Poster Radarr (proxy)
+# --------------------------
+@router.get("/get-radarr-id/{movie_folder}")
+async def get_radarr_id(
+    movie_folder: str,
+    radarr: RadarrService = Depends(RadarrService)
+):
+    try:
+        logger.debug("🎬 get-radarr-id appelé avec: {}", movie_folder)
+        movie = radarr.get_movie_by_clean_title(movie_folder)
+
+        if not movie:
+            logger.warning("❌ Aucun film trouvé pour {}", movie_folder)
+            raise HTTPException(status_code=404, detail=f"Film non trouvé: {movie_folder}")
+
+        host = get_traefik_host("radarr")
+        if not host:
+            raise HTTPException(status_code=500, detail="Impossible de déterminer l'URL publique Radarr")
+
+        poster_url = None
+        if "images" in movie:
+            poster = next((img.get("url") for img in movie["images"] if img.get("coverType") == "poster"), None)
+            if poster:
+                poster_url = f"https://{host}{poster}"
+
+        return {
+            "id": movie.get("id"),
+            "title": movie.get("title"),
+            "poster": poster_url,
+        }
+
+    except Exception as e:
+        logger.error("💥 Erreur get-radarr-id pour {}: {}", movie_folder, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -------------------------
 # Suppression (Radarr)
@@ -386,6 +502,7 @@ async def delete_broken_symlinks(
             for ld in config_manager.config.links_dirs
             if ld.manager == "radarr"
         }
+        logger.debug(f"📁 Racines Radarr: {roots}")
     except Exception as e:
         logger.error(f"❌ Impossible de lire links_dirs : {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Configuration invalide")
@@ -394,7 +511,6 @@ async def delete_broken_symlinks(
         logger.warning("⚠️ Aucune racine Radarr trouvée")
         return {"message": "Aucune racine Radarr trouvée", "deleted": 0}
 
-    # Vérifie que le chemin reste sous la racine
     def is_relative_to(child: Path, parent: Path) -> bool:
         try:
             child.relative_to(parent)
@@ -403,8 +519,9 @@ async def delete_broken_symlinks(
             return False
 
     items = list(symlink_store)
+    logger.debug(f"📦 Cache actuel: {len(items)} symlinks en mémoire")
 
-    # Filtre par dossier
+    # 📂 Filtre par dossier si précisé
     if folder:
         key = folder.lower()
         if key in root_map:
@@ -412,74 +529,86 @@ async def delete_broken_symlinks(
         else:
             folder_paths = [(r / folder) for r in roots]
 
+        before = len(items)
         items = [
             i for i in items
             if any(is_relative_to(Path(i["symlink"]), fp) for fp in folder_paths)
         ]
-        logger.debug(f"📁 Filtrage sur '{folder}' — {len(items)} éléments restants")
+        logger.debug(f"📁 Filtrage sur '{folder}' — {before} → {len(items)} éléments restants")
 
-    # Ne garder que les symlinks cassés sous racines Radarr
+    # 🔎 Ne garder que les symlinks cassés (cible absente)
     broken_symlinks = [
         i for i in items
-        if i.get("ref_count", 0) == 0 and any(is_relative_to(Path(i["symlink"]), r) for r in roots)
+        if not i.get("target_exists", True)
+        and any(is_relative_to(Path(i["symlink"]), r) for r in roots)
     ]
+
+    logger.info(f"🧹 {len(broken_symlinks)} symlinks détectés comme cassés (avant suppression)")
 
     if not broken_symlinks:
         return {"message": "Aucun symlink cassé à supprimer", "deleted": 0}
 
-    logger.info(f"🔍 {len(broken_symlinks)} symlinks cassés à traiter")
-
     deleted_count = 0
     errors: list[str] = []
 
-    all_movies = []
     for item in broken_symlinks:
         try:
             symlink_path = Path(item["symlink"])
+            logger.debug(f"➡️ Traitement du symlink cassé: {symlink_path} | cible={item['target']}")
 
-            # Vérification stricte : c'est bien un symlink dans la racine
+            # Vérification stricte : c'est bien un symlink sous une racine Radarr
             if not any(is_relative_to(symlink_path, r) for r in roots):
                 logger.warning(f"⛔ Chemin interdit (hors racines Radarr) : {symlink_path}")
                 continue
 
             if not symlink_path.is_symlink():
-                logger.warning(f"⚠️ Pas un symlink valide : {symlink_path}")
+                logger.warning(f"⚠️ Pas un symlink valide (fichier disparu ou transformé) : {symlink_path}")
                 continue
 
-            # Suppression physique
-            symlink_path.unlink()
-            logger.info(f"🗑️ Supprimé : {symlink_path}")
+            # 🗑️ Suppression physique
+            symlink_path.unlink(missing_ok=True)
+            logger.info(f"🗑️ Supprimé physiquement : {symlink_path}")
             deleted_count += 1
 
-            # Identifier le film
+            # 🎬 Identifier le film associé
             raw_name = symlink_path.parent.name
             cleaned = clean_movie_name(raw_name)
-            norm_cleaned = normalize_name(cleaned)
+            logger.debug(f"🎬 Nettoyage nom film: brut='{raw_name}' → clean='{cleaned}'")
 
-            match = radarr.get_movie_by_clean_title(raw_name)
-
+            match = radarr.get_movie_by_clean_title(cleaned)
             if not match:
-                logger.warning(f"❗ Aucun film trouvé pour : {cleaned}")
+                logger.warning(f"❗ Aucun film trouvé dans Radarr pour : {cleaned}")
                 continue
 
             movie_id = match["id"]
+            logger.debug(f"🎬 Film associé trouvé: {match.get('title')} (ID={movie_id})")
 
             try:
                 radarr.refresh_movie(movie_id)
                 await asyncio.sleep(2)
                 radarr.search_missing_movie(movie_id)
-                logger.info(f"📥 Recherche relancée pour : {match.get('title', 'Inconnu')}")
+                logger.info(f"📥 Recherche relancée dans Radarr pour : {match.get('title')}")
             except Exception as e:
                 err_msg = f"{symlink_path}: action Radarr échouée — {e}"
                 logger.error(err_msg)
                 errors.append(err_msg)
 
+            # 📡 Event SSE incrémental
+            payload = {
+                "event": "symlink_removed",
+                "path": str(symlink_path),
+                "movie": {
+                    "id": movie_id,
+                    "title": match.get("title", "Inconnu")
+                }
+            }
+            logger.debug(f"📡 Envoi event SSE symlink_removed: {payload}")
+            sse_manager.publish_event("symlink_update", payload)
+
         except Exception as e:
-            err_msg = f"Erreur {item['symlink']}: {str(e)}"
+            err_msg = f"💥 Erreur {item['symlink']}: {str(e)}"
             logger.error(err_msg, exc_info=True)
             errors.append(err_msg)
-
-    sse_manager.publish_event("symlink_update", json.dumps({"event": "refreshed"}))
 
     return {
         "message": f"{deleted_count} symlinks cassés supprimés",
@@ -494,38 +623,30 @@ async def delete_symlink(
     radarr: RadarrService = Depends(RadarrService)
 ):
     """
-    Supprime un symlink (Radarr) à partir d'un chemin RELATIF à une des racines déclarées
-    dans config_manager.config.links_dirs, puis relance un refresh + search Radarr sur le film.
+    Supprime un symlink (Radarr) :
+    - Supprime physiquement le lien symbolique si présent (même si cible orpheline)
+    - Essaie d’identifier le film Radarr associé (par titre ou imdb/tmdb)
+    - Relance refresh + search Radarr si trouvé
+    - Publie un event SSE informatif
     """
-    logger.debug("🔧 Début de la suppression du symlink (Radarr)")
-    logger.debug(f"📥 Chemin relatif reçu : {symlink_path}")
-
     try:
-        # 🔹 Déterminer les racines Radarr
+        # 🔎 Identifier racines Radarr
         if root:
             root_paths = {
                 Path(ld.path).name: Path(ld.path).resolve()
-                for ld in config_manager.config.links_dirs
-                if ld.manager == "radarr"
+                for ld in config_manager.config.links_dirs if ld.manager == "radarr"
             }
             if root not in root_paths:
-                logger.warning(f"❌ Racine '{root}' introuvable dans la configuration Radarr")
                 raise HTTPException(status_code=400, detail="Racine Radarr inconnue")
             roots = [root_paths[root]]
         else:
-            roots = [
-                Path(ld.path).resolve()
-                for ld in config_manager.config.links_dirs
-                if ld.manager == "radarr"
-            ]
+            roots = [Path(ld.path).resolve() for ld in config_manager.config.links_dirs if ld.manager == "radarr"]
 
-        # 🔹 Recherche du symlink exact
         candidate_abs = None
         for r in roots:
             test_path = (r / symlink_path)
-            logger.debug(f"🔍 Test du chemin candidat (non résolu) : {test_path}")
             try:
-                test_path.relative_to(r)  # sécurise que c'est bien dans la racine
+                test_path.relative_to(r)
                 if test_path.is_symlink():
                     candidate_abs = test_path
                     break
@@ -533,83 +654,165 @@ async def delete_symlink(
                 continue
 
         if not candidate_abs:
-            logger.warning(f"❌ Chemin invalide ou symlink introuvable : {symlink_path}")
-            raise HTTPException(status_code=404, detail="Symlink introuvable dans les racines Radarr")
+            raise HTTPException(status_code=404, detail="Symlink introuvable dans Radarr")
 
-        # 🔹 Suppression physique
-        try:
-            candidate_abs.unlink()
-            logger.info(f"🗑️ Symlink supprimé : {candidate_abs}")
-        except Exception as e:
-            logger.error(f"💥 Erreur suppression symlink : {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"Erreur suppression symlink : {e}")
+        # 🗑️ Suppression du symlink même si la cible est orpheline
+        if candidate_abs.is_symlink():
+            try:
+                candidate_abs.unlink(missing_ok=True)  # ⚡ Python 3.8+ → évite crash si déjà manquant
+                logger.info(f"🗑️ Symlink supprimé : {candidate_abs}")
+            except Exception as e:
+                logger.warning(f"⚠️ Impossible de supprimer le symlink {candidate_abs} : {e}")
 
-        # 🔹 Identifier le film dans Radarr
+        # 🎬 Essayer d’identifier le film
+        movie = None
         raw_name = candidate_abs.parent.name
-        logger.debug(f"🎬 Nom brut récupéré : {raw_name}")
+        cleaned = clean_movie_name(raw_name)
 
-        cleaned_title = clean_movie_name(raw_name)
-        movie = radarr.get_movie_by_clean_title(cleaned_title)
+        try:
+            movie = radarr.get_movie_by_clean_title(cleaned)
+        except Exception as e:
+            logger.warning(f"⚠️ Impossible de récupérer le film '{cleaned}' via Radarr : {e}")
+
+        # Fallback : tenter par imdbId si présent dans le nom
         if not movie:
-            logger.warning(f"❗ Film introuvable dans Radarr : {cleaned_title}")
-            raise HTTPException(status_code=404, detail=f"Aucun film trouvé : {cleaned_title}")
+            imdb_match = re.search(r"\{imdb-(tt\d+)\}", symlink_path)
+            if imdb_match:
+                imdb_id = imdb_match.group(1)
+                try:
+                    movie = radarr.get_movie_by_imdb(imdb_id)
+                    if movie:
+                        logger.info(f"🎯 Film trouvé via IMDb {imdb_id} : {movie.get('title')}")
+                except Exception:
+                    pass
 
-        movie_id = movie["id"]
-        logger.info(f"🎯 Film trouvé : {movie.get('title', 'Inconnu')} ({movie.get('year', '?')}) — ID : {movie_id}")
+        if movie:
+            movie_id = movie["id"]
+            radarr.refresh_movie(movie_id)
+            await asyncio.sleep(2)
+            radarr.search_missing_movie(movie_id)
+            logger.info(f"📥 Recherche relancée pour {movie.get('title')}")
 
-        # 🔹 Actions Radarr
-        radarr.refresh_movie(movie_id)
-        await asyncio.sleep(2)
-        radarr.search_missing_movie(movie_id)
-        logger.info(f"📥 Recherche relancée pour : {movie.get('title', 'Inconnu')}")
+            payload = {
+                "event": "symlink_removed",
+                "path": str(candidate_abs),
+                "movie": {
+                    "id": movie_id,
+                    "title": movie.get("title")
+                }
+            }
+            sse_manager.publish_event("symlink_update", payload)
 
-        # 🔹 Notifier le front
-        sse_manager.publish_event("symlink_update", json.dumps({"event": "refreshed"}))
-
-        return {"message": f"✅ Symlink supprimé et recherche relancée pour '{movie.get('title', 'Inconnu')}'"}
+            return {"message": f"✅ Symlink supprimé et recherche relancée pour {movie.get('title')}"}
+        else:
+            logger.warning(f"⚠️ Aucun film associé trouvé pour {candidate_abs}")
+            return {"message": "✅ Symlink supprimé (film non retrouvé dans Radarr, aucune recherche lancée)"}
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"💥 Erreur inattendue dans delete_symlink : {e}", exc_info=True)
+        logger.error(f"💥 Erreur suppression symlink : {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Erreur interne : {e}")
-
 
 # --------------------------
 # (Sonarr) –> seasonarr
 # --------------------------
+
 @router.get("/get-sonarr-id/{symlink_path:path}")
 async def get_sonarr_series_id_only(
     symlink_path: str,
     sonarr: SonarrService = Depends(SonarrService)
 ):
     """
-    Récupère uniquement l'ID Sonarr et le titre correspondant à une série.
+    Récupère les infos principales d'une série + saison/épisode à partir d’un symlink.
     """
     logger.debug(f"📥 Chemin reçu : {symlink_path}")
 
     try:
-        cleaned = clean_series_name(Path(symlink_path).parts[0])
-        logger.debug(f"🔍 Nom de série nettoyé : {cleaned}")
+        parts = Path(symlink_path).parts
+        if not parts:
+            raise HTTPException(status_code=400, detail="Chemin invalide")
 
+        # --- Identifier le bon dossier "série"
+        raw_series = None
+        if "shows" in parts:
+            try:
+                show_idx = parts.index("shows") + 1
+                raw_series = parts[show_idx]
+            except Exception:
+                raw_series = parts[0]
+        else:
+            raw_series = parts[0]
+
+        cleaned = clean_series_name(raw_series)
+        logger.debug(f"🔍 Série nettoyée : {cleaned}")
+
+        # --- Trouver la série dans Sonarr
         series = sonarr.get_series_by_clean_title(cleaned)
         if not series:
             logger.warning(f"❌ Série '{cleaned}' introuvable dans Sonarr")
             raise HTTPException(status_code=404, detail="Série introuvable dans Sonarr")
 
+        # --- Poster (proxy interne)
+        poster_url = None
+        poster = next(
+            (img for img in series.get("images", []) if img.get("coverType") == "poster"),
+            None
+        )
+        if poster:
+            poster_url = f"/api/v1/proxy-image?url={poster['url']}&instance_id=1"
+
+        # --- Extraire Saison / Épisode depuis le nom du fichier
+        filename = Path(symlink_path).name
+        match = re.search(r"(?:S(\d{1,2})E(\d{1,2})|(\d{1,2})x(\d{1,2}))", filename, re.IGNORECASE)
+
+        season_num, episode_num, episode_title, downloaded = None, None, None, None
+
+        if match:
+            if match.group(1) and match.group(2):
+                season_num = int(match.group(1))
+                episode_num = int(match.group(2))
+            else:
+                season_num = int(match.group(3))
+                episode_num = int(match.group(4))
+
+            logger.debug(f"🎯 Détecté S{season_num:02d}E{episode_num:02d}")
+
+            # --- Chercher l’épisode exact dans Sonarr
+            episodes = sonarr.get_all_episodes(series["id"])
+            ep = next(
+                (e for e in episodes if e["seasonNumber"] == season_num and e["episodeNumber"] == episode_num),
+                None
+            )
+            if ep:
+                episode_title = ep.get("title")
+                downloaded = ep.get("hasFile", False)
+
         logger.info(f"🔑 Série trouvée : {series['title']} (ID: {series['id']})")
-        return {"id": series["id"], "title": series["title"]}
+
+        return {
+            "id": series["id"],
+            "title": series["title"],
+            "poster": poster_url,
+            "year": series.get("year"),
+            "status": series.get("status"),
+            "network": series.get("network"),
+            "genres": series.get("genres", []),
+            "season": season_num,
+            "episode": episode_num,
+            "episodeTitle": episode_title,
+            "downloaded": downloaded,
+        }
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"💥 Erreur lors de la récupération de l'ID série Sonarr : {e}", exc_info=True)
+        logger.error(f"💥 Erreur lors de la récupération Sonarr : {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Erreur interne : {e}")
 
 # --------------------------
-# Construction lien sonarr a partir du sous domaine et du nom de la serie
+# Lien Sonarr (UI publique)
 # --------------------------
-
 @router.get("/get-sonarr-url/{symlink_path:path}")
 async def get_sonarr_series_url(
     symlink_path: str,
@@ -628,13 +831,11 @@ async def get_sonarr_series_url(
     if not title_slug:
         raise HTTPException(status_code=500, detail="Champ titleSlug manquant dans la réponse Sonarr")
 
-    # 🔑 Récupération dynamique du host depuis Traefik
     host = get_traefik_host("sonarr")  # ou "tv" selon ton conteneur
     if not host:
         raise HTTPException(status_code=500, detail="Impossible de déterminer l'URL publique Sonarr")
 
     url = f"https://{host}/series/{title_slug}"
-
     return {"url": url, "title": series["title"]}
 
 # --------------------------
@@ -646,11 +847,17 @@ async def delete_symlink_sonarr(
     root: Optional[str] = Query(None, description="Nom de la racine (ex: shows)"),
     sonarr: SonarrService = Depends(SonarrService)
 ):
-    logger.debug("🔧 Début de la suppression du symlink (Sonarr)")
+    """
+    Supprime un symlink Sonarr et relance la recherche :
+    - si SxxEyy détecté → recherche épisode précis
+    - si Sxx seulement → recherche saison
+    - sinon → recherche globale série
+    """
+    logger.debug("🔧 Début suppression symlink (Sonarr)")
     logger.debug(f"📥 Chemin relatif reçu : {symlink_path}")
 
     try:
-        # 1️⃣ Récupération des racines Sonarr
+        # 1️⃣ Récupérer racines Sonarr
         if root:
             root_paths = {
                 Path(ld.path).name.lower(): Path(ld.path)
@@ -658,17 +865,16 @@ async def delete_symlink_sonarr(
                 if ld.manager == "sonarr"
             }
             if root.lower() not in root_paths:
-                logger.warning(f"❌ Racine '{root}' introuvable dans la configuration Sonarr")
+                logger.warning(f"❌ Racine '{root}' introuvable dans config Sonarr")
                 raise HTTPException(status_code=400, detail="Racine Sonarr inconnue")
             roots = [root_paths[root.lower()]]
         else:
             roots = [Path(ld.path) for ld in config_manager.config.links_dirs if ld.manager == "sonarr"]
 
-        # 2️⃣ Construction du chemin brut du symlink
+        # 2️⃣ Vérifier symlink
         candidate_abs = None
         for r in roots:
-            test_path = r / symlink_path  # NE PAS resolve ici
-            logger.debug(f"🔍 Test du chemin candidat (brut) : {test_path}")
+            test_path = r / symlink_path
             try:
                 test_path.relative_to(r)
                 candidate_abs = test_path
@@ -677,55 +883,74 @@ async def delete_symlink_sonarr(
                 continue
 
         if not candidate_abs:
-            logger.warning(f"❌ Chemin invalide ou symlink introuvable : {symlink_path}")
-            raise HTTPException(status_code=404, detail="Symlink introuvable dans les racines Sonarr")
+            logger.warning(f"❌ Chemin invalide ou introuvable : {symlink_path}")
+            raise HTTPException(status_code=404, detail="Symlink introuvable")
 
-        # 3️⃣ Suppression physique du lien
+        # 3️⃣ Suppression physique
         try:
             if candidate_abs.exists() or candidate_abs.is_symlink():
                 if candidate_abs.is_symlink():
                     candidate_abs.unlink()
                     logger.info(f"🗑️ Symlink supprimé : {candidate_abs}")
                 else:
-                    logger.warning(f"⚠️ Le chemin trouvé n'est pas un symlink : {candidate_abs}")
+                    logger.warning(f"⚠️ Pas un symlink : {candidate_abs}")
             else:
-                logger.warning(f"⚠️ Le fichier à supprimer n'existe plus : {candidate_abs}")
+                logger.warning(f"⚠️ Déjà inexistant : {candidate_abs}")
         except Exception as e:
-            logger.error(f"💥 Erreur lors de la suppression physique du symlink : {e}", exc_info=True)
+            logger.error(f"💥 Erreur suppression symlink : {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Erreur suppression symlink : {e}")
 
-        # 4️⃣ Identification série dans Sonarr
-        try:
-            cleaned = clean_series_name(Path(symlink_path).parts[0])
-            series = sonarr.get_series_by_clean_title(cleaned)
-            if not series:
-                logger.warning(f"❗ Série '{cleaned}' introuvable dans Sonarr")
-                raise HTTPException(status_code=404, detail="Série introuvable dans Sonarr")
-        except Exception as e:
-            logger.error(f"💥 Erreur lors de la récupération de la série dans Sonarr : {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"Erreur récupération série Sonarr : {e}")
+        # 4️⃣ Identifier la série
+        cleaned = clean_series_name(Path(symlink_path).parts[0])
+        series = sonarr.get_series_by_clean_title(cleaned)
+        if not series:
+            logger.warning(f"❗ Série '{cleaned}' introuvable dans Sonarr")
+            return {"message": f"✅ Symlink supprimé (aucune série trouvée : {cleaned})"}
 
-        # 5️⃣ Relance recherche saison si applicable
+        series_id = series["id"]
+
+        # 5️⃣ Déterminer saison / épisode
+        filename = Path(symlink_path).name
+        episode_match = re.search(r"[Ss](\d{1,2})[Ee](\d{1,2})", filename)
+        season_match = re.search(r"[Ss](\d{1,2})", filename)
+
         try:
-            season_match = re.search(r"S(\d{2})", symlink_path, re.IGNORECASE)
-            if season_match:
-                season_number = int(season_match.group(1))
-                sonarr.refresh_series(series["id"])
+            if episode_match:
+                season = int(episode_match.group(1))
+                episode = int(episode_match.group(2))
+                sonarr.refresh_series(series_id)
                 await asyncio.sleep(1)
-                sonarr.search_season(series["id"], season_number)
-                logger.info(f"📥 Recherche relancée pour la saison {season_number} de '{series['title']}'")
+
+                episodes = sonarr.get_all_episodes(series_id)
+                ep = next(
+                    (e for e in episodes if e["seasonNumber"] == season and e["episodeNumber"] == episode),
+                    None
+                )
+                if ep:
+                    sonarr.search_season(series_id, season)  # Sonarr ne supporte pas recherche épisode direct
+                    logger.info(f"📥 Recherche relancée pour {series['title']} S{season:02d}E{episode:02d}")
+            elif season_match:
+                season = int(season_match.group(1))
+                sonarr.refresh_series(series_id)
+                await asyncio.sleep(1)
+                sonarr.search_season(series_id, season)
+                logger.info(f"📥 Recherche relancée pour saison {season} de {series['title']}")
+            else:
+                sonarr.refresh_series(series_id)
+                await asyncio.sleep(1)
+                sonarr.search_missing_episodes(series_id)
+                logger.info(f"📥 Recherche relancée pour la série entière {series['title']}")
         except Exception as e:
-            logger.error(f"💥 Erreur lors du rafraîchissement/recherche dans Sonarr : {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"Erreur recherche saison Sonarr : {e}")
+            logger.error(f"💥 Erreur recherche Sonarr : {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Erreur recherche Sonarr : {e}")
 
         return {"message": f"✅ Symlink supprimé et recherche relancée pour '{series['title']}'"}
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"💥 Erreur inattendue dans delete_symlink_sonarr : {e}", exc_info=True)
+        logger.error(f"💥 Erreur inattendue delete_symlink_sonarr : {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Erreur interne : {e}")
-
 
 # ------------------------------------
 # Suppression en masse (Sonarr, séries)
@@ -761,7 +986,6 @@ async def delete_broken_sonarr_symlinks(
         logger.warning("⚠️ Aucun dossier racine Sonarr trouvé")
         return {"message": "Aucune racine Sonarr trouvée", "deleted": 0}
 
-    # 🔒 Même utilitaire que Radarr : ne suit pas la cible, compare les chemins
     def is_relative_to(child: Path, parent: Path) -> bool:
         try:
             child.relative_to(parent)
@@ -780,17 +1004,16 @@ async def delete_broken_sonarr_symlinks(
         else:
             folder_paths = [(r / folder) for r in roots]
 
-        # Debug ciblé pour comprendre les 0 matchs
+        # Debug ciblé
         logger.debug(f"🧭 folder='{folder}' | folder_paths={folder_paths}")
         _sample = items if len(items) <= 200 else items[:200]
         for i in _sample:
             child = Path(i["symlink"])
             for fp in folder_paths:
                 try:
-                    res = is_relative_to(child, fp)
+                    _ = is_relative_to(child, fp)
                 except Exception as e:
                     logger.debug(f"TEST_ERROR child={child} parent={fp} err={e}")
-                    res = False
 
         before_count = len(items)
         items = [
@@ -826,13 +1049,12 @@ async def delete_broken_sonarr_symlinks(
     def _norm(s: str) -> str:
         return normalize_name(clean_series_name(s or ""))
 
-    series_index = { _norm(s.get("title", "")): s for s in all_series }
+    series_index = {_norm(s.get("title", "")): s for s in all_series}
 
     for item in broken_symlinks:
         try:
             symlink_path = Path(item["symlink"])
 
-            # Vérification stricte : sous racines Sonarr
             if not any(is_relative_to(symlink_path, r) for r in roots):
                 logger.warning(f"⛔ Chemin interdit (hors racines Sonarr) : {symlink_path}")
                 continue
@@ -846,20 +1068,16 @@ async def delete_broken_sonarr_symlinks(
             logger.info(f"🗑️ Supprimé : {symlink_path}")
             deleted_count += 1
 
-            # 📂 Identifier la série à partir du dossier de série
-            # .../<Serie>/Saison XX/<fichier>
+            # 📂 Identifier la série
             series_dir = symlink_path.parent.parent
             raw_series_name = series_dir.name
             norm_cleaned = _norm(raw_series_name)
 
             match = series_index.get(norm_cleaned)
             if not match:
-                # Fallback : match "contains" tolérant
                 match = next(
-                    (
-                        s for k, s in series_index.items()
-                        if k == norm_cleaned or k in norm_cleaned or norm_cleaned in k
-                    ),
+                    (s for k, s in series_index.items()
+                     if k == norm_cleaned or k in norm_cleaned or norm_cleaned in k),
                     None
                 )
 
@@ -870,7 +1088,6 @@ async def delete_broken_sonarr_symlinks(
             series_id = match.get("id")
             logger.info(f"📺 Série trouvée : {match.get('title', raw_series_name)} (ID={series_id})")
 
-            # 🔄 Refresh Sonarr (garde la même logique que ta version)
             try:
                 sonarr.refresh_series(series_id)
                 await asyncio.sleep(2)
@@ -879,7 +1096,7 @@ async def delete_broken_sonarr_symlinks(
                 logger.error(err_msg)
                 errors.append(err_msg)
 
-            # 📂 Vérifie si la saison est vide, sinon ne supprime pas
+            # 📂 Vérifie si la saison est vide
             season_dir = symlink_path.parent
             valid_exts = {".mkv", ".mp4", ".m4v"}
             try:
@@ -896,7 +1113,6 @@ async def delete_broken_sonarr_symlinks(
                 logger.warning(f"⚠️ Erreur lors du scan du dossier de saison : {e}")
                 remaining = None
 
-            # 🚫 Si saison vide → appelle ton endpoint interne de suppression
             if remaining is not None and not remaining:
                 match_season = re.search(r"(\d{1,2})", season_dir.name)
                 if match_season:
@@ -921,7 +1137,6 @@ async def delete_broken_sonarr_symlinks(
             logger.error(msg, exc_info=True)
             errors.append(msg)
 
-    # SSE comme ta version Radarr
     try:
         sse_manager.publish_event("symlink_update", json.dumps({"event": "refreshed"}))
     except Exception as e:
@@ -1015,7 +1230,7 @@ async def delete_sonarr_season(
         logger.debug(f"📁 Répertoire saison trouvé : {season_dir}")
 
         valid_exts = {".mkv", ".mp4", ".m4v"}
-        remaining_files = [f for f in season_dir.iterdir() if f.is_file() and f.suffix.lower() in valid_exts]
+        remaining_files = [f for f in season_dir.iterdir() if f.is_file() and f.suffix.lower() in valid_media_exts]
 
         if remaining_files:
             return {
@@ -1044,7 +1259,7 @@ async def delete_sonarr_season(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"⚠️ Erreur traitement saison {season_number} de {series_name} : {e}", exc_info=True)
+        logger.error(f"⚠️ Erreur traitement saison {number} de {series_name} : {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Erreur traitement saison Sonarr")
 
 # ---------------------------------------
@@ -1198,4 +1413,3 @@ def list_duplicates():
             duplicates.extend(items)
 
     return {"total": len(duplicates), "data": duplicates}
-

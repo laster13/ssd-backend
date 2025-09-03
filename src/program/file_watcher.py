@@ -83,22 +83,43 @@ def _enrich_from_radarr_index(symlink_path: Path) -> dict:
     Enrichit un item à partir de l'index Radarr partagé :
     - id, title, tmdbId, poster
     - year, rating (tmdb si dispo), overview, genres
-    En cas de « MISS », tente un rebuild de l'index (TTL) puis 2e essai.
+    Stratégie hybride :
+      1. Recherche dans le cache
+      2. Si MISS → lookup direct via RadarrService
+      3. Si encore MISS → rebuild complet de l'index
     """
     raw_name = symlink_path.parent.name
     cleaned = clean_movie_name(raw_name)
     norm = normalize_name(cleaned)
 
+    # --- Essai avec index courant
     with _radarr_idx_lock:
         movie = _radarr_index.get(norm) or _radarr_index.get(f"{norm}")
 
+    # --- Lookup direct si MISS
     if not movie:
-        _build_radarr_index(force=False)
+        try:
+            radarr = RadarrService()
+            movie = radarr.get_movie_by_clean_title(raw_name)
+            if movie:
+                logger.debug(f"✅ Film trouvé par lookup direct Radarr: {movie.get('title')}")
+                # 📝 Ajout au cache
+                with _radarr_idx_lock:
+                    _radarr_index[norm] = movie
+                    if movie.get("year"):
+                        _radarr_index[f"{norm}{movie['year']}"] = movie
+        except Exception as e:
+            logger.warning(f"⚠️ Lookup direct Radarr échoué pour '{raw_name}' : {e}")
+
+    # --- Rebuild forcé si toujours MISS
+    if not movie:
+        logger.debug(f"🔄 MISS persistant → rebuild complet de l’index Radarr pour '{raw_name}'")
+        _build_radarr_index(force=True)
         with _radarr_idx_lock:
             movie = _radarr_index.get(norm) or _radarr_index.get(f"{norm}")
 
     if not movie:
-        logger.debug(f"🟡 Enrichissement Radarr: MISS pour '{raw_name}' (norm='{norm}')")
+        logger.debug(f"🟡 Enrichissement Radarr: MISS définitif pour '{raw_name}' (norm='{norm}')")
         return {}
 
     # --- Poster

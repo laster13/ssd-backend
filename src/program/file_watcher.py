@@ -9,6 +9,7 @@ from pathlib import Path
 from loguru import logger
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+
 from src.services.fonctions_arrs import RadarrService
 from program.utils.text_utils import normalize_name, clean_movie_name
 from program.settings.manager import config_manager
@@ -25,23 +26,19 @@ VAULT_PASSWORD_FILE = f"/home/{USER}/.vault_pass"
 symlink_events_buffer = []
 last_sent_time = datetime.utcnow()
 SUMMARY_INTERVAL = 60  # en secondes
-MAX_EVENTS_BEFORE_FLUSH = 20  # flush immédiat si on dépasse ce seuil
-buffer_lock = threading.Lock()  # 🔒 protection accès buffer
+MAX_EVENTS_BEFORE_FLUSH = 20
+buffer_lock = threading.Lock()
 
 # --- Cache d'enrichissement Radarr partagé ---
 _radarr_index: dict[str, dict] = {}
 _radarr_host: str | None = None
 _radarr_idx_lock = threading.Lock()
 _last_index_build = 0.0
-_INDEX_TTL_SEC = 600  # TTL simple pour éviter rebuild trop fréquent
+_INDEX_TTL_SEC = 3600
 
 
 def _build_radarr_index(force: bool = False) -> None:
-    """
-    Construit (ou reconstruit) l'index Radarr pour enrichir rapidement les symlinks :
-    - clés: normalize(title) et normalize(title)+year
-    - host Traefik pour préfixer les posters relatifs
-    """
+    """Construit (ou reconstruit) l’index Radarr partagé"""
     global _radarr_index, _radarr_host, _last_index_build
     now = time.time()
     if not force and (now - _last_index_build) < _INDEX_TTL_SEC and _radarr_index:
@@ -63,7 +60,6 @@ def _build_radarr_index(force: bool = False) -> None:
             if y:
                 idx[f"{norm}{y}"] = m
 
-        # Import tardif (évite import circulaire au chargement)
         from routers.secure.symlinks import get_traefik_host
         host = get_traefik_host("radarr")
 
@@ -79,31 +75,19 @@ def _build_radarr_index(force: bool = False) -> None:
 
 
 def _enrich_from_radarr_index(symlink_path: Path) -> dict:
-    """
-    Enrichit un item à partir de l'index Radarr partagé :
-    - id, title, tmdbId, poster
-    - year, rating (tmdb si dispo), overview, genres
-    Stratégie hybride :
-      1. Recherche dans le cache
-      2. Si MISS → lookup direct via RadarrService
-      3. Si encore MISS → rebuild complet de l'index
-    """
+    """Enrichit un item symlink avec les infos Radarr (cache + fallback direct)"""
     raw_name = symlink_path.parent.name
     cleaned = clean_movie_name(raw_name)
     norm = normalize_name(cleaned)
 
-    # --- Essai avec index courant
     with _radarr_idx_lock:
         movie = _radarr_index.get(norm) or _radarr_index.get(f"{norm}")
 
-    # --- Lookup direct si MISS
     if not movie:
         try:
             radarr = RadarrService()
             movie = radarr.get_movie_by_clean_title(raw_name)
             if movie:
-                logger.debug(f"✅ Film trouvé par lookup direct Radarr: {movie.get('title')}")
-                # 📝 Ajout au cache
                 with _radarr_idx_lock:
                     _radarr_index[norm] = movie
                     if movie.get("year"):
@@ -111,18 +95,9 @@ def _enrich_from_radarr_index(symlink_path: Path) -> dict:
         except Exception as e:
             logger.warning(f"⚠️ Lookup direct Radarr échoué pour '{raw_name}' : {e}")
 
-    # --- Rebuild forcé si toujours MISS
     if not movie:
-        logger.debug(f"🔄 MISS persistant → rebuild complet de l’index Radarr pour '{raw_name}'")
-        _build_radarr_index(force=True)
-        with _radarr_idx_lock:
-            movie = _radarr_index.get(norm) or _radarr_index.get(f"{norm}")
-
-    if not movie:
-        logger.debug(f"🟡 Enrichissement Radarr: MISS définitif pour '{raw_name}' (norm='{norm}')")
         return {}
 
-    # --- Poster
     poster_url = None
     images = movie.get("images") or []
     poster = next((img.get("url") for img in images if img.get("coverType") == "poster"), None)
@@ -133,27 +108,15 @@ def _enrich_from_radarr_index(symlink_path: Path) -> dict:
         else:
             poster_url = poster
 
-    # --- Rating (TMDB si dispo)
-    rating = None
-    ratings = movie.get("ratings") or {}
-    if isinstance(ratings, dict):
-        tmdb_rating = ratings.get("tmdb")
-        if isinstance(tmdb_rating, dict):
-            rating = tmdb_rating.get("value")
-
-    out = {
+    return {
         "id": movie.get("id"),
         "title": movie.get("title"),
         "tmdbId": movie.get("tmdbId"),
         "poster": poster_url,
         "year": movie.get("year"),
-        "rating": rating,
         "overview": movie.get("overview"),
         "genres": movie.get("genres") or []
     }
-
-    logger.debug(f"🟢 Enrichissement Radarr: HIT '{out.get('title')}' (id={out.get('id')}, year={out.get('year')})")
-    return out
 
 
 # --- 1. YAML watcher ---
@@ -178,7 +141,6 @@ class YAMLFileEventHandler(FileSystemEventHandler):
 
                 decrypted_yaml_content = result.stdout
                 update_json_files(decrypted_yaml_content)
-                logger.success("📘 YAML mis à jour avec succès")
 
             except Exception as e:
                 logger.exception(f"💥 Exception YAML: {e}")
@@ -203,7 +165,6 @@ def start_yaml_watcher():
 class SymlinkEventHandler(FileSystemEventHandler):
     def __init__(self):
         self._lock = threading.Lock()
-        self.webhook_url = config_manager.config.discord_webhook_url
 
     def on_any_event(self, event):
         if event.is_directory:
@@ -216,8 +177,6 @@ class SymlinkEventHandler(FileSystemEventHandler):
             self._handle_created(path)
         elif event.event_type == "deleted":
             self._handle_deleted(path)
-        else:
-            logger.debug(f"⚠️ Événement ignoré : {event.event_type}")
 
     def _handle_created(self, symlink_path: Path):
         try:
@@ -225,21 +184,17 @@ class SymlinkEventHandler(FileSystemEventHandler):
             links_dirs = [(Path(ld.path).resolve(), ld.manager) for ld in config.links_dirs]
             mount_dirs = [Path(d).resolve() for d in config.mount_dirs]
 
-            # Trouver la racine et le manager
             root, manager = None, "unknown"
             for ld, mgr in links_dirs:
                 if str(symlink_path).startswith(str(ld)):
                     root, manager = ld, mgr
                     break
             if not root:
-                logger.warning(f"⚠️ Impossible de trouver la racine pour {symlink_path}")
                 return
 
-            # Résolution de la cible (informative)
             try:
                 target_path = symlink_path.resolve(strict=True)
             except FileNotFoundError:
-                # Règle métier: symlink existe => cible OK fonctionnellement
                 target_path = symlink_path.resolve(strict=False)
 
             matched_mount, relative_target = None, None
@@ -252,7 +207,6 @@ class SymlinkEventHandler(FileSystemEventHandler):
                     continue
             full_target = str(matched_mount / relative_target) if matched_mount else str(target_path)
 
-            # Chemin relatif à la racine
             try:
                 relative_path = str(symlink_path.resolve().relative_to(root))
             except Exception:
@@ -261,7 +215,6 @@ class SymlinkEventHandler(FileSystemEventHandler):
             stat = symlink_path.lstat()
             created_at = datetime.fromtimestamp(stat.st_mtime).isoformat()
 
-            # ✅ Règle: symlink présent => cible OK + ref_count=1
             item = {
                 "symlink": str(symlink_path),
                 "relative_path": relative_path,
@@ -273,44 +226,19 @@ class SymlinkEventHandler(FileSystemEventHandler):
                 "ref_count": 1,
             }
 
-            # 🎬 Enrichissement Radarr via index partagé
             if manager == "radarr":
-                try:
-                    extra = _enrich_from_radarr_index(symlink_path)
-                    if extra:
-                        item.update(extra)
-                except Exception as e:
-                    logger.warning(f"⚠️ Enrichissement Radarr impossible pour {symlink_path} : {e}")
+                extra = _enrich_from_radarr_index(symlink_path)
+                if extra:
+                    item.update(extra)
 
-            logger.debug(
-                f"🟢 Nouveau symlink en cache: {item['symlink']} "
-                f"| target={item['target']} | target_exists={item['target_exists']} | ref_count={item['ref_count']}"
-            )
-
-            # ➕ Ajout incrémental (thread-safe, sans réassigner la liste)
             with self._lock:
                 symlink_store.append(item)
 
-            # 📡 Event SSE incrémental
             sse_manager.publish_event("symlink_update", {
                 "event": "symlink_added",
                 "item": item,
                 "count": len(symlink_store),
             })
-
-            # 📨 Alimente le buffer Discord
-            with buffer_lock:
-                symlink_events_buffer.append({
-                    "action": "created",
-                    "symlink": str(symlink_path),
-                    "path": str(symlink_path),
-                    "target": item.get("target"),
-                    "manager": item.get("manager"),
-                    "title": item.get("title"),
-                    "tmdbId": item.get("tmdbId"),
-                    "when": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                })
-                logger.debug(f"📬 Discord buffer += created | size={len(symlink_events_buffer)}")
 
             logger.success(f"➕ Symlink enrichi ajouté au cache : {symlink_path}")
 
@@ -332,106 +260,10 @@ class SymlinkEventHandler(FileSystemEventHandler):
                 "count": len(symlink_store)
             })
             logger.success(f"➖ Symlink supprimé du cache : {symlink_path}")
-        else:
-            logger.warning(f"⚠️ Suppression ignorée, symlink non trouvé en cache : {symlink_path}")
-
-        # 📨 Alimente le buffer Discord (même si non trouvé, on loggue la demande de delete)
-        with buffer_lock:
-            symlink_events_buffer.append({
-                "action": "deleted",
-                "symlink": str(symlink_path),
-                "path": str(symlink_path),
-                "when": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-            })
-            logger.debug(f"📬 Discord buffer += deleted | size={len(symlink_events_buffer)}")
-
-    def _detect_manager(self, path: Path) -> str:
-        for ld in config_manager.config.links_dirs:
-            if str(path).startswith(str(Path(ld.path).resolve())):
-                return ld.manager
-        return "unknown"
 
 
-# --- 3. Flush automatique Discord ---
+# --- 3. Flush Discord ---
 def start_discord_flusher():
-    # 🔒 Verrou de buffer (fallback si non défini ailleurs)
-    lock = globals().get("buffer_lock")
-    if lock is None:
-        lock = threading.Lock()
-        globals()["buffer_lock"] = lock
-
-    # ⚙️ Paramètres par défaut si absents
-    max_before = globals().get("MAX_EVENTS_BEFORE_FLUSH", 25)
-    interval = globals().get("SUMMARY_INTERVAL", 60)
-
-    def _as_datetime(v) -> datetime:
-        """Convertit v en datetime (UTC). Accepte datetime, epoch (int/float), ou str ISO (gère 'Z')."""
-        if isinstance(v, datetime):
-            return v
-        if isinstance(v, (int, float)):
-            return datetime.utcfromtimestamp(v)
-        if isinstance(v, str):
-            s = v.strip()
-            # Tente ISO 8601 simple
-            try:
-                if s.endswith("Z"):
-                    # fromisoformat ne gère pas 'Z' -> convertir en +00:00
-                    s = s[:-1] + "+00:00"
-                # Certaines chaînes sans tz passent quand même; on récupère naive
-                dt = datetime.fromisoformat(s)
-                # Si aware -> convertit en naive UTC
-                try:
-                    return dt.astimezone(tz=None).replace(tzinfo=None)
-                except Exception:
-                    return dt.replace(tzinfo=None)
-            except Exception:
-                pass
-            # Dernières chances: quelques formats courants
-            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%d/%m/%Y %H:%M:%S"):
-                try:
-                    return datetime.strptime(s, fmt)
-                except Exception:
-                    continue
-        # Fallback: maintenant (UTC)
-        return datetime.utcnow()
-
-    def _normalize_batch(batch: list) -> list[dict]:
-        """Homogénéise les événements et renvoie une nouvelle liste de dicts propres."""
-        normalized: list[dict] = []
-        for ev in batch:
-            # Si l'event est une simple string, on l’enveloppe
-            if not isinstance(ev, dict):
-                normalized.append({
-                    "action": "log",
-                    "path": str(ev),
-                    "time": datetime.utcnow(),
-                    "manager": "unknown",
-                    "type": "unknown",
-                })
-                continue
-
-            action = ev.get("action") or ev.get("type") or ({
-                "symlink_added": "created",
-                "symlink_removed": "deleted",
-            }.get(ev.get("event", ""), "update"))
-
-            path = ev.get("path") or ev.get("symlink") or ev.get("target") or "unknown"
-
-            # 🔧 time -> datetime obligatoire
-            time_dt = _as_datetime(
-                ev.get("time") or ev.get("when") or ev.get("created_at") or ev.get("timestamp") or ev.get("ts")
-            )
-
-            normalized.append({
-                **ev,
-                "action": action,
-                "path": path,
-                "time": time_dt,                  # ✅ datetime (pas str)
-                "manager": ev.get("manager") or ev.get("type") or "unknown",
-                "type": ev.get("type") or ev.get("manager") or "unknown",
-            })
-        return normalized
-
     def loop():
         global last_sent_time, symlink_events_buffer
         while True:
@@ -439,51 +271,23 @@ def start_discord_flusher():
                 now = datetime.utcnow()
                 webhook = config_manager.config.discord_webhook_url
 
-                if not webhook:
-                    time.sleep(10)
-                    continue
-
-                send_now = False
-                batch = None
-
-                with lock:
-                    count = len(symlink_events_buffer)
-                    if count >= max_before:
-                        batch = list(symlink_events_buffer)
-                        symlink_events_buffer.clear()
-                        last_sent_time = now
-                        send_now = True
-                        logger.debug(f"🚀 Flush Discord par taille: {count} événements")
-                    elif count > 0 and (now - last_sent_time).total_seconds() >= interval:
-                        batch = list(symlink_events_buffer)
-                        symlink_events_buffer.clear()
-                        last_sent_time = now
-                        send_now = True
-                        logger.debug(f"⏱️ Flush Discord par intervalle: {count} événements")
-
-                if send_now and batch:
-                    # ✅ Normalisation: 'time' devient un datetime, + champs minimaux
-                    safe_batch = _normalize_batch(batch)
+                if webhook and symlink_events_buffer and (now - last_sent_time).total_seconds() >= SUMMARY_INTERVAL:
                     try:
-                        asyncio.run(send_discord_summary(webhook, safe_batch))
-                        logger.info(f"📊 Rapport Discord envoyé ({len(safe_batch)} événements)")
+                        asyncio.run(send_discord_summary(webhook, symlink_events_buffer))
+                        logger.info(f"📊 Rapport Discord envoyé ({len(symlink_events_buffer)} événements)")
+                        symlink_events_buffer.clear()
+                        last_sent_time = now
                     except Exception as e:
                         logger.error(f"💥 Erreur envoi résumé Discord : {e}")
-                        # Réinsère pour re-essai plus tard
-                        with lock:
-                            symlink_events_buffer[:0] = batch
-                        time.sleep(15)
-                        continue
-
                 time.sleep(10)
-
             except Exception as e:
                 logger.error(f"💥 Erreur flusher Discord : {e}")
                 time.sleep(30)
 
     threading.Thread(target=loop, daemon=True).start()
 
-# --- 4. Lancement des watchers ---
+
+# --- 4. Lancement watchers ---
 def start_symlink_watcher():
     logger.info("🛰️ Symlink watcher démarré")
     observers = []
@@ -495,10 +299,8 @@ def start_symlink_watcher():
             logger.warning("⚠️ Aucun répertoire dans 'links_dirs'")
             return
 
-        # ✅ Index Radarr initial (pour enrichir dès les 1ers events)
         _build_radarr_index(force=True)
 
-        # ✅ Scan initial complet (avec Radarr pour avoir les posters)
         try:
             radarr = RadarrService()
         except Exception:
@@ -514,7 +316,6 @@ def start_symlink_watcher():
             "count": len(symlinks_data)
         })
 
-        # ✅ Watchers incrémentaux ensuite
         for dir_path in links_dirs:
             path = Path(dir_path)
             if not path.exists():
@@ -527,10 +328,34 @@ def start_symlink_watcher():
             observers.append(observer)
             logger.info(f"📍 Symlink watcher actif sur {path.resolve()}")
 
+        # === Boucle de fond ===
+        scan_interval = 3600  # 1h
+        last_scan = time.time()
+
         while True:
             logger.debug("📡 Symlink thread actif...")
-            # petit refresh périodique de l'index de manière douce (TTL gère le reste)
             _build_radarr_index(force=False)
+
+            if time.time() - last_scan >= scan_interval:
+                try:
+                    radarr = RadarrService()
+                except Exception:
+                    radarr = None
+
+                symlinks_data = scan_symlinks(radarr)
+                with threading.Lock():
+                    symlink_store.clear()
+                    symlink_store.extend(symlinks_data)
+
+                sse_manager.publish_event("symlink_update", {
+                    "event": "periodic_scan",
+                    "message": "Rescan automatique",
+                    "count": len(symlinks_data)
+                })
+
+                logger.success(f"🔄 Scan périodique exécuté — {len(symlinks_data)} symlinks")
+                last_scan = time.time()
+
             time.sleep(30)
 
     except KeyboardInterrupt:
@@ -538,7 +363,7 @@ def start_symlink_watcher():
         for obs in observers:
             obs.stop()
     except Exception as e:
-        logger.exception(f"💥 Erreur lors du démarrage du watcher symlink : {e}")
+        logger.exception(f"💥 Erreur watcher symlink : {e}")
 
     for obs in observers:
         obs.join()

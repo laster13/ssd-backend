@@ -21,14 +21,11 @@ class SimpleCache:
         if key in self._cache:
             entry = self._cache[key]
             if entry['expires_at'] > time.time():
-                logger.debug(f"Cache hit for key: {key}")
                 return entry['data']
             else:
                 # Expired entry
                 del self._cache[key]
-                logger.debug(f"Cache expired for key: {key}")
         
-        logger.debug(f"Cache miss for key: {key}")
         return None
     
     def set(self, key: str, value: Any, ttl: int = 1800) -> None:
@@ -38,13 +35,11 @@ class SimpleCache:
             'expires_at': time.time() + ttl,
             'created_at': time.time()
         }
-        logger.debug(f"Cache set for key: {key}, TTL: {ttl}s")
     
     def delete(self, key: str) -> bool:
         """Delete key from cache"""
         if key in self._cache:
             del self._cache[key]
-            logger.debug(f"Cache deleted for key: {key}")
             return True
         return False
     

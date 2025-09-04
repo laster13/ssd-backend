@@ -84,7 +84,7 @@ LEVEL_STYLES = {
     "WARNING": {"color": "<fg #FFD93D>", "icon": ICON_MAP["WARNING"]},
     "ERROR": {"color": "<fg #FF6B6B>", "icon": ICON_MAP["ERROR"]},
     "CRITICAL": {"color": "<fg #FF0000><bold>", "icon": ICON_MAP["CRITICAL"]},
-    "SEASONARR": {"color": "<fg #FFB347>", "icon": ICON_MAP["SEASONARR"]},
+    "SEASONARR": {"color": "<fg #FECACA>", "icon": ICON_MAP["SEASONARR"]},
     "WATCHER": {"color": "<fg #A1C4FD>", "icon": ICON_MAP["WATCHER"]},
     "SYSTEM": {"color": "<fg #FFD700>", "icon": ICON_MAP["SYSTEM"]},
     "CONTAINER": {"color": "<fg #00CED1>", "icon": ICON_MAP["CONTAINER"]},
@@ -195,8 +195,8 @@ setup_logging()
 
 # ===== FASTAPI LIFESPAN =====
 load_dotenv()
-origins = os.getenv("CORS_ALLOWED_ORIGINS", "https://ssdv2.lastharo.fr").split(",")
-origins = [o.strip() for o in origins if o.strip()]
+cookie_domain = os.getenv("COOKIE_DOMAIN")
+origins = [f"https://{cookie_domain}"] if cookie_domain else []
 logger.info(f"🚀 CORS ORIGINS: {origins}")
 
 async def start_watchers_async():
@@ -252,10 +252,6 @@ async def log_requests(request: Request, call_next):
         size_kb = len(response.body or b"") / 1024 if hasattr(response, "body") else 0
         client_ip = request.client.host if request.client else "unknown"
 
-        logger.log(
-            "API",
-            f"{request.method} {request.url.path} ({status}) - {process_time:.2f}ms - {size_kb:.1f}KB - IP: {client_ip}"
-        )
     return response
 
 

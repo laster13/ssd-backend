@@ -71,7 +71,7 @@ async def run_script(script_name: str, label: str = Query(None, description="Lab
 
             process.wait()
             yield "event: end\ndata: Fin du script\n\n"
-            logger.success(f"Script terminé : {script_name}")
+            logger.success(f"Opération terminée avec succès : {script_name}")
 
         except Exception as e:
             logger.exception(f"Erreur pendant le script {script_name}")
@@ -133,7 +133,6 @@ async def get_domains():
         app_domains = data["dossiers"]["domaine"]
         result = {app: f"{sub}.{base_domain}" for app, sub in app_domains.items()}
 
-        logger.info(f"Domaines générés : {result}")
         return result
 
     except Exception as e:

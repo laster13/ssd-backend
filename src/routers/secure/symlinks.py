@@ -257,7 +257,6 @@ def list_symlinks(
     """
     try:
         items = list(symlink_store or [])
-        logger.debug(f"📦 /symlinks | store_id={id(symlink_store)} | items={len(items)}")
     except Exception:
         logger.exception("💥 Impossible de lire symlink_store")
         return {
@@ -1317,7 +1316,7 @@ async def repair_missing_seasons(
         if not raw_missing_seasons:
             continue
 
-        logger.info(f"📺 '{series_title}' - Saisons manquantes : {raw_missing_seasons}")
+        logger.info(f"�� '{series_title}' - Saisons manquantes : {raw_missing_seasons}")
 
         try:
             all_episodes = sonarr.get_all_episodes(series_id)

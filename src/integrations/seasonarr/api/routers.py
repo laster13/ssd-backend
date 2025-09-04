@@ -408,12 +408,10 @@ async def get_filter_options(
     cache_key = get_cache_key("filter_options", instance_id)
     cached_result = cache.get(cache_key)
     if cached_result is not None:
-        logger.info(f"Returning cached filter options for instance {instance_id}")
         return cached_result
 
     client = SonarrClient(instance.url, instance.api_key, instance.id)
     try:
-        logger.info(f"Fetching filter options from Sonarr API for instance {instance_id}")
         all_shows_response = await client.get_series(page=1, page_size=1000)
         shows = all_shows_response["shows"]
 
@@ -441,7 +439,6 @@ async def get_filter_options(
         }
 
         cache.set(cache_key, result, ttl=1800)  # 30 min
-        logger.info(f"Cached filter options for instance {instance_id}")
         return result
 
     except Exception as e:
@@ -511,9 +508,6 @@ async def proxy_image(
     from ..db.database import SessionLocal
     from ..db.models import SonarrInstance
 
-    logger.info(f"[proxy_image] Request from {request.client.host}, UA={request.headers.get('user-agent')}")
-    logger.info(f"[proxy_image] url={url}, instance_id={instance_id}")
-
     # Connexion DB
     try:
         db: Session = SessionLocal()
@@ -545,8 +539,6 @@ async def proxy_image(
     full_url = f"{instance_url}{api_url}"
     headers = {"X-Api-Key": instance_api_key}
 
-    logger.info(f"[proxy_image] Fetching image from {full_url}")
-
     try:
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
             resp = await client.get(full_url, headers=headers)
@@ -557,8 +549,6 @@ async def proxy_image(
     if resp.status_code != 200:
         logger.error(f"[proxy_image] Sonarr returned {resp.status_code} for {full_url}")
         raise HTTPException(status_code=resp.status_code, detail="Image not found")
-
-    logger.info(f"[proxy_image] Returning image, size={len(resp.content)} bytes")
 
     return StreamingResponse(
         iter([resp.content]),
@@ -615,7 +605,7 @@ async def search_season_packs(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    logger.info(f"🔍 SEARCH: show_id={request.show_id}, season={request.season_number}, instance_id={request.instance_id}")
+    logger.info(f"🔍 RECHERCHE: show_id={request.show_id}, season={request.season_number}, instance_id={request.instance_id}")
     service = SeasonItService(db, current_user.id)
 
     try:

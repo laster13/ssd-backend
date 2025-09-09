@@ -734,9 +734,9 @@ async def get_sonarr_series_id_only(
 
         # --- Identifier le bon dossier "série"
         raw_series = None
-        if "shows" in parts:
+        if "Medias" in parts:
             try:
-                show_idx = parts.index("shows") + 1
+                show_idx = parts.index("Medias") + 2
                 raw_series = parts[show_idx]
             except Exception:
                 raw_series = parts[0]
@@ -1316,7 +1316,7 @@ async def repair_missing_seasons(
         if not raw_missing_seasons:
             continue
 
-        logger.info(f"�� '{series_title}' - Saisons manquantes : {raw_missing_seasons}")
+        logger.info(f"   '{series_title}' - Saisons manquantes : {raw_missing_seasons}")
 
         try:
             all_episodes = sonarr.get_all_episodes(series_id)

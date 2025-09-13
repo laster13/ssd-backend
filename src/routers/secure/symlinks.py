@@ -1,9 +1,10 @@
 from typing import Optional
 from pathlib import Path
 from collections import Counter
-from fastapi import APIRouter, HTTPException, Query, Request, Depends
+from fastapi import APIRouter, HTTPException, Query, Request, Depends, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from fastapi.concurrency import run_in_threadpool
+from functools import partial
 import json
 import urllib.parse
 import asyncio
@@ -11,15 +12,30 @@ import re
 import os
 import httpx
 import docker
+import threading
 from datetime import datetime
 from loguru import logger
 from urllib.parse import unquote
+from fastapi import BackgroundTasks
 from program.managers.sse_manager import sse_manager
 from src.services.fonctions_arrs import RadarrService, SonarrService
 from program.settings.manager import config_manager
 from program.settings.models import SymlinkConfig
-from program.utils.text_utils import normalize_name, clean_movie_name, clean_series_name
+from program.utils.text_utils import normalize_name, clean_movie_name
 from program.utils.discord_notifier import send_discord_message
+from src.services.medias_movies import MediasMovies
+from src.services.medias_series import MediasSeries
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from program.file_watcher import start_symlink_watcher
+from services.scan_librairies import LibraryScanner
+from program.radarr_cache import (
+    _radarr_index,
+    _radarr_catalog,
+    _radarr_host,
+    _radarr_idx_lock,
+    _build_radarr_index,
+    enrich_from_radarr_index,
+)
 
 router = APIRouter(
     prefix="/symlinks",
@@ -82,6 +98,47 @@ def filter_items_by_folder(items, folder: Optional[str]):
         folder_paths = [(p / folder).resolve() for p in roots]
     return [i for i in items if any(is_relative_to(Path(i["symlink"]), fp) for fp in folder_paths)]
 
+def get_movies_manager() -> MediasMovies:
+    """Instancie MediasMovies avec config.json"""
+    cfg = config_manager.config
+    api_key = cfg.tmdb_api_key
+
+    # Trouver le dossier Radarr/movies
+    movies_dir = None
+    for ld in cfg.links_dirs:
+        if ld.manager == "radarr":  # ou "movies" selon ta convention
+            movies_dir = Path(ld.path)
+            break
+
+    if not api_key:
+        raise RuntimeError("⚠️ TMDB API key manquante dans config.json")
+    if not movies_dir or not movies_dir.exists():
+        raise RuntimeError("⚠️ Dossier films introuvable dans config.json")
+
+    return MediasMovies(base_dir=movies_dir, api_key=api_key)
+
+def get_series_managers() -> list[MediasSeries]:
+    """Instancie MediasSeries pour TOUS les dossiers Sonarr définis dans config.json"""
+    cfg = config_manager.config
+    api_key = cfg.tmdb_api_key
+
+    if not api_key:
+        raise RuntimeError("⚠️ TMDB API key manquante dans config.json")
+
+    managers: list[MediasSeries] = []
+    for ld in cfg.links_dirs:
+        if ld.manager == "sonarr":  # Séries
+            base_dir = Path(ld.path)
+            if base_dir.exists():
+                managers.append(MediasSeries(base_dir=base_dir, api_key=api_key))
+            else:
+                logger.warning(f"⚠️ Dossier introuvable : {base_dir}")
+
+    if not managers:
+        raise RuntimeError("⚠️ Aucun dossier séries (sonarr) trouvé dans config.json")
+
+    return managers
+
 # -------------
 # Settings manager
 # -------------
@@ -91,148 +148,127 @@ async def get_symlinks_config():
     """Récupérer la config symlinks depuis config.json"""
     return config_manager.config
 
+watcher_thread = None
+
 @router.post("/config", response_model=dict)
-async def set_symlinks_config(new_config: SymlinkConfig):
-    """Sauvegarder une nouvelle config symlinks dans config.json"""
+async def set_symlinks_config(new_config: SymlinkConfig, background_tasks: BackgroundTasks):
+    """Sauvegarder une nouvelle config symlinks et démarrer le watcher si nécessaire"""
+    global watcher_thread
     try:
+        # 1️⃣ Sauvegarder la config
         config_manager.config = SymlinkConfig.model_validate(new_config.model_dump())
         config_manager.save()
-        return {"message": "✅ Config mise à jour avec succès !"}
+
+        # 2️⃣ Démarrer le watcher si pas encore actif
+        if not watcher_thread or not watcher_thread.is_alive():
+            def start_watcher():
+                logger.info("🚀 Démarrage du symlink watcher après config")
+                start_symlink_watcher()
+
+            watcher_thread = threading.Thread(target=start_watcher, daemon=True)
+            watcher_thread.start()
+
+        return {"message": "✅ Config mise à jour avec succès ! Watcher actif 🚀"}
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 # -------------
 # Scan symlinks
 # -------------
-def scan_symlinks(radarr: RadarrService | None = None):
+def scan_symlinks_parallel(workers: int = 32):
     """
-    Scan des symlinks + enrichissement Radarr optimisé :
-    - Un seul appel API pour récupérer tous les films
-    - Dictionnaire {normalized_title: movie, normalized_title+year: movie} en RAM
-    - Recherche instantanée pour chaque symlink
-    - Posters Radarr corrigés avec URL publique (Traefik)
-    - Ajout de year, rating, overview, genres
+    Scan des symlinks optimisé avec os.scandir et ThreadPoolExecutor.
+    ⚡ Ne dépend pas d’un cache disque symlinks.
     """
-    global radarr_index
     config = config_manager.config
     links_dirs = [(Path(ld.path).resolve(), ld.manager) for ld in config.links_dirs]
-    mount_dirs = [Path(d).resolve() for d in config.mount_dirs]
 
     for links_dir, _ in links_dirs:
         if not links_dir.exists():
             raise RuntimeError(f"Dossier introuvable : {links_dir}")
-    for mount_dir in mount_dirs:
-        if not mount_dir.exists():
-            raise RuntimeError(f"Dossier introuvable : {mount_dir}")
 
-    # --- Construire index Radarr (si dispo)
-    radarr_index = {}
-    radarr_host = None
-    if radarr:
-        try:
-            all_movies = radarr.get_all_movies()
-            logger.info(f"📚 {len(all_movies)} films récupérés depuis Radarr")
-            for movie in all_movies:
-                cleaned = clean_movie_name(movie.get("title", ""))
-                norm = normalize_name(cleaned)
-                radarr_index[norm] = movie
-                year = movie.get("year")
-                if year:
-                    radarr_index[f"{norm}{year}"] = movie
-            radarr_host = get_traefik_host("radarr")
-        except Exception as e:
-            logger.error(f"❌ Impossible de récupérer la liste complète des films Radarr : {e}")
-
+    tasks = []
     symlinks_list = []
-    for links_dir, manager in links_dirs:
-        for symlink_path in links_dir.rglob("*"):
-            if symlink_path.is_symlink():
-                try:
-                    target_path = symlink_path.resolve(strict=True)
-                except FileNotFoundError:
-                    target_path = symlink_path.resolve(strict=False)
 
-                matched_mount = None
-                relative_target = None
-                for mount_dir in mount_dirs:
-                    try:
-                        relative_target = target_path.relative_to(mount_dir)
-                        matched_mount = mount_dir
-                        break
-                    except ValueError:
-                        continue
-                full_target = str(matched_mount / relative_target) if matched_mount else str(target_path)
+    def process_symlink(symlink_path: str, root: Path, manager: str):
+        try:
+            # Résolution de la cible
+            try:
+                target_path = Path(os.readlink(symlink_path))
+                if not target_path.is_absolute():
+                    target_path = (Path(symlink_path).parent / target_path).resolve()
+            except Exception:
+                target_path = Path(symlink_path).resolve(strict=False)
 
-                try:
-                    relative_path = str(symlink_path.resolve().relative_to(links_dir))
-                except Exception:
-                    relative_path = str(symlink_path).replace(str(links_dir) + "/", "")
+            try:
+                relative_path = str(Path(symlink_path).resolve().relative_to(root))
+            except Exception:
+                relative_path = str(symlink_path).replace(str(root) + "/", "")
 
-                stat = symlink_path.lstat()
-                created_at = datetime.fromtimestamp(stat.st_mtime).isoformat()
+            stat = os.lstat(symlink_path)
+            created_at = datetime.fromtimestamp(stat.st_mtime).isoformat()
 
-                item = {
-                    "symlink": str(symlink_path),
-                    "relative_path": relative_path,
-                    "target": full_target,
-                    "target_exists": target_path.exists(),
-                    "manager": manager,
-                    "type": manager,
-                    "created_at": created_at
-                }
+            item = {
+                "symlink": symlink_path,
+                "relative_path": relative_path,
+                "target": str(target_path),
+                "target_exists": target_path.exists(),
+                "manager": manager,
+                "type": manager,
+                "created_at": created_at,
+            }
 
-                # --- Enrichissement Radarr via index
-                if manager == "radarr" and radarr_index:
-                    raw_name = symlink_path.parent.name
-                    cleaned = clean_movie_name(raw_name)
-                    norm_cleaned = normalize_name(cleaned)
-                    movie = radarr_index.get(norm_cleaned)
-                    if movie:
-                        # Poster
-                        poster_url = None
-                        if "images" in movie:
-                            poster = next(
-                                (img.get("url") for img in movie["images"] if img.get("coverType") == "poster"),
-                                None
-                            )
-                            if poster:
-                                if poster.startswith("/"):
-                                    if radarr_host:
-                                        poster_url = f"https://{radarr_host}{poster}"
-                                    else:
-                                        poster_url = f"{radarr.base_url.rstrip('/')}{poster}"
-                                else:
-                                    poster_url = poster
+            # 🎬 Enrichissement uniquement si manager = radarr
+            if manager == "radarr":
+                extra = enrich_from_radarr_index(Path(symlink_path))
+                if extra:
+                    item.update(extra)
 
-                        # Rating (TMDB si dispo)
-                        rating = None
-                        ratings = movie.get("ratings") or {}
-                        if isinstance(ratings, dict):
-                            tmdb_rating = ratings.get("tmdb")
-                            if isinstance(tmdb_rating, dict):
-                                rating = tmdb_rating.get("value")
+            return item
+        except Exception as e:
+            logger.warning(f"⚠️ Erreur traitement symlink {symlink_path}: {e!r}")
+            return None
 
-                        item.update({
-                            "id": movie.get("id"),
-                            "title": movie.get("title"),
-                            "tmdbId": movie.get("tmdbId"),
-                            "poster": poster_url,
-                            "year": movie.get("year"),
-                            "rating": rating,
-                            "overview": movie.get("overview"),
-                            "genres": movie.get("genres") or []
-                        })
+    def walk_dir(root: Path, manager: str):
+        stack = [root]
+        while stack:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as it:
+                    for entry in it:
+                        if entry.is_symlink():
+                            yield entry.path, root, manager
+                        elif entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+            except PermissionError:
+                logger.warning(f"⛔ Permission refusée: {current}")
+            except FileNotFoundError:
+                continue
 
-                symlinks_list.append(item)
+    # ⚡ Dispatch des tâches
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for root, manager in links_dirs:
+            for symlink_path, r, m in walk_dir(root, manager):
+                tasks.append(executor.submit(process_symlink, symlink_path, r, m))
 
+        for future in as_completed(tasks):
+            result = future.result()
+            if result:
+                symlinks_list.append(result)
+
+    # Comptage des références
     target_counts = Counter(item["target"] for item in symlinks_list if item["target_exists"])
     results = [{
         **item,
         "ref_count": target_counts.get(item["target"], 0) if item["target_exists"] else 0
     } for item in symlinks_list]
 
-    logger.success(f"{len(results)} symlinks scannés (Radarr index {len(radarr_index)})")
+    logger.success(f"{len(results)} symlinks scannés (workers={workers})")
     return results
+
+# ⚡ Remplace l’ancien scan
+scan_symlinks = scan_symlinks_parallel
 
 # ---------------
 # Liste symlinks
@@ -345,11 +381,13 @@ def list_symlinks(
 # Scan
 # -----
 @router.post("/scan")
-async def trigger_scan(radarr: RadarrService = Depends(RadarrService)):
+async def trigger_scan():
     global symlink_store
     try:
-        logger.info("🚀 [SCAN] Début du scan symlinks")
-        scanned = await run_in_threadpool(scan_symlinks, radarr)
+        logger.info("🚀 [SCAN] Début du scan symlinks (parallèle + cache disque)")
+
+        # ⚡ Lancement du scan en threadpool (évite de bloquer l'event loop FastAPI)
+        scanned = await run_in_threadpool(scan_symlinks_parallel, 8)  # 8 workers par défaut
 
         # ✅ IMPORTANT : modifier la liste en place pour conserver la référence partagée
         symlink_store.clear()
@@ -367,7 +405,7 @@ async def trigger_scan(radarr: RadarrService = Depends(RadarrService)):
             "data": symlink_store,
         }
     except Exception as e:
-        logger.error(f"💥 Erreur scan: {e}", exc_info=True)
+        logger.error(f"💥 Erreur scan: {e!r}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 # ---
@@ -424,7 +462,7 @@ async def get_radarr_movie_url(
     raw_name = Path(symlink_path).stem
     cleaned = clean_movie_name(raw_name)
 
-    movie = radarr.get_movie_by_clean_title(cleaned)
+    movie = radarr.get_movie_by_clean_title(raw_name)
     if not movie:
         raise HTTPException(status_code=404, detail="Film introuvable dans Radarr")
 
@@ -690,7 +728,7 @@ async def delete_symlink(
             radarr.refresh_movie(movie_id)
             await asyncio.sleep(2)
             radarr.search_missing_movie(movie_id)
-            logger.info(f"📥 Recherche relancée pour {movie.get('title')}")
+            logger.info(f"   Recherche relancée pour {movie.get('title')}")
 
             payload = {
                 "event": "symlink_removed",
@@ -743,13 +781,12 @@ async def get_sonarr_series_id_only(
         else:
             raw_series = parts[0]
 
-        cleaned = clean_series_name(raw_series)
-        logger.debug(f"🔍 Série nettoyée : {cleaned}")
+        logger.debug(f"🔍 Série nettoyée : {raw_series}")
 
         # --- Trouver la série dans Sonarr
-        series = sonarr.get_series_by_clean_title(cleaned)
+        series = sonarr.resolve_series(raw_series)
         if not series:
-            logger.warning(f"❌ Série '{cleaned}' introuvable dans Sonarr")
+            logger.warning(f"❌ Série '{raw_series}' introuvable dans Sonarr")
             raise HTTPException(status_code=404, detail="Série introuvable dans Sonarr")
 
         # --- Poster (proxy interne)
@@ -801,6 +838,7 @@ async def get_sonarr_series_id_only(
             "episode": episode_num,
             "episodeTitle": episode_title,
             "downloaded": downloaded,
+            "tmdbId": series.get("tmdbId"),
         }
 
     except HTTPException:
@@ -820,11 +858,11 @@ async def get_sonarr_series_url(
     """
     Renvoie l'URL publique de la série dans Sonarr (interface web).
     """
-    cleaned = clean_series_name(Path(symlink_path).parts[0])
-    series = sonarr.get_series_by_clean_title(cleaned)
+    raw_series = Path(symlink_path).parts[0]  # ou extraire comme dans get-sonarr-id
+    series = sonarr.resolve_series(raw_series)
 
     if not series:
-        raise HTTPException(status_code=404, detail="Série introuvable dans Sonarr")
+        raise HTTPException(status_code=404, detail=f"Série introuvable dans Sonarr : {raw_series}")
 
     title_slug = series.get("titleSlug")
     if not title_slug:
@@ -899,12 +937,14 @@ async def delete_symlink_sonarr(
             logger.error(f"💥 Erreur suppression symlink : {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Erreur suppression symlink : {e}")
 
-        # 4️⃣ Identifier la série
-        cleaned = clean_series_name(Path(symlink_path).parts[0])
-        series = sonarr.get_series_by_clean_title(cleaned)
+        # 4️⃣ Identifier la série (corrigé)
+        series_dir = candidate_abs.parent.parent
+        raw_series_name = series_dir.name
+
+        series = sonarr.resolve_series(raw_series_name)
         if not series:
-            logger.warning(f"❗ Série '{cleaned}' introuvable dans Sonarr")
-            return {"message": f"✅ Symlink supprimé (aucune série trouvée : {cleaned})"}
+            logger.warning(f"❗ Série '{raw_series_name}' introuvable dans Sonarr")
+            return {"message": f"✅ Symlink supprimé (aucune série trouvée : {raw_series_name})"}
 
         series_id = series["id"]
 
@@ -1037,19 +1077,6 @@ async def delete_broken_sonarr_symlinks(
     deleted_count = 0
     errors: list[str] = []
 
-    # 📚 Récup liste séries Sonarr une seule fois + index normalisé
-    try:
-        all_series = sonarr.get_all_series()
-        logger.debug(f"📚 {len(all_series)} séries récupérées depuis Sonarr")
-    except Exception as e:
-        logger.error(f"❌ Erreur récupération séries Sonarr : {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Erreur récupération séries Sonarr")
-
-    def _norm(s: str) -> str:
-        return normalize_name(clean_series_name(s or ""))
-
-    series_index = {_norm(s.get("title", "")): s for s in all_series}
-
     for item in broken_symlinks:
         try:
             symlink_path = Path(item["symlink"])
@@ -1067,21 +1094,13 @@ async def delete_broken_sonarr_symlinks(
             logger.info(f"🗑️ Supprimé : {symlink_path}")
             deleted_count += 1
 
-            # 📂 Identifier la série
+            # 📂 Identifier la série avec resolve_series
             series_dir = symlink_path.parent.parent
             raw_series_name = series_dir.name
-            norm_cleaned = _norm(raw_series_name)
 
-            match = series_index.get(norm_cleaned)
+            match = sonarr.resolve_series(raw_series_name)
             if not match:
-                match = next(
-                    (s for k, s in series_index.items()
-                     if k == norm_cleaned or k in norm_cleaned or norm_cleaned in k),
-                    None
-                )
-
-            if not match:
-                logger.warning(f"❗ Aucune série trouvée pour : {raw_series_name}")
+                logger.warning(f"❗ Aucune série trouvée (resolve) pour : {raw_series_name}")
                 continue
 
             series_id = match.get("id")
@@ -1122,7 +1141,7 @@ async def delete_broken_sonarr_symlinks(
                         async with httpx.AsyncClient(timeout=20.0) as client:
                             response = await client.post(
                                 "http://localhost:8080/api/v1/symlinks/delete-sonarr-season",
-                                params={"series_name": clean_series_name(raw_series_name), "season_number": season_number}
+                                params={"series_name": raw_series_name, "season_number": season_number}
                             )
                             if response.status_code != 200:
                                 logger.error(f"❌ Appel API delete-sonarr-season échoué : {response.text}")
@@ -1158,35 +1177,24 @@ async def delete_sonarr_season(
 ):
     logger.info(f"🔁 [delete-sonarr-season] Traitement saison {season_number} pour : {series_name}")
 
-    cleaned_series = clean_series_name(series_name)
-    normalized_cleaned = normalize_name(cleaned_series)
-
     try:
-        all_series = sonarr.get_all_series()
-        logger.debug(f"📚 {len(all_series)} séries récupérées depuis Sonarr")
-    except Exception as e:
-        logger.error(f"❌ Erreur récupération séries Sonarr : {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Erreur récupération séries Sonarr")
+        # ✅ Résolution directe avec resolve_series
+        series = sonarr.resolve_series(series_name)
+        if not series:
+            logger.warning(f"❗ Série introuvable dans Sonarr pour : {series_name}")
+            raise HTTPException(status_code=404, detail="Série introuvable")
 
-    def match_title(s):
-        norm = normalize_name(s.get("title", ""))
-        return norm == normalized_cleaned or norm in normalized_cleaned or normalized_cleaned in norm
+        series_id = series["id"]
+        logger.info(f"📺 Série trouvée : {series['title']} (ID={series_id})")
 
-    match = next((s for s in all_series if match_title(s)), None)
-    if not match:
-        logger.warning(f"❗ Série introuvable dans Sonarr pour : {cleaned_series}")
-        raise HTTPException(status_code=404, detail="Série introuvable")
-
-    series_id = match["id"]
-    logger.info(f"📺 Série trouvée : {match['title']} (ID={series_id})")
-
-    try:
+        # 🔄 Refresh + relancer recherche
         sonarr.refresh_series(series_id)
         await asyncio.sleep(2)
         sonarr.search_missing_episodes(series_id)
-        logger.info(f"📥 Recherche manuelle lancée pour : {match['title']}")
+        logger.info(f"📥 Recherche manuelle lancée pour : {series['title']}")
         await asyncio.sleep(3)
 
+        # 📂 Vérification des dossiers de saison
         try:
             sonarr_roots = [
                 Path(ld.path) for ld in config_manager.config.links_dirs
@@ -1206,36 +1214,46 @@ async def delete_sonarr_season(
             except ValueError:
                 return False
 
+        # 🔍 Trouver le dossier série (FR OU EN accepté)
         series_dir = None
         for root in sonarr_roots:
             if not root.exists():
                 continue
             for d in root.iterdir():
-                if d.is_dir() and match_title({"title": d.name}) and is_under(d, root):
+                if not d.is_dir():
+                    continue
+                if (
+                    normalize_name(d.name) == normalize_name(series["title"])  # titre officiel Sonarr (souvent EN)
+                    or normalize_name(d.name) == normalize_name(series_name)  # titre venant du symlink (FR possible)
+                ) and is_under(d, root):
                     series_dir = d
                     break
             if series_dir:
                 break
 
         if not series_dir:
+            logger.error(f"❌ Répertoire série introuvable pour {series_name} (attendu : {series['title']})")
             raise HTTPException(status_code=404, detail="Répertoire série introuvable")
 
         logger.debug(f"📁 Répertoire série trouvé : {series_dir}")
 
+        # 🔍 Trouver la saison
         season_dir = next((d for d in series_dir.glob(f"*{season_number:02d}*") if d.is_dir()), None)
         if not season_dir:
             raise HTTPException(status_code=404, detail="Répertoire saison introuvable")
 
         logger.debug(f"📁 Répertoire saison trouvé : {season_dir}")
 
+        # 📂 Vérifier si fichiers restants
         valid_exts = {".mkv", ".mp4", ".m4v"}
-        remaining_files = [f for f in season_dir.iterdir() if f.is_file() and f.suffix.lower() in valid_media_exts]
+        remaining_files = [f for f in season_dir.iterdir() if f.is_file() and f.suffix.lower() in valid_exts]
 
         if remaining_files:
             return {
-                "message": f"Recherche relancée pour la saison {season_number} de {match['title']}. Fichiers présents."
+                "message": f"Recherche relancée pour la saison {season_number} de {series['title']}. Fichiers présents."
             }
 
+        # 🚮 Aucun fichier → purge
         logger.warning(f"🚫 Aucun fichier vidéo trouvé dans la saison {season_number} — suppression dossiers/fichiers résiduels")
         for f in season_dir.iterdir():
             try:
@@ -1247,18 +1265,19 @@ async def delete_sonarr_season(
             except Exception as e:
                 logger.warning(f"⚠️ Échec suppression {f} : {e}")
 
+        # 🔄 Refresh + recherche complète
         sonarr.refresh_series(series_id)
         await asyncio.sleep(2)
         sonarr.search_missing_episodes(series_id)
 
         return {
-            "message": f"✅ Saison {season_number} réinitialisée pour {match['title']} — recherche complète relancée"
+            "message": f"✅ Saison {season_number} réinitialisée pour {series['title']} — recherche complète relancée"
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"⚠️ Erreur traitement saison {number} de {series_name} : {e}", exc_info=True)
+        logger.error(f"⚠️ Erreur traitement saison {season_number} de {series_name} : {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Erreur traitement saison Sonarr")
 
 # ---------------------------------------
@@ -1305,7 +1324,7 @@ async def repair_missing_seasons(
     try:
         missing_list = sonarr.get_all_series_with_missing_seasons()
     except Exception as e:
-        logger.error(f"❌ Erreur récupération séries : {e}", exc_info=True)
+        logger.error(f"❌ Erreur récupération séries Sonarr : {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Erreur récupération des séries avec saisons manquantes")
 
     for entry in missing_list:
@@ -1341,10 +1360,10 @@ async def repair_missing_seasons(
         if not confirmed_missing:
             continue
 
-        norm_title = normalize_name(series_title)
+        # ✅ Filtrage des symlinks : on ne passe plus par normalize_name
+        # On compare directement avec le dossier parent de symlink (nom série dans symlink)
         def match_path(path_str: str) -> bool:
-            p_norm = normalize_name(path_str)
-            return p_norm == norm_title or p_norm in norm_title or norm_title in p_norm
+            return Path(path_str).parent.parent.name.lower() == series_title.lower()
 
         matching_items = [i for i in items if match_path(i["symlink"])]
         if not matching_items:
@@ -1412,3 +1431,165 @@ def list_duplicates():
             duplicates.extend(items)
 
     return {"total": len(duplicates), "data": duplicates}
+
+
+# --------------------------
+# Proxy TMDB (films/séries)
+# --------------------------
+@router.get("/tmdb/{media_type}/{tmdb_id}")
+async def get_tmdb_data(
+    media_type: str,
+    tmdb_id: int,
+    lang: str = Query("fr-FR")
+):
+    api_key = config_manager.config.tmdb_api_key
+    url = f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}"
+    params = {
+        "api_key": api_key,
+        "language": lang,
+        "append_to_response": "videos,credits,recommendations,release_dates"
+    }
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.get(url, params=params)
+        r.raise_for_status()
+        data = r.json()
+
+    # Trailer (YouTube uniquement)
+    trailer = None
+    videos = data.get("videos", {}).get("results", [])
+    for v in videos:
+        if v.get("site") == "YouTube" and v.get("type") == "Trailer":
+            trailer = f"https://www.youtube.com/watch?v={v['key']}"
+            break
+
+    # Casting (top 10)
+    cast = [
+        {
+            "name": c["name"],
+            "character": c.get("character"),
+            "profile": f"https://image.tmdb.org/t/p/w185{c['profile_path']}" if c.get("profile_path") else None
+        }
+        for c in data.get("credits", {}).get("cast", [])[:10]
+    ]
+
+    # Recommendations
+    recos = [
+        {
+            "id": r["id"],
+            "title": r.get("title") or r.get("name"),
+            "poster": f"https://image.tmdb.org/t/p/w342{r['poster_path']}" if r.get("poster_path") else None
+        }
+        for r in data.get("recommendations", {}).get("results", [])[:10]
+    ]
+
+    # Certification
+    certification = None
+    rel_dates = data.get("release_dates", {}).get("results", [])
+    for entry in rel_dates:
+        if entry["iso_3166_1"] == "FR":
+            certs = entry.get("release_dates", [])
+            if certs:
+                certification = certs[0].get("certification")
+                break
+
+    # Gestion runtime sécurisé (films ou séries)
+    runtime = None
+    if data.get("runtime"):
+        runtime = data["runtime"]
+    else:
+        episode_run_time = data.get("episode_run_time")
+        if isinstance(episode_run_time, list) and episode_run_time:
+            runtime = episode_run_time[0]
+
+    return {
+        "id": data.get("id"),
+        "title": data.get("title") or data.get("name"),
+        "overview": data.get("overview"),
+        "genres": [g["name"] for g in data.get("genres", [])],
+        "runtime": runtime,
+        "year": (data.get("release_date") or data.get("first_air_date") or "")[:4],
+        "poster": f"https://image.tmdb.org/t/p/w342{data['poster_path']}" if data.get("poster_path") else None,
+        "backdrop": f"https://image.tmdb.org/t/p/w780{data['backdrop_path']}" if data.get("backdrop_path") else None,
+        "rating": data.get("vote_average"),
+        "trailer": trailer,
+        "cast": cast,
+        "recommendations": recos,
+        "certification": certification
+    }
+
+# --------------------------
+# Renommage symlinks movies avec tmdbid
+# --------------------------
+
+@router.post("/movies/scan")
+async def scan_all_movies(dry_run: bool = Query(True, description="Simulation ou exécution réelle")):
+    """
+    Scan et renomme les films dans TOUS les dossiers Radarr (ex: movies + anime_movies).
+    - dry_run=True → simulation (affiche seulement)
+    - dry_run=False → applique réellement les renommages
+    """
+    cfg = config_manager.config
+    api_key = cfg.tmdb_api_key
+
+    if not api_key:
+        raise HTTPException(status_code=500, detail="⚠️ Clé TMDb manquante dans config.json")
+
+    results = []
+    try:
+        for ld in cfg.links_dirs:
+            if ld.manager == "radarr":
+                base_dir = Path(ld.path)
+                if not base_dir.exists():
+                    logger.warning(f"⚠️ Dossier introuvable : {base_dir}")
+                    continue
+
+                logger.info(f"🎬 Scan Radarr → {base_dir}")
+                manager = MediasMovies(base_dir=base_dir, api_key=api_key)
+                res = await manager.run(dry_run=dry_run)
+                results.extend(res)
+
+        return {
+            "message": "✅ Scan terminé pour tous les dossiers Radarr",
+            "dry_run": dry_run,
+            "count": len(results),
+            "results": results,
+        }
+
+    except Exception as e:
+        logger.error(f"💥 Erreur pendant le scan films : {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --------------------------
+# Renommage symlinks series avec tmdbid
+# --------------------------
+@router.post("/series/scan")
+async def scan_all_series(dry_run: bool = Query(True, description="Simulation ou exécution réelle")):
+    """
+    Scan et renomme les séries dans TOUS les dossiers Sonarr.
+    """
+    try:
+        managers = get_series_managers()
+        results = []
+        for manager in managers:
+            res = await manager.run()
+            results.extend(res)
+
+        return {
+            "message": "✅ Scan terminé pour tous les dossiers Sonarr",
+            "dry_run": dry_run,
+            "count": len(results),
+            "results": results,
+        }
+    except Exception as e:
+        logger.error(f"💥 Erreur pendant le scan séries : {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/libraries")
+def scan_libraries(scanner: LibraryScanner = Depends(LibraryScanner)):
+    """
+    Lance un scan Movies + Shows et retourne un résumé.
+    """
+    return scanner.scan()
+
+

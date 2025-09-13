@@ -116,7 +116,6 @@ class ConfigManager:
             # Création d'une config par défaut
             self.config = SymlinkConfig(
                 links_dirs=[],
-                mount_dirs=[],
                 radarr_api_key=None,
                 sonarr_api_key=None,
                 discord_webhook_url=None,

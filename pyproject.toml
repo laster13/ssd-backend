@@ -48,6 +48,7 @@ python-jose = {extras = ["cryptography"], version = "^3.5.0"}
 sqlalchemy = "^2.0.43"
 passlib = {extras = ["bcrypt"], version = "^1.7.4"}
 websockets = "^15.0.1"
+aiohttp = "^3.12.15"
 
 [build-system]
 requires = ["poetry-core"]

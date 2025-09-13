@@ -175,12 +175,10 @@ class SonarrClient:
                     headers=self.headers,
                     timeout=30.0
                 )
-                
                 if series_response.status_code != 200:
                     raise Exception(f"Sonarr API error: {series_response.status_code}")
-                
                 series_data = series_response.json()
-                
+
                 # Get episodes for this series
                 episodes_response = await client.get(
                     f"{self.base_url}/api/v3/episode",
@@ -188,11 +186,10 @@ class SonarrClient:
                     headers=self.headers,
                     timeout=30.0
                 )
-                
                 episodes_data = []
                 if episodes_response.status_code == 200:
                     episodes_data = episodes_response.json()
-                
+
                 # Group episodes by season
                 seasons_with_episodes = {}
                 for episode in episodes_data:
@@ -200,25 +197,22 @@ class SonarrClient:
                     if season_num not in seasons_with_episodes:
                         seasons_with_episodes[season_num] = []
                     seasons_with_episodes[season_num].append(episode)
-                
+
                 # Check for incomplete seasons
                 future_check = await self.has_future_episodes(show_id)
                 incomplete_seasons = set(future_check.get("seasons_incomplete", []))
-                
+
                 # Process seasons with detailed statistics
                 processed_seasons = []
                 for season in series_data.get("seasons", []):
                     season_num = season.get("seasonNumber", 0)
                     season_stats = season.get("statistics", {})
-                    
-                    # Get episodes for this season
                     season_episodes = seasons_with_episodes.get(season_num, [])
-                    
-                    # Calculate detailed statistics
+
                     total_episodes = len(season_episodes)
                     downloaded_episodes = len([ep for ep in season_episodes if ep.get("hasFile", False)])
                     missing_episodes = total_episodes - downloaded_episodes
-                    
+
                     processed_seasons.append({
                         "seasonNumber": season_num,
                         "monitored": season.get("monitored", False),
@@ -230,13 +224,13 @@ class SonarrClient:
                         "episodes": season_episodes,
                         "has_future_episodes": season_num in incomplete_seasons
                     })
-                
+
                 # Calculate overall statistics
                 series_stats = series_data.get("statistics", {})
                 total_episode_count = series_stats.get("episodeCount", 0)
                 episode_file_count = series_stats.get("episodeFileCount", 0)
                 missing_count = total_episode_count - episode_file_count
-                
+
                 return {
                     "id": series_data["id"],
                     "title": series_data["title"],
@@ -250,7 +244,7 @@ class SonarrClient:
                     "episode_count": total_episode_count,
                     "missing_episode_count": missing_count,
                     "seasons": processed_seasons,
-                    "path": series_data.get("path", ""),
+                    "path": series_data.get("path", ""),   # 👈 champ ajouté
                     "qualityProfileId": series_data.get("qualityProfileId"),
                     "languageProfileId": series_data.get("languageProfileId"),
                     "seriesType": series_data.get("seriesType", "standard"),
@@ -266,10 +260,9 @@ class SonarrClient:
                     "tags": series_data.get("tags", []),
                     "added": series_data.get("added", ""),
                     "ratings": series_data.get("ratings", {}),
-                    "languageProfileId": series_data.get("languageProfileId"),
                     "ended": series_data.get("ended", False)
                 }
-                
+
         except Exception as e:
             logger.error(f"Erreur lors de la récupération des détails de la série : {e}")
             raise

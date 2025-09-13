@@ -5,7 +5,7 @@ from typing import Optional
 import re
 from fastapi import HTTPException
 import logging
-from program.utils.text_utils import normalize_name, clean_movie_name
+from program.utils.text_utils import normalize_name, clean_movie_name, clean_series_name
 
 
 RADARR_PORT = 7878
@@ -131,6 +131,40 @@ class RadarrService:
         except requests.exceptions.RequestException as e:
             logger.error(f"🌐 Erreur lors de la récupération des films : {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Erreur récupération films Radarr : {e}")
+
+    def get_movie_by_imdb(self, imdb_id: str):
+        """
+        Recherche un film dans Radarr via IMDb ID.
+        Renvoie un objet complet (avec 'id') si le film est déjà importé,
+        sinon renvoie l'objet du lookup brut.
+        """
+        try:
+            # 1️⃣ Lookup direct par IMDb
+            lookup_url = f"{self.base_url}/movie/lookup/imdb?imdbId={imdb_id}"
+            res = requests.get(lookup_url, headers=self.headers)
+            res.raise_for_status()
+            lookup_movie = res.json()
+
+            if not lookup_movie or "tmdbId" not in lookup_movie:
+                logger.warning(f"❌ Aucun film trouvé via IMDb {imdb_id}")
+                return None
+
+            tmdb_id = lookup_movie["tmdbId"]
+
+            # 2️⃣ Vérifier dans la liste des films existants
+            all_movies = self.get_all_movies()
+            for movie in all_movies:
+                if movie.get("tmdbId") == tmdb_id:
+                    logger.debug(f"✅ Film trouvé dans Radarr par IMDb {imdb_id} → {movie['title']}")
+                    return movie
+
+            # 3️⃣ Si pas trouvé dans la liste → renvoyer quand même le lookup (incomplet)
+            logger.debug(f"⚠️ Film IMDb {imdb_id} trouvé en lookup mais pas importé dans Radarr")
+            return lookup_movie
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"🌐 Erreur Radarr lookup IMDb {imdb_id} : {e}")
+            return None
 
 class SonarrService:
     def __init__(self):
@@ -341,4 +375,66 @@ class SonarrService:
                 return ep
         return None
 
+    def resolve_series(self, raw_name: str) -> Optional[dict]:
+        """
+        Résout une série à partir d’un nom brut de dossier/fichier :
+        1. Essaye par titre nettoyé
+        2. Fallback via IMDb si présent dans le nom {imdb-tt...}
+        3. Fallback via TMDb si présent {tmdb-...}
+        """
+        cleaned = clean_series_name(raw_name)
+
+        # 1️⃣ Essai direct via titre
+        match = self.get_series_by_clean_title(cleaned)
+        if match:
+            return match
+
+        # 2️⃣ Fallback IMDb
+        imdb_match = re.search(r"imdb-(tt\d+)", raw_name)
+        if imdb_match:
+            imdb_id = imdb_match.group(1)
+            try:
+                return self.get_series_by_imdb(imdb_id)
+            except Exception as e:
+                logger.warning(f"⚠️ IMDb fallback échoué pour {imdb_id}: {e}")
+
+        # 3️⃣ (Optionnel) Fallback TMDb
+        tmdb_match = re.search(r"tmdb-(\d+)", raw_name)
+        if tmdb_match:
+            tmdb_id = int(tmdb_match.group(1))
+            try:
+                return self.get_series_by_tmdb(tmdb_id)
+            except Exception as e:
+                logger.warning(f"⚠️ TMDb fallback échoué pour {tmdb_id}: {e}")
+
+        logger.warning(f"❌ Impossible de résoudre la série : {raw_name}")
+        return None
+
+    def get_series_by_imdb(self, imdb_id: str) -> Optional[dict]:
+        """Recherche une série directement via IMDb ID."""
+        try:
+            lookup_url = f"{self.base_url}/series/lookup?term=imdb:{imdb_id}"
+            res = requests.get(lookup_url, headers=self.headers, timeout=10)
+            res.raise_for_status()
+            data = res.json()
+            if isinstance(data, list) and data:
+                return data[0]  # retourne la première correspondance
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.error(f"🌐 Erreur lookup IMDb {imdb_id} : {e}", exc_info=True)
+            return None
+
+    def get_series_by_tmdb(self, tmdb_id: int) -> Optional[dict]:
+        """Recherche une série directement via TMDb ID."""
+        try:
+            lookup_url = f"{self.base_url}/series/lookup?term=tmdb:{tmdb_id}"
+            res = requests.get(lookup_url, headers=self.headers, timeout=10)
+            res.raise_for_status()
+            data = res.json()
+            if isinstance(data, list) and data:
+                return data[0]
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.error(f"🌐 Erreur lookup TMDb {tmdb_id} : {e}", exc_info=True)
+            return None
 

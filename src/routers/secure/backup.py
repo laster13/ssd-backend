@@ -1,13 +1,16 @@
+import shutil
+import json
+import getpass
+import asyncio
 from fastapi import APIRouter, HTTPException, Request
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from pathlib import Path
 from datetime import datetime
-import shutil
-import json
-import getpass
 from zoneinfo import ZoneInfo
 from loguru import logger
+from program.radarr_cache import _build_radarr_index
+
 
 router = APIRouter(
     prefix="/media-backups",
@@ -85,11 +88,11 @@ def run_backup(subfolder):
     shutil.make_archive(str(archive_path).replace(".tar.gz", ""), 'gztar', str(source))
     logger.success(f"Backup de {subfolder} créée → {archive_path}")
 
-
 def schedule_all():
     scheduler.remove_all_jobs()
     config = load_config()
 
+    # 🔁 Planification des backups (depuis config backup.json)
     for name, sched in config.items():
         if isinstance(sched, dict):
             day = sched.get("day")
@@ -106,6 +109,18 @@ def schedule_all():
                 )
                 logger.debug(f"Tâche planifiée : {name} ({day=}, {hour=})")
 
+    # 🔄 Ajout tâche fixe rebuild Radarr (toutes les heures, à xx:00)
+    def radarr_rebuild_job():
+        logger.info("🕒 Rebuild Radarr périodique lancé...")
+        asyncio.run(_build_radarr_index(force=True))
+
+    scheduler.add_job(
+        radarr_rebuild_job,
+        CronTrigger(minute=0),
+        id="radarr_rebuild",
+        replace_existing=True
+    )
+    logger.debug("Tâche planifiée : rebuild Radarr (toutes les heures)")
 
 # ===== Événements =====
 @router.on_event("startup")

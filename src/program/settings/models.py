@@ -85,7 +85,6 @@ class LinkDir(BaseModel):
 
 class SymlinkConfig(BaseModel):
     links_dirs: List[LinkDir] = Field(default_factory=list)
-    mount_dirs: List[str] = Field(default_factory=list)
     radarr_api_key: Optional[str] = None
     sonarr_api_key: Optional[str] = None
     discord_webhook_url: Optional[str] = None

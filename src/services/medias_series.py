@@ -5,18 +5,18 @@ import asyncio
 import aiohttp
 import shutil
 from pathlib import Path
-from datetime import datetime
 from loguru import logger
 
 
 class MediasSeries:
-    def __init__(self, base_dir: Path, api_key: str,
-                 not_found_file="not_found_series.txt",
-                 max_concurrent=10):
+    def __init__(self, base_dir: Path, sonarr_url: str, sonarr_key: str,
+                 not_found_file="not_found_series.txt", max_concurrent=10, apply=False):
         self.base_dir = Path(base_dir)
-        self.api_key = api_key
+        self.sonarr_url = sonarr_url.rstrip("/")
+        self.sonarr_key = sonarr_key
         self.not_found_file = not_found_file
         self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.apply = apply
 
     # ----------------- UTILITAIRES -----------------
 
@@ -30,6 +30,7 @@ class MediasSeries:
 
     @staticmethod
     def clean_name(raw: str) -> str:
+        """Nettoie le nom du dossier en enlevant imdb, années parasites, etc."""
         name = re.sub(r"\{?imdb-?tt\d+\}?", "", raw, flags=re.IGNORECASE)
         name = re.sub(r"tt\d+", "", name, flags=re.IGNORECASE)
         name = re.sub(r"-\s*\(\d{4}\)", "", name)
@@ -42,68 +43,57 @@ class MediasSeries:
         match = re.search(r"(tt\d+)", raw)
         return match.group(1) if match else None
 
-    # ----------------- TMDb API -----------------
+    # ----------------- SONARR API -----------------
 
-    async def fetch_json(self, session, url):
-        async with self.semaphore:
-            async with session.get(url) as resp:
-                if resp.status == 429:
-                    retry_after = int(resp.headers.get("Retry-After", 2))
-                    logger.warning(f"⚠️ Rate limit atteint, pause {retry_after}s...")
-                    await asyncio.sleep(retry_after)
-                    return await self.fetch_json(session, url)
-                return await resp.json()
+    async def sonarr_lookup(self, session, query: str):
+        """Recherche une série via l’API Sonarr"""
+        url = f"{self.sonarr_url}/api/v3/series/lookup?term={query}"
+        headers = {"X-Api-Key": self.sonarr_key}
+        async with self.semaphore, session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                logger.error(f"❌ Erreur API Sonarr ({resp.status}) pour {query}")
+                return []
+            return await resp.json()
 
-    async def get_tmdb_info_by_imdb(self, session, imdb_id):
-        url = f"https://api.themoviedb.org/3/find/{imdb_id}?api_key={self.api_key}&external_source=imdb_id&language=en-US"
-        data = await self.fetch_json(session, url)
-        results = data.get("tv_results", [])
+    async def get_sonarr_info(self, session, title, year=None, imdb_id=None):
+        """Récupère les infos fiables via Sonarr (IMDb ID, titre, année)"""
+        term = imdb_id or title
+        results = await self.sonarr_lookup(session, term)
         if not results:
-            logger.error(f"❌ IMDb ID introuvable sur TMDb : {imdb_id}")
-            return None
-        details_url = f"https://api.themoviedb.org/3/tv/{results[0]['id']}?api_key={self.api_key}&append_to_response=external_ids&language=en-US"
-        details = await self.fetch_json(session, details_url)
-        imdb_id = details.get("external_ids", {}).get("imdb_id")
-        title_en = details.get("name") or details.get("original_name")
-        tmdb_year = (details.get("first_air_date") or "").split("-")[0]
-        if not imdb_id or not title_en:
-            return None
-        title_en = self.normalize_filename(title_en)
-        return {"imdb_id": imdb_id, "title_en": title_en, "year": tmdb_year}
-
-    async def get_tmdb_info_by_search(self, session, title, year=None):
-        search_url = f"https://api.themoviedb.org/3/search/tv?api_key={self.api_key}&query={title}&language=en-US"
-        if year and year != "0":
-            search_url += f"&first_air_date_year={year}"
-        search_data = await self.fetch_json(session, search_url)
-        results = search_data.get("results", [])
-        if not results:
-            logger.error(f"❌ Pas trouvé : {title} ({year})")
             self.log_not_found(title, year)
             return None
+
         best = results[0]
-        if year and year != "0":
+        if year:
             for r in results:
-                first_air_date = r.get("first_air_date") or ""
-                result_year = first_air_date.split("-")[0] if first_air_date else None
-                if result_year == year:
+                if r.get("year") and str(r["year"]) == str(year):
                     best = r
                     break
-        details_url = f"https://api.themoviedb.org/3/tv/{best['id']}?api_key={self.api_key}&append_to_response=external_ids&language=en-US"
-        details = await self.fetch_json(session, details_url)
-        imdb_id = details.get("external_ids", {}).get("imdb_id")
-        title_en = details.get("name") or details.get("original_name") or title
-        tmdb_year = (details.get("first_air_date") or "").split("-")[0]
+
+        imdb_id = best.get("imdbId")
+        title_en = best.get("title")
+        year = best.get("year")
+
         if not imdb_id or not title_en:
             return None
-        title_en = self.normalize_filename(title_en)
-        return {"imdb_id": imdb_id, "title_en": title_en, "year": tmdb_year}
+
+        return {
+            "imdb_id": imdb_id,
+            "title_en": self.normalize_filename(title_en),
+            "year": str(year)
+        }
 
     # ----------------- RENAME EPISODES -----------------
 
     def rename_episodes_in_dir(self, series_dir: Path, series_name: str, year: str):
         logger.info(f"🔎 Scan des épisodes dans {series_dir}")
         renamed = []
+
+        # éviter doublon (2023) (2023)
+        if f"({year})" in series_name:
+            base_name = series_name
+        else:
+            base_name = f"{series_name} ({year})"
 
         for root, _, files in os.walk(series_dir):
             for file in files:
@@ -114,7 +104,7 @@ class MediasSeries:
                         season = int(match.group(1))
                         episode = int(match.group(2))
                         episode_code = f"S{season:02d}E{episode:02d}"
-                        new_name = f"{series_name} ({year}) - {episode_code}{f.suffix}"
+                        new_name = f"{base_name} - {episode_code}{f.suffix}"
                         new_path = f.parent / new_name
 
                         if f != new_path:
@@ -122,8 +112,11 @@ class MediasSeries:
                                 if new_path.exists():
                                     logger.warning(f"⚠️ Fichier existe déjà, ignoré : {new_path}")
                                     continue
-                                shutil.move(str(f), str(new_path))
-                                logger.success(f"📂 Épisode renommé : {f.name} → {new_name}")
+                                if self.apply:
+                                    shutil.move(str(f), str(new_path))
+                                    logger.success(f"📂 Épisode renommé : {f.name} → {new_name}")
+                                else:
+                                    logger.info(f"(Dry-run Episode) {f.name} → {new_name}")
                                 renamed.append({"old": str(f), "new": str(new_path)})
                             except Exception as e:
                                 logger.error(f"❌ Erreur renommage fichier {f}: {e}")
@@ -135,37 +128,42 @@ class MediasSeries:
         raw_name = d.name
         imdb_id = self.extract_imdb_id(raw_name)
         clean = self.clean_name(raw_name)
+
         match = re.match(r"^(.*?)\s*\((\d{4})\)", clean)
         if match:
             title, year = match.groups()
         else:
             title, year = clean, None
 
-        best = None
-        if imdb_id:
-            logger.info(f"🔎 Recherche TMDb par IMDb : {imdb_id}")
-            best = await self.get_tmdb_info_by_imdb(session, imdb_id)
-        else:
-            logger.info(f"🔎 Recherche TMDb par titre : {title} ({year})")
-            best = await self.get_tmdb_info_by_search(session, title, year)
+        logger.info(f"🔎 Recherche via Sonarr : {title} ({year}) {imdb_id or ''}")
+        best = await self.get_sonarr_info(session, title, year, imdb_id)
 
         renamed_eps = []
         if best:
-            imdb_id, title_en, tmdb_year = best["imdb_id"], best["title_en"], best["year"]
-            new_name = f"{title_en} ({tmdb_year}) {{imdb-{imdb_id}}}"
-            new_path = d.parent / new_name
+            imdb_id, title_en, sn_year = best["imdb_id"], best["title_en"], best["year"]
+
+            # éviter doublon (2023) (2023)
+            if f"({sn_year})" in title_en:
+                folder_name = f"{title_en} {{imdb-{imdb_id}}}"
+            else:
+                folder_name = f"{title_en} ({sn_year}) {{imdb-{imdb_id}}}"
+
+            new_path = d.parent / folder_name
 
             if d != new_path:
                 try:
-                    shutil.move(str(d), str(new_path))
-                    logger.success(f"✅ Dossier renommé : {d.name} → {new_name}")
-                    d = new_path
+                    if self.apply:
+                        shutil.move(str(d), str(new_path))
+                        logger.success(f"✅ Dossier renommé : {d.name} → {folder_name}")
+                        d = new_path
+                    else:
+                        logger.info(f"(Dry-run Folder) {d.name} → {folder_name}")
                 except Exception as e:
                     logger.error(f"❌ Erreur renommage dossier {d}: {e}")
 
-            renamed_eps = self.rename_episodes_in_dir(d, title_en, tmdb_year)
+            renamed_eps = self.rename_episodes_in_dir(d, title_en, sn_year)
         else:
-            logger.warning(f"⚠️ TMDb introuvable, renommage local des épisodes pour {d.name}")
+            logger.warning(f"⚠️ Série introuvable, renommage local pour {d.name}")
             renamed_eps = self.rename_episodes_in_dir(d, clean, year or "0000")
 
         return {"series": d.name, "episodes": renamed_eps}
@@ -175,19 +173,25 @@ class MediasSeries:
     async def run(self):
         results = []
         async with aiohttp.ClientSession() as session:
-            for d in self.base_dir.iterdir():
-                if d.is_dir():
-                    res = await self.process_series_dir(session, d)
-                    results.append(res)
+            tasks = [self.process_series_dir(session, d) for d in self.base_dir.iterdir() if d.is_dir()]
+            results = await asyncio.gather(*tasks)
         return results
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Renommer séries et épisodes avec IMDb ID via TMDb")
+
+    parser = argparse.ArgumentParser(description="Renommer séries et épisodes via Sonarr (IMDb ID inclus)")
     parser.add_argument("--base", required=True, help="Chemin du dossier contenant les séries")
-    parser.add_argument("--apply", action="store_true", help="Appliquer réellement les renommages")
+    parser.add_argument("--sonarr-url", required=True, help="URL de Sonarr (ex: http://localhost:8989)")
+    parser.add_argument("--sonarr-key", required=True, help="API Key de Sonarr")
+    parser.add_argument("--apply", action="store_true", help="Appliquer réellement les renommages (sinon dry-run)")
     args = parser.parse_args()
 
-    manager = MediasSeries(base_dir=args.base, api_key=API_KEY)
+    manager = MediasSeries(
+        base_dir=args.base,
+        sonarr_url=args.sonarr_url,
+        sonarr_key=args.sonarr_key,
+        apply=args.apply
+    )
     asyncio.run(manager.run())

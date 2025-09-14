@@ -117,20 +117,29 @@ def get_movies_manager() -> MediasMovies:
 
     return MediasMovies(base_dir=movies_dir, api_key=api_key)
 
-def get_series_managers() -> list[MediasSeries]:
+def get_series_managers(apply: bool = False) -> list[MediasSeries]:
     """Instancie MediasSeries pour TOUS les dossiers Sonarr définis dans config.json"""
     cfg = config_manager.config
-    api_key = cfg.tmdb_api_key
 
-    if not api_key:
-        raise RuntimeError("⚠️ TMDB API key manquante dans config.json")
+    sonarr_url = "http://localhost:8989"  # fixé en dur
+    sonarr_key = cfg.sonarr_api_key
+
+    if not sonarr_key:
+        raise RuntimeError("⚠️ Sonarr API key manquante dans config.json")
 
     managers: list[MediasSeries] = []
     for ld in cfg.links_dirs:
-        if ld.manager == "sonarr":  # Séries
+        if ld.manager == "sonarr":
             base_dir = Path(ld.path)
             if base_dir.exists():
-                managers.append(MediasSeries(base_dir=base_dir, api_key=api_key))
+                managers.append(
+                    MediasSeries(
+                        base_dir=base_dir,
+                        sonarr_url=sonarr_url,
+                        sonarr_key=sonarr_key,
+                        apply=apply
+                    )
+                )
             else:
                 logger.warning(f"⚠️ Dossier introuvable : {base_dir}")
 
@@ -1519,7 +1528,7 @@ async def get_tmdb_data(
     }
 
 # --------------------------
-# Renommage symlinks movies avec tmdbid
+# Renommage symlinks movies radarr et tmdbid
 # --------------------------
 
 @router.post("/movies/scan")
@@ -1564,16 +1573,21 @@ async def scan_all_movies(dry_run: bool = Query(True, description="Simulation ou
 # Renommage symlinks series avec tmdbid
 # --------------------------
 @router.post("/series/scan")
-async def scan_all_series(dry_run: bool = Query(True, description="Simulation ou exécution réelle")):
+async def scan_all_series(
+    dry_run: bool = Query(True, description="Simulation ou exécution réelle")
+):
     """
     Scan et renomme les séries dans TOUS les dossiers Sonarr.
     """
     try:
-        managers = get_series_managers()
-        results = []
-        for manager in managers:
-            res = await manager.run()
-            results.extend(res)
+        logger.info(f"🚀 Lancement du scan séries (dry_run={dry_run})")
+
+        # On instancie les managers avec le flag dry_run
+        managers = get_series_managers(apply=not dry_run)
+
+        # Exécution en parallèle
+        all_results = await asyncio.gather(*(m.run() for m in managers))
+        results = [item for sublist in all_results for item in sublist]
 
         return {
             "message": "✅ Scan terminé pour tous les dossiers Sonarr",

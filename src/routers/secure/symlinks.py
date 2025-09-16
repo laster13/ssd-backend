@@ -310,7 +310,8 @@ def list_symlinks(
             "limit": limit,
             "data": [],
             "orphaned": 0,
-            "unique_targets": 0
+            "unique_targets": 0,
+            "duplicates": []
         }
 
     try:
@@ -383,7 +384,8 @@ def list_symlinks(
             "limit": limit,
             "data": [],
             "orphaned": 0,
-            "unique_targets": 0
+            "unique_targets": 0,
+            "duplicates": []
         }
 
 # -----
@@ -1423,13 +1425,20 @@ async def repair_missing_seasons(
 # -----------------
 # Doublons (cibles)
 # -----------------
+
 @router.get("/duplicates")
-def list_duplicates():
+def list_duplicates(folder: str = Query(None)):
     if not symlink_store:
         raise HTTPException(status_code=503, detail="Cache vide, lancez un scan d'abord.")
 
+    # ⚡ On applique d’abord le filtrage par dossier si fourni
+    results = symlink_store
+    if folder:
+        results = [s for s in results if folder in s["symlink"]]
+
+    # ⚡ Ensuite on construit la map des doublons
     target_map = {}
-    for item in symlink_store:
+    for item in results:
         target = item["target"]
         if item.get("ref_count", 0) > 1:
             target_map.setdefault(target, []).append(item)
@@ -1439,8 +1448,10 @@ def list_duplicates():
         if len(items) > 1:
             duplicates.extend(items)
 
-    return {"total": len(duplicates), "data": duplicates}
-
+    return {
+        "total": len(duplicates),
+        "data": duplicates
+    }
 
 # --------------------------
 # Proxy TMDB (films/séries)
@@ -1607,3 +1618,71 @@ def scan_libraries(scanner: LibraryScanner = Depends(LibraryScanner)):
     return scanner.scan()
 
 
+# -------------------
+# Suppression Symlink local
+# -------------------
+@router.delete("/delete_local/{symlink_path:path}")
+async def delete_local_symlink(
+    symlink_path: str,
+    root: Optional[str] = Query(None, description="Nom de la racine (ex: movies ou shows)")
+):
+    """
+    Supprime un symlink :
+    - Supprime physiquement le lien symbolique si présent (même si cible orpheline)
+    - Publie un event SSE informatif
+    """
+    try:
+        # 🔎 Identifier les répertoires racines autorisés
+        if root:
+            root_paths = {
+                Path(ld.path).name: Path(ld.path).resolve()
+                for ld in config_manager.config.links_dirs
+            }
+            if root not in root_paths:
+                raise HTTPException(status_code=400, detail="Racine inconnue")
+            roots = [root_paths[root]]
+        else:
+            roots = [Path(ld.path).resolve() for ld in config_manager.config.links_dirs]
+
+        candidate_abs = None
+        for r in roots:
+            # Chemin absolu basé sur la racine
+            test_path = r / symlink_path
+            try:
+                # Vérifie bien que le chemin est dans la racine
+                test_path.relative_to(r)
+            except ValueError:
+                continue
+
+            if test_path.exists() or test_path.is_symlink():
+                candidate_abs = test_path
+                break
+
+        if not candidate_abs:
+            raise HTTPException(status_code=404, detail="Symlink introuvable")
+
+        if not candidate_abs.is_symlink():
+            raise HTTPException(status_code=400, detail="Le chemin trouvé n'est pas un symlink")
+
+        # 🗑️ Suppression du symlink
+        try:
+            candidate_abs.unlink(missing_ok=True)
+            logger.info(f"🗑️ Symlink supprimé : {candidate_abs}")
+        except Exception as e:
+            logger.warning(f"⚠️ Impossible de supprimer le symlink {candidate_abs} : {e}")
+            raise HTTPException(status_code=500, detail=f"Impossible de supprimer le symlink : {e}")
+
+        # 📢 Publier un event SSE
+        payload = {
+            "event": "symlink_removed",
+            "path": str(candidate_abs),
+        }
+        sse_manager.publish_event("symlink_update", payload)
+
+        return {"message": f"✅ Symlink supprimé : {candidate_abs}"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"💥 Erreur suppression symlink : {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Erreur interne : {e}")

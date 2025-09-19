@@ -28,6 +28,7 @@ from src.services.medias_series import MediasSeries
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from program.file_watcher import start_symlink_watcher
 from services.scan_librairies import LibraryScanner
+from program.utils.imdb import is_missing_imdb 
 from program.radarr_cache import (
     _radarr_index,
     _radarr_catalog,
@@ -45,14 +46,6 @@ router = APIRouter(
 # ⚠️ Ne JAMAIS réassigner cette liste : toujours modifier en place (clear/extend, slices, etc.)
 symlink_store = []
 VALID_MEDIA_EXTS = {".mkv", ".mp4", ".m4v"}
-
-# ---------------------------
-# Utilitaires chemins & roots
-# ---------------------------
-
-# -----------------
-# Utilise nom container sonarr pour recuperer sous domaine
-# -----------------
 
 client = docker.from_env()
 
@@ -281,7 +274,8 @@ scan_symlinks = scan_symlinks_parallel
 
 # ---------------
 # Liste symlinks
-# ---------------
+# --------------
+
 @router.get("")
 def list_symlinks(
     page: int = Query(1, gt=0),
@@ -291,14 +285,17 @@ def list_symlinks(
     order: Optional[str] = "asc",
     orphans: Optional[bool] = False,
     folder: Optional[str] = None,
-    all: bool = False
+    all: bool = False,
+    rename: bool = False,   # ✅ flag "rename"
 ):
     """
     Liste des symlinks filtrés / paginés.
-    - folder = nom de racine (ex: "movies" ou "shows")
-    - sort = symlink | target | ref_count | created_at
-    - order = asc | desc
-    - orphans = liens brisés (cible absente) → basé UNIQUEMENT sur target_exists=False
+    - folder  = nom de racine (ex: "movies" ou "shows")
+    - sort    = symlink | target | ref_count | created_at
+    - order   = asc | desc
+    - orphans = liens brisés (cible absente)
+    - rename  = dossiers parents sans identifiant IMDb valide
+                (filtrage par dossier film/série, pas les saisons)
     """
     try:
         items = list(symlink_store or [])
@@ -311,10 +308,26 @@ def list_symlinks(
             "data": [],
             "orphaned": 0,
             "unique_targets": 0,
-            "duplicates": []
+            "duplicates": [],
+            "imdb_missing": 0,
         }
 
     try:
+        # 📊 Calcul global du nombre de dossiers à renommer (avant filtres)
+        imdb_missing = 0
+        seen_parents = set()
+        for i in items:
+            symlink_path = Path(i["symlink"])
+            parent = symlink_path.parent
+            if "shows" in symlink_path.parts:
+                parent = parent.parent
+            if parent not in seen_parents:
+                seen_parents.add(parent)
+                if parent.exists() and is_missing_imdb(parent.name):
+                    imdb_missing += 1
+
+        all_broken = sum(1 for i in symlink_store or [] if not i.get("target_exists", True))
+
         # 📂 Filtre par dossier racine
         if folder:
             config = config_manager.config
@@ -341,6 +354,21 @@ def list_symlinks(
         # ⚠️ Filtre orphelins (cible absente)
         if orphans:
             items = [i for i in items if not i.get("target_exists", True)]
+
+        # 🎬 Mode rename (dossiers sans IMDb valide)
+        if rename:
+            seen = set()
+            filtered = []
+            for i in items:
+                symlink_path = Path(i["symlink"])
+                parent = symlink_path.parent
+                if "shows" in symlink_path.parts:
+                    parent = parent.parent
+                if parent not in seen:
+                    seen.add(parent)
+                    if parent.exists() and is_missing_imdb(parent.name):
+                        filtered.append(i)
+            items = filtered
 
         # ↕️ Tri
         reverse = order.lower() == "desc"
@@ -374,6 +402,8 @@ def list_symlinks(
             "data": paginated,
             "orphaned": sum(1 for i in items if not i.get("target_exists", True)),
             "unique_targets": len(set(i["target"] for i in items if i.get("target_exists", True))),
+            "imdb_missing": imdb_missing,  # ✅ cohérent en snake_case
+            "all_broken": all_broken,
         }
 
     except Exception:
@@ -385,7 +415,8 @@ def list_symlinks(
             "data": [],
             "orphaned": 0,
             "unique_targets": 0,
-            "duplicates": []
+            "duplicates": [],
+            "imdb_missing": 0,
         }
 
 # -----
@@ -567,7 +598,7 @@ async def delete_broken_symlinks(
             return False
 
     items = list(symlink_store)
-    logger.debug(f"📦 Cache actuel: {len(items)} symlinks en mémoire")
+    logger.debug(f"   Cache actuel: {len(items)} symlinks en mémoire")
 
     # 📂 Filtre par dossier si précisé
     if folder:
@@ -1556,6 +1587,14 @@ async def scan_all_movies(dry_run: bool = Query(True, description="Simulation ou
         raise HTTPException(status_code=500, detail="⚠️ Clé TMDb manquante dans config.json")
 
     results = []
+    stats = {
+        "total": 0,
+        "renamed": 0,
+        "already_conform": 0,
+        "not_found": 0,
+        "errors": 0,
+    }
+
     try:
         for ld in cfg.links_dirs:
             if ld.manager == "radarr":
@@ -1567,12 +1606,19 @@ async def scan_all_movies(dry_run: bool = Query(True, description="Simulation ou
                 logger.info(f"🎬 Scan Radarr → {base_dir}")
                 manager = MediasMovies(base_dir=base_dir, api_key=api_key)
                 res = await manager.run(dry_run=dry_run)
-                results.extend(res)
+
+                # ⚠️ IMPORTANT : n'ajouter que la partie "results"
+                results.extend(res["results"])
+
+                # Agréger les stats globales
+                for k, v in res["stats"].items():
+                    if k in stats:
+                        stats[k] += v
 
         return {
             "message": "✅ Scan terminé pour tous les dossiers Radarr",
             "dry_run": dry_run,
-            "count": len(results),
+            "stats": stats,
             "results": results,
         }
 
@@ -1589,6 +1635,8 @@ async def scan_all_series(
 ):
     """
     Scan et renomme les séries dans TOUS les dossiers Sonarr.
+    - dry_run=True → simulation (affiche seulement)
+    - dry_run=False → applique réellement les renommages
     """
     try:
         logger.info(f"🚀 Lancement du scan séries (dry_run={dry_run})")
@@ -1598,14 +1646,30 @@ async def scan_all_series(
 
         # Exécution en parallèle
         all_results = await asyncio.gather(*(m.run() for m in managers))
-        results = [item for sublist in all_results for item in sublist]
+
+        results = []
+        stats = {
+            "total": 0,
+            "renamed": 0,
+            "already_conform": 0,
+            "not_found": 0,
+            "errors": 0,
+        }
+
+        # Fusionner proprement les résultats et les stats
+        for res in all_results:
+            results.extend(res["results"])  # ⚠️ on prend uniquement la clé "results"
+            for k, v in res["stats"].items():
+                if k in stats:
+                    stats[k] += v
 
         return {
             "message": "✅ Scan terminé pour tous les dossiers Sonarr",
             "dry_run": dry_run,
-            "count": len(results),
+            "stats": stats,
             "results": results,
         }
+
     except Exception as e:
         logger.error(f"💥 Erreur pendant le scan séries : {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -1617,9 +1681,8 @@ def scan_libraries(scanner: LibraryScanner = Depends(LibraryScanner)):
     """
     return scanner.scan()
 
-
 # -------------------
-# Suppression Symlink local
+# Suppression Symlink local doublons
 # -------------------
 @router.delete("/delete_local/{symlink_path:path}")
 async def delete_local_symlink(

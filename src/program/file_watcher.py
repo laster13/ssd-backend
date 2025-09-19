@@ -15,7 +15,7 @@ from program.utils.text_utils import normalize_name, clean_movie_name
 from program.settings.manager import config_manager
 from program.managers.sse_manager import sse_manager
 from .json_manager import update_json_files
-from program.utils.discord_notifier import send_discord_summary
+from program.utils.discord_notifier import send_discord_summary, send_discord_message
 from program.radarr_cache import (
     _radarr_index,
     _radarr_catalog,
@@ -387,6 +387,31 @@ def start_symlink_watcher():
         symlink_store.extend(symlinks_data)
         logger.success(f"✔️ Scan initial terminé — {len(symlinks_data)} symlinks chargés")
 
+        # 🚨 Détection des symlinks brisés (scan initial)
+        broken_symlinks = [s for s in symlinks_data if not s.get("target_exists")]
+        if broken_symlinks:
+            logger.warning(f"⚠️ {len(broken_symlinks)} symlinks brisés détectés (scan initial)")
+            with buffer_lock:
+                for s in broken_symlinks:
+                    symlink_events_buffer.append({
+                        "action": "broken",
+                        "symlink": s["symlink"],
+                        "path": s["symlink"],
+                        "target": s.get("target"),
+                        "manager": s.get("manager"),
+                        "when": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                    })
+
+                    # 🚨 Notification instantanée Discord
+                    webhook = config_manager.config.discord_webhook_url
+                    if webhook:
+                        asyncio.run(send_discord_message(
+                            webhook_url=webhook,
+                            title="⚠️ Symlink brisé détecté",
+                            description=f"Le lien `{s['symlink']}` pointe vers une cible manquante.",
+                            action="broken"
+                        ))
+
         sse_manager.publish_event("symlink_update", {
             "event": "initial_scan",
             "message": "Scan initial terminé",
@@ -406,7 +431,7 @@ def start_symlink_watcher():
             observers.append(observer)
             logger.info(f"📍 Symlink watcher actif sur {path.resolve()}")
 
-        # 4️⃣ Boucle de fond
+        # 4️⃣ Boucle de fond (rescans périodiques)
         scan_interval = 3600  # 1h
         last_scan = time.time()
 
@@ -421,6 +446,31 @@ def start_symlink_watcher():
                 with threading.Lock():
                     symlink_store.clear()
                     symlink_store.extend(symlinks_data)
+
+                # 🚨 Détection des symlinks brisés (rescan périodique)
+                broken_symlinks = [s for s in symlinks_data if not s.get("target_exists")]
+                if broken_symlinks:
+                    logger.warning(f"⚠️ {len(broken_symlinks)} symlinks brisés détectés (rescan)")
+                    with buffer_lock:
+                        for s in broken_symlinks:
+                            symlink_events_buffer.append({
+                                "action": "broken",
+                                "symlink": s["symlink"],
+                                "path": s["symlink"],
+                                "target": s.get("target"),
+                                "manager": s.get("manager"),
+                                "when": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                            })
+
+                            # 🚨 Notification instantanée Discord
+                            webhook = config_manager.config.discord_webhook_url
+                            if webhook:
+                                asyncio.run(send_discord_message(
+                                    webhook_url=webhook,
+                                    title="⚠️ Symlink brisé détecté",
+                                    description=f"Le lien `{s['symlink']}` pointe vers une cible manquante.",
+                                    action="broken"
+                                ))
 
                 sse_manager.publish_event("symlink_update", {
                     "event": "periodic_scan",

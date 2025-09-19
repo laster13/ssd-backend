@@ -25,8 +25,11 @@ class MediasSeries:
         return re.sub(r'[\/:*?"<>|]', "-", name).strip()
 
     def log_not_found(self, title, year=None):
-        with open(self.not_found_file, "a", encoding="utf-8") as f:
-            f.write(f"{title} ({year}) [TV]\n")
+        try:
+            with open(self.not_found_file, "a", encoding="utf-8") as f:
+                f.write(f"{title} ({year}) [TV]\n")
+        except Exception as e:
+            logger.warning(f"⚠️ Impossible d'écrire dans {self.not_found_file}: {e}")
 
     @staticmethod
     def clean_name(raw: str) -> str:
@@ -53,13 +56,24 @@ class MediasSeries:
             if resp.status != 200:
                 logger.error(f"❌ Erreur API Sonarr ({resp.status}) pour {query}")
                 return []
-            return await resp.json()
+            try:
+                data = await resp.json()
+            except Exception as e:
+                logger.error(f"❌ Réponse JSON invalide Sonarr pour {query}: {e}")
+                return []
+            if isinstance(data, dict):
+                return [data]
+            if not isinstance(data, list):
+                logger.error(f"❌ Réponse inattendue Sonarr pour {query}: {data}")
+                return []
+            return data
 
     async def get_sonarr_info(self, session, title, year=None, imdb_id=None):
         """Récupère les infos fiables via Sonarr (IMDb ID, titre, année)"""
         term = imdb_id or title
         results = await self.sonarr_lookup(session, term)
-        if not results:
+
+        if not results or not all(isinstance(r, dict) for r in results):
             self.log_not_found(title, year)
             return None
 
@@ -89,11 +103,7 @@ class MediasSeries:
         logger.info(f"🔎 Scan des épisodes dans {series_dir}")
         renamed = []
 
-        # éviter doublon (2023) (2023)
-        if f"({year})" in series_name:
-            base_name = series_name
-        else:
-            base_name = f"{series_name} ({year})"
+        base_name = f"{series_name} ({year})"
 
         for root, _, files in os.walk(series_dir):
             for file in files:
@@ -107,19 +117,37 @@ class MediasSeries:
                         new_name = f"{base_name} - {episode_code}{f.suffix}"
                         new_path = f.parent / new_name
 
-                        if f != new_path:
-                            try:
-                                if new_path.exists():
-                                    logger.warning(f"⚠️ Fichier existe déjà, ignoré : {new_path}")
-                                    continue
-                                if self.apply:
-                                    shutil.move(str(f), str(new_path))
-                                    logger.success(f"📂 Épisode renommé : {f.name} → {new_name}")
-                                else:
-                                    logger.info(f"(Dry-run Episode) {f.name} → {new_name}")
-                                renamed.append({"old": str(f), "new": str(new_path)})
-                            except Exception as e:
-                                logger.error(f"❌ Erreur renommage fichier {f}: {e}")
+                        if f == new_path:
+                            renamed.append({
+                                "old": str(f),
+                                "new": str(new_path),
+                                "status": "already_conform"
+                            })
+                            continue
+
+                        try:
+                            if self.apply:
+                                shutil.move(str(f), str(new_path))
+                                logger.success(f"📂 Épisode renommé : {f.name} → {new_name}")
+                            else:
+                                logger.info(f"(Dry-run Episode) {f.name} → {new_name}")
+
+                            renamed.append({
+                                "old": str(f),
+                                "new": str(new_path),
+                                "status": "renamed",
+                                "dry_run": not self.apply
+                            })
+                        except Exception as e:
+                            logger.error(f"❌ Erreur renommage fichier {f}: {e}")
+                            renamed.append({
+                                "old": str(f),
+                                "new": None,
+                                "status": "error",
+                                "error": str(e)
+                            })
+                    else:
+                        logger.debug(f"⏭ Aucun pattern SxxEyy détecté pour {f.name}")
         return renamed
 
     # ----------------- SERIES -----------------
@@ -138,16 +166,11 @@ class MediasSeries:
         logger.info(f"🔎 Recherche via Sonarr : {title} ({year}) {imdb_id or ''}")
         best = await self.get_sonarr_info(session, title, year, imdb_id)
 
-        renamed_eps = []
+        results = []
         if best:
             imdb_id, title_en, sn_year = best["imdb_id"], best["title_en"], best["year"]
 
-            # éviter doublon (2023) (2023)
-            if f"({sn_year})" in title_en:
-                folder_name = f"{title_en} {{imdb-{imdb_id}}}"
-            else:
-                folder_name = f"{title_en} ({sn_year}) {{imdb-{imdb_id}}}"
-
+            folder_name = f"{title_en} ({sn_year}) {{imdb-{imdb_id}}}"
             new_path = d.parent / folder_name
 
             if d != new_path:
@@ -160,22 +183,65 @@ class MediasSeries:
                         logger.info(f"(Dry-run Folder) {d.name} → {folder_name}")
                 except Exception as e:
                     logger.error(f"❌ Erreur renommage dossier {d}: {e}")
+                    results.append({
+                        "series": d.name,
+                        "status": "error",
+                        "error": str(e)
+                    })
+                    return results
 
-            renamed_eps = self.rename_episodes_in_dir(d, title_en, sn_year)
+            results.extend(self.rename_episodes_in_dir(d, title_en, sn_year))
         else:
             logger.warning(f"⚠️ Série introuvable, renommage local pour {d.name}")
-            renamed_eps = self.rename_episodes_in_dir(d, clean, year or "0000")
+            results.append({
+                "series": d.name,
+                "status": "not_found"
+            })
+            results.extend(self.rename_episodes_in_dir(d, clean, year or "0000"))
 
-        return {"series": d.name, "episodes": renamed_eps}
+        return results
 
     # ----------------- MAIN -----------------
 
     async def run(self):
         results = []
+        total = renamed = already_conform = not_found = errors = 0
+
         async with aiohttp.ClientSession() as session:
             tasks = [self.process_series_dir(session, d) for d in self.base_dir.iterdir() if d.is_dir()]
-            results = await asyncio.gather(*tasks)
-        return results
+            all_series = await asyncio.gather(*tasks)
+
+        for series_results in all_series:
+            for r in series_results:
+                results.append(r)
+                total += 1
+                if r["status"] == "renamed":
+                    renamed += 1
+                elif r["status"] == "already_conform":
+                    already_conform += 1
+                elif r["status"] == "error":
+                    errors += 1
+                elif r["status"] == "not_found":
+                    not_found += 1
+
+        logger.info(
+            f"📊 Scan séries terminé : {total} épisodes détectés | "
+            f"🔄 {renamed} renommés | "
+            f"⏭ {already_conform} déjà conformes | "
+            f"❌ {not_found} introuvables | "
+            f"⚠️ {errors} erreurs"
+        )
+
+        return {
+            "stats": {
+                "total": total,
+                "renamed": renamed,
+                "already_conform": already_conform,
+                "not_found": not_found,
+                "errors": errors,
+            },
+            "results": results,
+        }
 
 
 if __name__ == "__main__":
@@ -189,7 +255,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     manager = MediasSeries(
-        base_dir=args.base,
+        base_dir=Path(args.base),
         sonarr_url=args.sonarr_url,
         sonarr_key=args.sonarr_key,
         apply=args.apply

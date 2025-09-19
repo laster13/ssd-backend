@@ -1,11 +1,11 @@
 import json
-import re
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from program.utils.imdb import is_missing_imdb   # ✅ fonction factorisée
+
 CONFIG_PATH = Path("data/config.json")
-IMDB_PATTERN = re.compile(r"\{imdb-tt\d+\}", re.IGNORECASE)
 
 
 class LibraryScanner:
@@ -33,18 +33,13 @@ class LibraryScanner:
             return json.load(f)
 
     @staticmethod
-    def _check_movie_folder(folder: Path):
+    def _check_folder(folder: Path):
+        """Retourne 'ok' ou 'imdb_missing' pour un dossier."""
         if not folder.is_dir():
             return "skip"
-        return "ok" if IMDB_PATTERN.search(folder.name) else "imdb_missing"
+        return "ok" if not is_missing_imdb(folder.name) else "imdb_missing"
 
-    @staticmethod
-    def _check_show_folder(folder: Path):
-        if not folder.is_dir():
-            return "skip"
-        return "ok" if IMDB_PATTERN.search(folder.name) else "imdb_missing"
-
-    def _scan_folder(self, base: Path, mode: str):
+    def _scan_folder(self, base: Path):
         results = {"ok": 0, "imdb_missing": 0}
         tasks = []
 
@@ -52,10 +47,7 @@ class LibraryScanner:
             for item in base.iterdir():
                 if not item.is_dir():
                     continue
-                if mode == "movies":
-                    tasks.append(executor.submit(self._check_movie_folder, item))
-                elif mode == "shows":
-                    tasks.append(executor.submit(self._check_show_folder, item))
+                tasks.append(executor.submit(self._check_folder, item))
 
             for future in as_completed(tasks):
                 res = future.result()
@@ -67,7 +59,7 @@ class LibraryScanner:
     def scan_movies(self):
         results = {"ok": 0, "imdb_missing": 0}
         for base in self.movie_dirs:
-            res = self._scan_folder(base, "movies")
+            res = self._scan_folder(base)
             results["ok"] += res["ok"]
             results["imdb_missing"] += res["imdb_missing"]
         return results
@@ -75,7 +67,7 @@ class LibraryScanner:
     def scan_shows(self):
         results = {"ok": 0, "imdb_missing": 0}
         for base in self.show_dirs:
-            res = self._scan_folder(base, "shows")
+            res = self._scan_folder(base)
             results["ok"] += res["ok"]
             results["imdb_missing"] += res["imdb_missing"]
         return results

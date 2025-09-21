@@ -214,13 +214,17 @@ async def create_sonarr_instance(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    if not await test_sonarr_connection(instance_data.url, instance_data.api_key):
+    # ⚡ On ignore l’URL envoyée par le frontend
+    sonarr_url = "http://172.17.0.1:8989"
+    user_api_key = instance_data.api_key
+
+    if not await test_sonarr_connection(sonarr_url, user_api_key):
         raise HTTPException(status_code=400, detail="Could not connect to Sonarr instance")
 
     db_instance = SonarrInstance(
-        name=instance_data.name,
-        url=instance_data.url,
-        api_key=instance_data.api_key,
+        name=instance_data.name or "Sonarr",
+        url=sonarr_url,  # toujours l’URL interne
+        api_key=user_api_key,
         owner_id=current_user.id
     )
     db.add(db_instance)
@@ -262,20 +266,18 @@ async def update_sonarr_instance(
     if not instance:
         raise HTTPException(status_code=404, detail="Sonarr instance not found")
 
-    if instance_data.url or instance_data.api_key:
-        test_url = instance_data.url or instance.url
-        test_api_key = instance_data.api_key or instance.api_key
-        if not await test_sonarr_connection(test_url, test_api_key):
-            raise HTTPException(status_code=400, detail="Could not connect to Sonarr instance with provided settings")
+    # ⚡ Toujours utiliser l’URL interne
+    instance.url = "http://172.17.0.1:8989"
 
-    if instance_data.name is not None:
-        instance.name = instance_data.name
-    if instance_data.url is not None:
-        instance.url = instance_data.url
     if instance_data.api_key is not None:
         instance.api_key = instance_data.api_key
+    if instance_data.name is not None:
+        instance.name = instance_data.name
     if instance_data.is_active is not None:
         instance.is_active = instance_data.is_active
+
+    if not await test_sonarr_connection(instance.url, instance.api_key):
+        raise HTTPException(status_code=400, detail="Could not connect to Sonarr instance with provided settings")
 
     db.commit()
     db.refresh(instance)
@@ -287,7 +289,8 @@ async def test_sonarr_connection_endpoint(
     instance_data: SonarrInstanceCreate,
     current_user: User = Depends(get_current_user)
 ):
-    success = await test_sonarr_connection(instance_data.url, instance_data.api_key)
+    sonarr_url = "http://172.17.0.1:8989"  # ⚡ forcé
+    success = await test_sonarr_connection(sonarr_url, instance_data.api_key)
     return {"success": bool(success), "message": "Connection successful" if success else "Connection failed"}
 
 

@@ -381,13 +381,26 @@ def start_symlink_watcher():
         logger.info("🗄️ Chargement initial du cache Radarr...")
         asyncio.run(_build_radarr_index(force=False))
 
-        # 2️⃣ Scan symlinks
+        # 2️⃣ Mise en place des watchers (⚡ déplacé ici)
+        for dir_path in links_dirs:
+            path = Path(dir_path)
+            if not path.exists():
+                logger.warning(f"⚠️ Dossier symlink introuvable : {path}")
+                continue
+
+            observer = Observer()
+            observer.schedule(SymlinkEventHandler(), path=str(path), recursive=True)
+            observer.start()
+            observers.append(observer)
+            logger.info(f"📍 Symlink watcher actif sur {path.resolve()}")
+
+        # 3️⃣ Scan symlinks (après démarrage watchers)
         symlinks_data = scan_symlinks()
         symlink_store.clear()
         symlink_store.extend(symlinks_data)
         logger.success(f"✔️ Scan initial terminé — {len(symlinks_data)} symlinks chargés")
 
-        # 🚨 Détection des symlinks brisés (scan initial)
+        # 🚨 Détection symlinks brisés (scan initial)
         broken_symlinks = [s for s in symlinks_data if not s.get("target_exists")]
         if broken_symlinks:
             logger.warning(f"⚠️ {len(broken_symlinks)} symlinks brisés détectés (scan initial)")
@@ -418,19 +431,6 @@ def start_symlink_watcher():
             "count": len(symlinks_data)
         })
 
-        # 3️⃣ Mise en place des watchers
-        for dir_path in links_dirs:
-            path = Path(dir_path)
-            if not path.exists():
-                logger.warning(f"⚠️ Dossier symlink introuvable : {path}")
-                continue
-
-            observer = Observer()
-            observer.schedule(SymlinkEventHandler(), path=str(path), recursive=True)
-            observer.start()
-            observers.append(observer)
-            logger.info(f"📍 Symlink watcher actif sur {path.resolve()}")
-
         # 4️⃣ Boucle de fond (rescans périodiques)
         scan_interval = 3600  # 1h
         last_scan = time.time()
@@ -447,7 +447,7 @@ def start_symlink_watcher():
                     symlink_store.clear()
                     symlink_store.extend(symlinks_data)
 
-                # 🚨 Détection des symlinks brisés (rescan périodique)
+                # 🚨 Détection symlinks brisés (rescan périodique)
                 broken_symlinks = [s for s in symlinks_data if not s.get("target_exists")]
                 if broken_symlinks:
                     logger.warning(f"⚠️ {len(broken_symlinks)} symlinks brisés détectés (rescan)")

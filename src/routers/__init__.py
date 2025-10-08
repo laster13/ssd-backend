@@ -8,6 +8,8 @@ from routers.secure.script import router as script_router
 from routers.secure.backup import router as backup_router
 from routers.secure.docker import router as docker_router
 from routers.secure.symlinks import router as symlinks_router
+from routers.secure.orphans import router as orphans_router
+
 
 # ➕ Seasonarr (intégré)
 from integrations.seasonarr.api.routers import (
@@ -34,6 +36,7 @@ app_router.include_router(script_router)
 app_router.include_router(backup_router)
 app_router.include_router(docker_router)
 app_router.include_router(symlinks_router)
+app_router.include_router(orphans_router)
 
 # ➕ Routes Seasonarr (HTTP) sous /api/v1/seasonarr/...
 app_router.include_router(seasonarr_router)

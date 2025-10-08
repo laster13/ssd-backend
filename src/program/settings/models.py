@@ -1,9 +1,17 @@
-from typing import Any, Dict, List, Callable, Optional, Literal
+from typing import Any, Dict, List, Callable, Optional
 from pydantic import BaseModel, Field
+from datetime import datetime
+from pathlib import Path
+
 from program.utils import generate_api_key, get_version
 
 
+# ═══════════════════════════════════════════════════════════
+# 🔁 Observable base
+# ═══════════════════════════════════════════════════════════
+
 class Observable(BaseModel):
+    """Base pour notifier les observateurs (UI ou autres) lors d’un changement."""
     _notify_observers: Callable = None
 
     @classmethod
@@ -15,22 +23,28 @@ class Observable(BaseModel):
         if self.__class__._notify_observers:
             self.__class__._notify_observers()
 
-# Modèle Plex
+
+# ═══════════════════════════════════════════════════════════
+# 🎬 Services et utilisateurs
+# ═══════════════════════════════════════════════════════════
+
 class PlexModel(Observable):
     token: str = ""
     login: str = ""
     password: str = ""
     enabled: bool = False
 
+
 class JellyfinModel(Observable):
     enabled: bool = False
     api_key: str = ""
+
 
 class EmbyModel(Observable):
     enabled: bool = False
     api_key: str = ""
 
-# Modèle utilisateur
+
 class UtilisateurModel(Observable):
     username: str = ""
     email: str = ""
@@ -49,10 +63,15 @@ class CloudflareModel(Observable):
     cloudflare_api_key: str = ""
 
 
+# ═══════════════════════════════════════════════════════════
+# ⚙️ Configuration générale de l’application
+# ═══════════════════════════════════════════════════════════
+
 class DossierModel(BaseModel):
     on_item_type: List[str] = []
     authentification: Dict[str, str] = Field(default_factory=dict)
     domaine: Dict[str, Any] = Field(default_factory=dict)
+
 
 class ApplicationModel(Observable):
     id: int = 1
@@ -78,14 +97,80 @@ class AppModel(Observable):
         if self.api_key == "":
             self.api_key = generate_api_key()
 
+
+# ═══════════════════════════════════════════════════════════
+# 📁 Gestion des symlinks
+# ═══════════════════════════════════════════════════════════
+
 class LinkDir(BaseModel):
     path: str
     manager: str  # "sonarr" ou "radarr"
 
 
+# ═══════════════════════════════════════════════════════════
+# 🧩 Configuration des instances AllDebrid
+# ═══════════════════════════════════════════════════════════
+
+class AllDebridInstance(BaseModel):
+    name: str
+    api_key: str
+    mount_path: str
+    rate_limit: float = 0.2
+    priority: int = 1
+    enabled: bool = True
+    cache_path: Optional[str] = None  # Permet de forcer un chemin si besoin
+
+    @property
+    def resolved_cache_path(self) -> str:
+        """
+        Retourne le chemin du cache Decypharr spécifique à cette instance.
+        S'il n'est pas fourni, il est déduit automatiquement du mount_path :
+          - Si le mount_path contient 'alldebridrd' → decypharrd
+          - Sinon → decypharr
+        """
+        if self.cache_path:
+            return self.cache_path
+
+        base_dir = "decypharrd" if "alldebridrd" in self.mount_path else "decypharr"
+        base = Path.home() / "seedbox" / "docker" / Path.home().name / base_dir / "config" / "cache"
+        return str(base / self.name.lower())
+
+class OrphanManagerConfig(BaseModel):
+    auto_delete: bool = False
+
+# ═══════════════════════════════════════════════════════════
+# ⚙️ Configuration principale (config.json)
+# ═══════════════════════════════════════════════════════════
+
 class SymlinkConfig(BaseModel):
     links_dirs: List[LinkDir] = Field(default_factory=list)
+    mount_dirs: List[str] = Field(default_factory=list)
+    alldebrid_instances: List[AllDebridInstance] = Field(default_factory=list)
+    orphan_manager: OrphanManagerConfig = OrphanManagerConfig()
     radarr_api_key: Optional[str] = None
     sonarr_api_key: Optional[str] = None
     discord_webhook_url: Optional[str] = None
-    tmdb_api_key: Optional[str] = None 
+    tmdb_api_key: Optional[str] = None
+
+# ═══════════════════════════════════════════════════════════
+# 🧹 Résultat du scan des orphelins
+# ═══════════════════════════════════════════════════════════
+
+class OrphanScanStats(BaseModel):
+    sources: int
+    symlinks: int
+    orphans: int
+
+
+class OrphanActions(BaseModel):
+    auto_delete: bool
+    deletable: int
+
+
+class OrphanScanResult(BaseModel):
+    scan_date: str = Field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    instance: str
+    mount_path: str
+    stats: OrphanScanStats
+    orphans: List[str] = Field(default_factory=list)
+    actions: OrphanActions

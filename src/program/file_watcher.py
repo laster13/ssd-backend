@@ -99,6 +99,7 @@ class SymlinkEventHandler(FileSystemEventHandler):
         try:
             config = config_manager.config
             links_dirs = [(Path(ld.path).resolve(), ld.manager) for ld in config.links_dirs]
+            mount_dirs = [Path(d).resolve() for d in config.mount_dirs]
 
             root, manager = None, "unknown"
             for ld, mgr in links_dirs:
@@ -113,7 +114,15 @@ class SymlinkEventHandler(FileSystemEventHandler):
             except FileNotFoundError:
                 target_path = symlink_path.resolve(strict=False)
 
-            full_target = str(target_path)
+            matched_mount, relative_target = None, None
+            for mount_dir in mount_dirs:
+                try:
+                    relative_target = target_path.relative_to(mount_dir)
+                    matched_mount = mount_dir
+                    break
+                except ValueError:
+                    continue
+            full_target = str(matched_mount / relative_target) if matched_mount else str(target_path)
 
             try:
                 relative_path = str(symlink_path.resolve().relative_to(root))
@@ -367,6 +376,7 @@ def _launch_radarr_index(force: bool):
 
 def start_symlink_watcher():
     from routers.secure.symlinks import scan_symlinks, symlink_store
+    from routers.secure.orphans import scan_instance, delete_all_orphans_job  # 🧩 import ajouté
     logger.info("🛰️ Symlink watcher démarré")
     observers = []
     try:
@@ -377,11 +387,7 @@ def start_symlink_watcher():
             logger.warning("⏸️ Aucun links_dirs configuré")
             return
 
-        # 1️⃣ Build Radarr initial
-        logger.info("🗄️ Chargement initial du cache Radarr...")
-        asyncio.run(_build_radarr_index(force=False))
-
-        # 2️⃣ Mise en place des watchers (⚡ déplacé ici)
+        # 1️⃣ Mise en place des watchers
         for dir_path in links_dirs:
             path = Path(dir_path)
             if not path.exists():
@@ -394,11 +400,37 @@ def start_symlink_watcher():
             observers.append(observer)
             logger.info(f"📍 Symlink watcher actif sur {path.resolve()}")
 
+        # 2️⃣ Build Radarr initial
+        logger.info("🗄️ Chargement du cache Radarr...")
+        asyncio.run(_build_radarr_index(force=False))
+
         # 3️⃣ Scan symlinks (après démarrage watchers)
         symlinks_data = scan_symlinks()
         symlink_store.clear()
         symlink_store.extend(symlinks_data)
         logger.success(f"✔️ Scan initial terminé — {len(symlinks_data)} symlinks chargés")
+
+        # 🧹 Scan orphelins initial
+        try:
+            instances = getattr(config_manager.config, "alldebrid_instances", [])
+            if instances:
+                logger.info("🧹 Lancement du scan des fichiers Alldebrid non rattachés à un symlink...")
+                for inst in instances:
+                    if getattr(inst, "enabled", True):
+                        asyncio.run(scan_instance(inst))
+                logger.success("✅ Scan orphelins terminé")
+
+                # 🧪 Suppression orphelins
+                try:
+                    logger.info("🧪 Lancement de la suppression des orphelins...")
+                    asyncio.run(delete_all_orphans_job(dry_run=True))
+                    logger.success("✅ Suppression orphelins terminée")
+                except Exception as e:
+                    logger.error(f"💥 Erreur durant la suppression orphelins initial : {e}")
+            else:
+                logger.info("ℹ️ Aucun compte AllDebrid configuré, scan orphelins ignoré.")
+        except Exception as e:
+            logger.error(f"💥 Erreur durant le scan orphelins initial : {e}")
 
         # 🚨 Détection symlinks brisés (scan initial)
         broken_symlinks = [s for s in symlinks_data if not s.get("target_exists")]
@@ -415,7 +447,6 @@ def start_symlink_watcher():
                         "when": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                     })
 
-                    # 🚨 Notification instantanée Discord
                     webhook = config_manager.config.discord_webhook_url
                     if webhook:
                         asyncio.run(send_discord_message(
@@ -462,7 +493,6 @@ def start_symlink_watcher():
                                 "when": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                             })
 
-                            # 🚨 Notification instantanée Discord
                             webhook = config_manager.config.discord_webhook_url
                             if webhook:
                                 asyncio.run(send_discord_message(
@@ -479,6 +509,29 @@ def start_symlink_watcher():
                 })
 
                 logger.success(f"🔄 Scan périodique exécuté — {len(symlinks_data)} symlinks")
+
+                # 🧹 Scan orphelins post-rescan
+                try:
+                    instances = getattr(config_manager.config, "alldebrid_instances", [])
+                    if instances:
+                        logger.info("🧹 Lancement du scan orphelins post-rescan...")
+                        for inst in instances:
+                            if getattr(inst, "enabled", True):
+                                asyncio.run(scan_instance(inst))
+                        logger.success("✅ Scan orphelins post-rescan terminé")
+
+                        # 🧪 Suppression orphelins (périodique)
+                        try:
+                            logger.info("🧪 Lancement du suppression orphelins (post-rescan)...")
+                            asyncio.run(delete_all_orphans_job(dry_run=True))
+                            logger.success("✅ Suppression orphelins périodique terminée")
+                        except Exception as e:
+                            logger.error(f"💥 Erreur durant la suppression orphelins périodique : {e}")
+                    else:
+                        logger.info("ℹ️ Aucun compte AllDebrid configuré, scan orphelins ignoré.")
+                except Exception as e:
+                    logger.error(f"💥 Erreur durant le scan orphelins post-rescan : {e}")
+
                 last_scan = time.time()
 
             time.sleep(30)

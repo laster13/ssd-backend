@@ -185,10 +185,14 @@ def scan_symlinks_parallel(workers: int = 32):
     """
     config = config_manager.config
     links_dirs = [(Path(ld.path).resolve(), ld.manager) for ld in config.links_dirs]
+    mount_dirs = [Path(d).resolve() for d in config.mount_dirs]
 
     for links_dir, _ in links_dirs:
         if not links_dir.exists():
             raise RuntimeError(f"Dossier introuvable : {links_dir}")
+    for mount_dir in mount_dirs:
+        if not mount_dir.exists():
+            raise RuntimeError(f"Dossier introuvable : {mount_dir}")
 
     tasks = []
     symlinks_list = []
@@ -202,6 +206,18 @@ def scan_symlinks_parallel(workers: int = 32):
                     target_path = (Path(symlink_path).parent / target_path).resolve()
             except Exception:
                 target_path = Path(symlink_path).resolve(strict=False)
+
+            # 🔗 Adaptation mount_dir (repris de l’ancien code)
+            matched_mount = None
+            relative_target = None
+            for mount_dir in mount_dirs:
+                try:
+                    relative_target = target_path.relative_to(mount_dir)
+                    matched_mount = mount_dir
+                    break
+                except ValueError:
+                    continue
+            full_target = str(matched_mount / relative_target) if matched_mount else str(target_path)
 
             try:
                 relative_path = str(Path(symlink_path).resolve().relative_to(root))

@@ -2,7 +2,7 @@ import json
 import os
 from pathlib import Path
 from loguru import logger
-from pydantic import ValidationError
+from pydantic import ValidationError, Field
 from program.settings.models import AppModel, Observable, SymlinkConfig, LinkDir
 from program.utils import data_dir_path
 
@@ -114,16 +114,17 @@ class ConfigManager:
 
         if not self.config_file.exists():
             # Création d'une config par défaut
-            self.config = SymlinkConfig(
-                links_dirs=[],
-                radarr_api_key=None,
-                sonarr_api_key=None,
-                discord_webhook_url=None,
-                tmdb_api_key= None  
-            )
-            # On applique les variables d'environnement
             self.config = SymlinkConfig.model_validate(
-                self.check_environment(json.loads(self.config.model_dump_json()), "SYMLINK")
+                {
+                    "links_dirs": [],
+                    "mount_dirs": [],
+                    "alldebrid_instances": [],
+                    "orphan_manager": {"auto_delete": False},
+                    "radarr_api_key": None,
+                    "sonarr_api_key": None,
+                    "discord_webhook_url": None,
+                    "tmdb_api_key": None,
+                }
             )
             self.save()
         else:

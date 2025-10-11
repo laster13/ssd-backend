@@ -185,21 +185,14 @@ class MediasMovies:
 
         movies = await asyncio.gather(*tasks)
 
-        for m in movies:
-            if not m:
-                continue
-            results.append(m)
-            status = m.get("status")
-            if status == "renamed":
-                renamed += 1
-            elif status == "already_conform":
-                already_conform += 1
-            elif status == "not_found":
-                not_found += 1
-            elif status == "error":
-                errors += 1
+        # 🧩 Filtrer uniquement les films à renommer
+        movies_to_rename = [m for m in movies if m and m.get("status") == "renamed"]
 
-        # 🔥 Sauvegarde cache
+        # 🔊 Afficher uniquement ceux-là
+        for m in movies_to_rename:
+            logger.info(f"🎬 [DRY-RUN] {m['original']} → {m['new']}")
+
+        # 🔥 Sauvegarde cache (inchangée)
         if self.cache:
             try:
                 with open(self.cache_file, "w", encoding="utf-8") as f:
@@ -207,22 +200,16 @@ class MediasMovies:
             except Exception as e:
                 logger.warning(f"⚠️ Erreur sauvegarde cache local : {e}")
 
-        # 📊 Log résumé
+        # 📊 Log résumé allégé
         logger.info(
             f"📊 Scan terminé : {total_files} fichiers vidéo détectés | "
-            f"🔄 {renamed} renommés | "
-            f"⏭ {already_conform} déjà conformes | "
-            f"❌ {not_found} introuvables | "
-            f"⚠️ {errors} erreurs"
+            f"🔄 {len(movies_to_rename)} nécessitent un renommage"
         )
 
         return {
             "stats": {
                 "total": total_files,
-                "renamed": renamed,
-                "already_conform": already_conform,
-                "not_found": not_found,
-                "errors": errors,
+                "renamed": len(movies_to_rename),
             },
-            "results": results,
+            "results": movies_to_rename,
         }

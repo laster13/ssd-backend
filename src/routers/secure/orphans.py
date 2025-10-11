@@ -9,6 +9,8 @@ import asyncio
 import subprocess
 import os
 import aiohttp
+import shutil
+
 
 
 router = APIRouter(
@@ -104,6 +106,7 @@ async def scan_instance(instance) -> dict:
     mount_path = Path(instance.mount_path)
     api_key = instance.api_key
     rate_limit = instance.rate_limit
+    cache_path = getattr(instance, "cache_path", "/app/cache")  # ✅ ajouté ici
 
     start = datetime.utcnow()
     logger.info(f"🔍 Scan instance: {name}")
@@ -132,10 +135,12 @@ async def scan_instance(instance) -> dict:
             }
         }
 
+        # ✅ cache_path ajouté ici
         orphans_store[name] = {
             "orphans": orphans,
             "api_key": api_key,
             "mount_path": str(mount_path),
+            "cache_path": cache_path,
             "rate_limit": rate_limit,
             "stats": result["stats"],
         }
@@ -219,15 +224,23 @@ async def get_stats():
 
 async def perform_deletion(instance: str, dry_run: bool = False):
     """
-    Supprime (ou simule la suppression) des orphelins AllDebrid
-    et supprime les fichiers JSON correspondants dans le cache Decypharr.
+    Supprime (ou simule la suppression) des orphelins AllDebrid,
+    supprime les fichiers JSON correspondants dans le cache Decypharr
+    et les fichiers locaux correspondants sur le mount_path.
     """
+
+    # --- Récupération de la configuration de l'instance ---
+    data = orphans_store.get(instance)
+    if not data:
+        logger.error(f"<red>[{instance}] Instance introuvable dans orphans_store</red>")
+        return
+
     dry_run = False
-    data = orphans_store[instance]
-    orphans = data["orphans"]
-    api_key = data["api_key"]
-    mount_path = data["mount_path"]
-    rate_limit = data["rate_limit"]
+    orphans = data.get("orphans", [])
+    api_key = data.get("api_key")
+    mount_path = data.get("mount_path")
+    rate_limit = float(data.get("rate_limit", 0.5))
+    cache_path = data.get("cache_path", "/app/cache")
 
     dry_label = "DRY-RUN" if dry_run else "SUPPRESSION"
     logger.info(f"🧪 [{instance}] Démarrage {dry_label} en tâche de fond...")
@@ -243,8 +256,11 @@ async def perform_deletion(instance: str, dry_run: bool = False):
 
     torrents = sorted(set(filter(None, [extract_torrent(f) for f in orphans])))
     if not torrents:
-        logger.info(f"<green>[{instance}] Aucun torrent à traiter.</green>")
+        logger.info(f"<green>🧱[{instance}] Aucun torrent à traiter.</green>")
         return
+
+    ok, nf, err = 0, 0, 0
+    decypharr_data = []  # [(nom, id)]
 
     # --- Connexion à AllDebrid ---
     async with aiohttp.ClientSession() as session:
@@ -252,13 +268,19 @@ async def perform_deletion(instance: str, dry_run: bool = False):
             f"{ALLDEBRID_API_BASE}/magnet/status",
             headers={"Authorization": f"Bearer {api_key}"}
         ) as resp:
-            data_status = await resp.json()
+            try:
+                data_status = await resp.json()
+            except Exception:
+                logger.error(f"<red>[{instance}] Erreur de décodage JSON sur magnet/status</red>")
+                return
+
             if data_status.get("status") != "success":
                 logger.error(f"<cyan>[{instance}] Erreur API magnet/status: {data_status}</cyan>")
                 return
+
             magnets = data_status.get("data", {}).get("magnets", [])
 
-        # Trouve les infos du magnet
+        # --- Recherche d'un magnet par nom ---
         def find_magnet_info(name: str) -> dict | None:
             for m in magnets:
                 if m.get("filename") == name or m.get("name") == name:
@@ -268,10 +290,7 @@ async def perform_deletion(instance: str, dry_run: bool = False):
                     return {"id": str(m["id"]), "name": m.get("filename") or m.get("name")}
             return None
 
-        ok, nf, err = 0, 0, 0
-        decypharr_data = []  # [(nom, id)]
-
-        # --- Suppression / Simulation AllDebrid ---
+        # --- Suppression ou simulation sur AllDebrid ---
         for torrent in torrents:
             info = find_magnet_info(torrent)
             if not info:
@@ -286,6 +305,7 @@ async def perform_deletion(instance: str, dry_run: bool = False):
             if dry_run:
                 logger.info(f"<green>🧱 [AllDebrid] {magnet_name} - ID: {magnet_id} → simulé</green>")
                 decypharr_data.append((magnet_name, magnet_id))
+                await asyncio.sleep(rate_limit)
                 continue
 
             try:
@@ -304,37 +324,63 @@ async def perform_deletion(instance: str, dry_run: bool = False):
                         msg = del_json.get("error", {}).get("message", "Erreur inconnue")
                         logger.warning(f"<yellow>⚠️ [AllDebrid] Échec suppression {magnet_name} : {msg}</yellow>")
             except Exception as e:
-                logger.error(f"<green>[{instance}] ✗ Exception suppression AllDebrid: {e}</green>")
+                logger.error(f"<red>[{instance}] ✗ Exception suppression AllDebrid: {e}</red>")
                 err += 1
 
             await asyncio.sleep(rate_limit)
 
-    # --- Étape 2 : suppression cache Decypharr ---
-    decy_conf = getattr(config_manager.config, "decypharr", None)
-    cache_path = getattr(decy_conf, "cache_path", "/app/cache")
-
+    # --- Étape 2 : suppression du cache Decypharr ---
     if not os.path.isdir(cache_path):
         logger.warning(f"<yellow>⚠️ [Decypharr] Dossier cache introuvable : {cache_path}</yellow>")
     else:
-        count_deleted = 0
         for name, decy_id in decypharr_data:
             json_file = os.path.join(cache_path, f"{decy_id}.json")
             if os.path.exists(json_file):
                 if dry_run:
-                    logger.info(f"<magenta>🧱 [Decypharr] {name} - ID: {decy_id} → simulé</magenta>")
+                    logger.info(f"<fg #FFCCFF>🧱 [Decypharr] {name} - ID: {decy_id} → simulé</fg #FFCCFF>")
                 else:
                     try:
                         os.remove(json_file)
-                        count_deleted += 1
-                        logger.info(f"<cyan>🧹 [Decypharr] {name} - ID: {decy_id} → supprimé</cyan>")
+                        logger.info(f"<fg #FFCCFF>🧹 [Decypharr] {name} - ID: {decy_id} → supprimé</fg #FFCCFF>")
                     except Exception as e:
                         logger.error(f"<red>❌ [Decypharr] Erreur suppression {json_file}: {e}</red>")
             else:
-                logger.warning(f"<yellow>⚠️ [Decypharr] {name} - ID: {decy_id} → non trouvé</yellow>")
+                logger.debug(f"[Decypharr] {name} - ID: {decy_id} → non trouvé")
+
+    # --- Étape 3 : suppression locale des fichiers uniquement ---
+    for torrent in torrents:
+        torrent_dir = os.path.join(mount_path, torrent)
+        if not os.path.exists(torrent_dir):
+            logger.debug(f"[Local] Dossier non trouvé : {torrent_dir}")
+            continue
+
+        try:
+            if dry_run:
+                logger.info(f"<magenta>🧱 [Local] {torrent_dir} → simulé</magenta>")
+            else:
+                if os.path.isfile(torrent_dir):
+                    os.remove(torrent_dir)
+                    logger.info(f"<cyan>🧹 [Local] Fichier supprimé : {torrent_dir}</cyan>")
+                elif os.path.isdir(torrent_dir):
+                    files = os.listdir(torrent_dir)
+                    for f in files:
+                        file_path = os.path.join(torrent_dir, f)
+                        if os.path.isfile(file_path):
+                            os.remove(file_path)
+                            logger.info(f"<fg 195>🧹 [Local] Fichier supprimé : {file_path}</fg 195>")
+                    # Laisse le dossier vide en place
+        except Exception as e:
+            logger.error(f"<red>❌ [Local] Erreur suppression {torrent_dir}: {e}</red>")
 
     # --- Résumé final ---
     data["orphans"] = []
-    data["stats"]["orphans"] = 0
+    data.setdefault("stats", {})["orphans"] = 0
+
+    logger.info(
+        f"✅ [{instance}] Fin {dry_label} → "
+        f"{ok} supprimé(s), {nf} introuvable(s), {err} erreur(s)"
+    )
+
     return {
         "instance": instance,
         "dry_run": dry_run,

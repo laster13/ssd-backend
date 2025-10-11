@@ -112,28 +112,18 @@ class LinkDir(BaseModel):
 # ═══════════════════════════════════════════════════════════
 
 class AllDebridInstance(BaseModel):
+    """
+    Représente une instance AllDebrid complète.
+    Chaque instance peut avoir son propre chemin de cache Decypharr,
+    défini manuellement par l'utilisateur via le frontend.
+    """
     name: str
     api_key: str
     mount_path: str
+    cache_path: Optional[str] = None
     rate_limit: float = 0.2
     priority: int = 1
     enabled: bool = True
-    cache_path: Optional[str] = None  # Permet de forcer un chemin si besoin
-
-    @property
-    def resolved_cache_path(self) -> str:
-        """
-        Retourne le chemin du cache Decypharr spécifique à cette instance.
-        S'il n'est pas fourni, il est déduit automatiquement du mount_path :
-          - Si le mount_path contient 'alldebridrd' → decypharrd
-          - Sinon → decypharr
-        """
-        if self.cache_path:
-            return self.cache_path
-
-        base_dir = "decypharrd" if "alldebridrd" in self.mount_path else "decypharr"
-        base = Path.home() / "seedbox" / "docker" / Path.home().name / base_dir / "config" / "cache"
-        return str(base / self.name.lower())
 
 class OrphanManagerConfig(BaseModel):
     auto_delete: bool = False

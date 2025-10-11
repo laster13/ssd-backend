@@ -103,17 +103,21 @@ def format_validation_error(e: ValidationError) -> str:
 
 settings_manager = SettingsManager()
 
-
 class ConfigManager:
+    """Gère la configuration principale (config.json) sans générer de valeurs par défaut complexes."""
+
     def __init__(self):
         self.config_file = data_dir_path / "config.json"
         self.config: SymlinkConfig | None = None
 
-        # ✅ Crée le dossier parent au démarrage si nécessaire
+        # ✅ Crée le dossier parent si nécessaire
         self.config_file.parent.mkdir(parents=True, exist_ok=True)
 
-        if not self.config_file.exists():
-            # Création d'une config par défaut
+        # 🟢 Si le fichier existe, on le charge
+        if self.config_file.exists():
+            self.load()
+        else:
+            # 🧩 Sinon, on crée une config vide et on la sauvegarde
             self.config = SymlinkConfig.model_validate(
                 {
                     "links_dirs": [],
@@ -126,9 +130,8 @@ class ConfigManager:
                     "tmdb_api_key": None,
                 }
             )
+            logger.info("🆕 Nouveau config.json créé (vide, géré via routes API)")
             self.save()
-        else:
-            self.load()
 
     def check_environment(self, config_dict, prefix="", seperator="_"):
         """Remplace les valeurs par celles des variables d'environnement si présentes."""
@@ -164,7 +167,7 @@ class ConfigManager:
             with self.config_file.open("r", encoding="utf-8") as f:
                 config_dict = json.load(f)
                 self.config = SymlinkConfig.model_validate(config_dict)
-                self.save()  # On re-sauvegarde pour garder un format propre
+                logger.info(f"📂 Config chargée depuis {self.config_file}")
         except ValidationError as e:
             logger.error(f"❌ Validation échouée pour config.json :\n{self.format_validation_error(e)}")
             raise
@@ -178,9 +181,7 @@ class ConfigManager:
     def save(self):
         """Sauvegarde la config dans config.json."""
         try:
-            # ✅ Assure la création du dossier parent
             self.config_file.parent.mkdir(parents=True, exist_ok=True)
-
             with self.config_file.open("w", encoding="utf-8") as f:
                 f.write(self.config.model_dump_json(indent=4))
             logger.success(f"💾 Configuration sauvegardée dans {self.config_file}")

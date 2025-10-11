@@ -235,7 +235,6 @@ async def perform_deletion(instance: str, dry_run: bool = False):
         logger.error(f"<red>[{instance}] Instance introuvable dans orphans_store</red>")
         return
 
-    dry_run = False
     orphans = data.get("orphans", [])
     api_key = data.get("api_key")
     mount_path = data.get("mount_path")

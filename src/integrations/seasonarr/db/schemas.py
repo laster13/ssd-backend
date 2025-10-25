@@ -2,27 +2,33 @@ from pydantic import BaseModel, HttpUrl
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
+# --- Auth & Utilisateurs ---
 class UserLogin(BaseModel):
     username: str
     password: str
     remember_me: Optional[bool] = False
 
+
 class UserRegister(BaseModel):
     username: str
     password: str
+
 
 class UserResponse(BaseModel):
     id: int
     username: str
     created_at: datetime
-    
+
     class Config:
         from_attributes = True
 
+
+# --- Sonarr Instances ---
 class SonarrInstanceCreate(BaseModel):
     name: str
     url: str
     api_key: str
+
 
 class SonarrInstanceUpdate(BaseModel):
     name: Optional[str] = None
@@ -30,16 +36,19 @@ class SonarrInstanceUpdate(BaseModel):
     api_key: Optional[str] = None
     is_active: Optional[bool] = None
 
+
 class SonarrInstanceResponse(BaseModel):
     id: int
     name: str
     url: str
     is_active: bool
     created_at: datetime
-    
+
     class Config:
         from_attributes = True
 
+
+# --- Shows ---
 class ShowResponse(BaseModel):
     id: int
     title: str
@@ -55,15 +64,19 @@ class ShowResponse(BaseModel):
     runtime: Optional[int] = None
     certification: Optional[str] = None
 
+
+# --- Actions / Requêtes ---
 class SeasonItRequest(BaseModel):
     show_id: int
     season_number: Optional[int] = None
     instance_id: int
 
+
 class SearchSeasonPacksRequest(BaseModel):
     show_id: int
     season_number: int
     instance_id: int
+
 
 class DownloadReleaseRequest(BaseModel):
     release_guid: str
@@ -72,6 +85,8 @@ class DownloadReleaseRequest(BaseModel):
     instance_id: int
     indexer_id: int
 
+
+# --- Releases ---
 class ReleaseResponse(BaseModel):
     guid: str
     title: str
@@ -88,11 +103,15 @@ class ReleaseResponse(BaseModel):
     indexer_flags: List[str]
     release_weight: int
 
+
+# --- Progress ---
 class ProgressUpdate(BaseModel):
     message: str
     progress: int
     status: str
 
+
+# --- User Settings ---
 class UserSettingsResponse(BaseModel):
     disable_season_pack_check: bool
     require_deletion_confirmation: bool
@@ -100,9 +119,10 @@ class UserSettingsResponse(BaseModel):
     shows_per_page: int
     default_sort: str
     default_show_missing_only: bool
-    
+
     class Config:
         from_attributes = True
+
 
 class UserSettingsUpdate(BaseModel):
     disable_season_pack_check: Optional[bool] = None
@@ -112,6 +132,8 @@ class UserSettingsUpdate(BaseModel):
     default_sort: Optional[str] = None
     default_show_missing_only: Optional[bool] = None
 
+
+# --- Notifications ---
 class NotificationCreate(BaseModel):
     title: str
     message: str
@@ -120,6 +142,7 @@ class NotificationCreate(BaseModel):
     priority: str = "normal"
     persistent: bool = False
     extra_data: Optional[Dict[str, Any]] = None
+
 
 class NotificationResponse(BaseModel):
     id: int
@@ -133,13 +156,16 @@ class NotificationResponse(BaseModel):
     extra_data: Optional[Dict[str, Any]]
     created_at: datetime
     read_at: Optional[datetime]
-    
+
     class Config:
         from_attributes = True
+
 
 class NotificationUpdate(BaseModel):
     read: Optional[bool] = None
 
+
+# --- Activity Logs ---
 class ActivityLogResponse(BaseModel):
     id: int
     action_type: str
@@ -151,6 +177,34 @@ class ActivityLogResponse(BaseModel):
     error_details: Optional[str]
     created_at: datetime
     completed_at: Optional[datetime]
-    
+
+    class Config:
+        from_attributes = True
+
+
+# --- System Activities ---
+class SystemActivityBase(BaseModel):
+    event: str
+    action: str
+    path: str
+    manager: Optional[str] = None
+
+
+class SystemActivityCreate(SystemActivityBase):
+    message: Optional[str] = None
+    extra: Optional[Dict[str, Any]] = None
+
+
+class SystemActivityResponse(SystemActivityBase):
+    id: int
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    message: Optional[str] = None
+    read: Optional[bool] = None
+    extra: Optional[Dict[str, Any]] = None
+
+    replaced: Optional[bool] = None
+    replaced_at: Optional[datetime] = None
+
     class Config:
         from_attributes = True

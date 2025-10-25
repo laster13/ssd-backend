@@ -55,7 +55,7 @@ def init_db():
         os.makedirs(db_dir, exist_ok=True)
 
     # ⚡ imports relatifs adaptés à ta structure Svelte/FastAPI
-    from integrations.seasonarr.db.models import User, SonarrInstance, UserSettings
+    from integrations.seasonarr.db.models import User, SonarrInstance, UserSettings, SystemActivity
     Base.metadata.create_all(bind=engine)
 
 

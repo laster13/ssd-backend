@@ -96,3 +96,31 @@ class ActivityLog(Base):
         Index('ix_activity_logs_user_instance', 'user_id', 'instance_id'),
         Index('ix_activity_logs_status_created', 'status', 'created_at'),
     )
+
+class SystemActivity(Base):
+    __tablename__ = "system_activities"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event = Column(String, nullable=False, index=True)           # ex: symlink_added, yaml_updated
+    action = Column(String, nullable=False, index=True)          # ex: created, deleted, scan, config
+    path = Column(String, nullable=True)                         # fichier ou symlink concerné
+    manager = Column(String, nullable=True)                      # radarr, sonarr, unknown...
+    message = Column(Text, nullable=True)                        # message explicatif
+    extra = Column(JSON, nullable=True)                          # contenu libre (dict)
+    read = Column(Boolean, default=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    # ✅ Ajout du champ de suivi automatique
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        index=True
+    )
+
+    replaced = Column(Boolean, default=None, nullable=True, index=True)
+    replaced_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_system_activities_event_action", "event", "action"),
+    )

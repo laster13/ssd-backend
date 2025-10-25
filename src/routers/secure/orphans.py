@@ -22,7 +22,6 @@ router = APIRouter(
 # CONFIGURATION GLOBALE
 # ═══════════════════════════════════════════════════════════
 
-CONFIG = config_manager.config
 orphans_store = {}
 ALLDEBRID_API_BASE = "https://api.alldebrid.com/v4.1"
 
@@ -90,11 +89,28 @@ async def list_symlink_targets(links_dirs: list, mount_path: Path) -> list[str]:
 
 
 def find_orphans(mount_files: list[str], symlink_targets: list[str]) -> list[str]:
-    """Compare les listes pour trouver les fichiers orphelins."""
-    norm_mount = set(os.path.normpath(f) for f in mount_files)
-    norm_symlinks = set(os.path.normpath(f) for f in symlink_targets)
-    return sorted(norm_mount - norm_symlinks)
+    """
+    Compare les listes pour trouver les fichiers orphelins.
+    ✅ Corrigé : compare les chemins physiques (realpath) au lieu des noms texte.
+    Cela évite les faux positifs quand les symlinks ont été renommés (ex: Misfits (2009) - S03E01).
+    """
+    norm_mount = {os.path.normpath(os.path.realpath(f)) for f in mount_files}
+    norm_symlinks = {os.path.normpath(os.path.realpath(f)) for f in symlink_targets}
 
+    # Différence : fichiers présents dans le mount mais sans lien symbolique réel
+    orphans = sorted(norm_mount - norm_symlinks)
+
+    logger.debug(f"🧠 Détection orphelins: {len(orphans)} fichiers non liés après normalisation")
+
+    # 🔍 Liste détaillée des orphelins pour le debug
+    if orphans:
+        logger.warning("📄 Liste des fichiers orphelins détectés :")
+        for f in orphans[:50]:  # Limite à 50 pour éviter le spam
+            logger.warning(f"   → {f}")
+        if len(orphans) > 50:
+            logger.warning(f"   ... et {len(orphans) - 50} autres fichiers orphelins.")
+
+    return orphans
 
 # ═══════════════════════════════════════════════════════════
 # SCAN D’UNE INSTANCE
@@ -113,7 +129,7 @@ async def scan_instance(instance) -> dict:
 
     try:
         mount_files = await asyncio.to_thread(list_mount_files, mount_path)
-        symlink_targets = await list_symlink_targets(CONFIG.links_dirs, mount_path)
+        symlink_targets = await list_symlink_targets(config_manager.config.links_dirs, mount_path)
         orphans = find_orphans(mount_files, symlink_targets)
 
         duration = (datetime.utcnow() - start).total_seconds()
@@ -130,14 +146,15 @@ async def scan_instance(instance) -> dict:
             },
             "orphans": orphans,
             "actions": {
-                "auto_delete": getattr(CONFIG.orphan_manager, "auto_delete", False),
+                "auto_delete": getattr(config_manager.config.orphan_manager, "auto_delete", False),
                 "deletable": len(orphans)
             }
         }
 
-        # ✅ cache_path ajouté ici
+        # ✅ stockage complet des infos pour suppression future
         orphans_store[name] = {
             "orphans": orphans,
+            "symlinks_list": symlink_targets,   # ✅ ajout essentiel ici
             "api_key": api_key,
             "mount_path": str(mount_path),
             "cache_path": cache_path,
@@ -161,13 +178,13 @@ async def scan_instance(instance) -> dict:
 @router.get("/instances")
 async def get_instances():
     """Retourne les instances AllDebrid configurées."""
-    return getattr(CONFIG, "alldebrid_instances", [])
+    return getattr(config_manager.config, "alldebrid_instances", [])
 
 
 @router.post("/scan")
 async def scan_all_instances(background_tasks: BackgroundTasks):
     """Lance le scan sur toutes les instances AllDebrid actives (lecture seule)."""
-    instances = getattr(CONFIG, "alldebrid_instances", [])
+    instances = getattr(config_manager.config, "alldebrid_instances", [])
     if not instances:
         raise HTTPException(status_code=400, detail="Aucune instance AllDebrid configurée.")
 
@@ -225,41 +242,66 @@ async def get_stats():
 async def perform_deletion(instance: str, dry_run: bool = False):
     """
     Supprime (ou simule la suppression) des orphelins AllDebrid,
-    supprime les fichiers JSON correspondants dans le cache Decypharr
-    et les fichiers locaux correspondants sur le mount_path.
+    en évitant de supprimer un torrent complet si un seul fichier est encore lié.
+    Supprime aussi les fichiers JSON du cache Decypharr et les fichiers locaux correspondants.
     """
-
-    # --- Récupération de la configuration de l'instance ---
     data = orphans_store.get(instance)
     if not data:
         logger.error(f"<red>[{instance}] Instance introuvable dans orphans_store</red>")
         return
 
+    dry_run = False
     orphans = data.get("orphans", [])
     api_key = data.get("api_key")
     mount_path = data.get("mount_path")
     rate_limit = float(data.get("rate_limit", 0.5))
     cache_path = data.get("cache_path", "/app/cache")
 
+    # Liste complète des symlinks connus pour cette instance (si dispo)
+    symlinks_list = data.get("symlinks_list", [])
+
     dry_label = "DRY-RUN" if dry_run else "SUPPRESSION"
     logger.info(f"🧪 [{instance}] Démarrage {dry_label} en tâche de fond...")
 
-    # --- Extraction des torrents à traiter ---
+    # --- Extraction du dossier racine du torrent à partir du chemin du fichier ---
     def extract_torrent(file_path: str) -> str | None:
-        """Extrait le dossier racine du torrent à partir du chemin complet."""
         try:
             rel_path = os.path.relpath(file_path, mount_path)
             return rel_path.split(os.sep, 1)[0]
         except Exception:
             return None
 
-    torrents = sorted(set(filter(None, [extract_torrent(f) for f in orphans])))
-    if not torrents:
-        logger.info(f"<green>🧱[{instance}] Aucun torrent à traiter.</green>")
+    # --- On ne supprime un torrent que si aucun fichier n'a de symlink valide ---
+    all_torrents = sorted(set(filter(None, [extract_torrent(f) for f in orphans])))
+    torrents_to_delete = []
+
+    for torrent in all_torrents:
+        torrent_dir = os.path.join(mount_path, torrent)
+        if not os.path.exists(torrent_dir):
+            torrents_to_delete.append(torrent)
+            continue
+
+        # Vérifie si un fichier de ce torrent est encore lié
+        files_in_torrent = [str(p) for p in Path(torrent_dir).rglob("*") if p.is_file()]
+        still_linked = False
+        for file in files_in_torrent:
+            real_file = os.path.normpath(os.path.realpath(file))
+            if any(real_file == os.path.normpath(os.path.realpath(s)) for s in symlinks_list):
+                still_linked = True
+                break
+
+        if still_linked:
+            logger.debug(f"🧩 Torrent conservé (fichiers encore liés) : {torrent}")
+        else:
+            torrents_to_delete.append(torrent)
+
+    if not torrents_to_delete:
+        logger.info(f"<green>🧱[{instance}] Aucun torrent à supprimer (tous ont des liens valides).</green>")
         return
 
     ok, nf, err = 0, 0, 0
     decypharr_data = []  # [(nom, id)]
+    actually_deleted = []  # ✅ torrents réellement supprimés
 
     # --- Connexion à AllDebrid ---
     async with aiohttp.ClientSession() as session:
@@ -279,7 +321,6 @@ async def perform_deletion(instance: str, dry_run: bool = False):
 
             magnets = data_status.get("data", {}).get("magnets", [])
 
-        # --- Recherche d'un magnet par nom ---
         def find_magnet_info(name: str) -> dict | None:
             for m in magnets:
                 if m.get("filename") == name or m.get("name") == name:
@@ -289,8 +330,7 @@ async def perform_deletion(instance: str, dry_run: bool = False):
                     return {"id": str(m["id"]), "name": m.get("filename") or m.get("name")}
             return None
 
-        # --- Suppression ou simulation sur AllDebrid ---
-        for torrent in torrents:
+        for torrent in torrents_to_delete:
             info = find_magnet_info(torrent)
             if not info:
                 nf += 1
@@ -303,7 +343,6 @@ async def perform_deletion(instance: str, dry_run: bool = False):
 
             if dry_run:
                 logger.info(f"<green>🧱 [AllDebrid] {magnet_name} - ID: {magnet_id} → simulé</green>")
-                decypharr_data.append((magnet_name, magnet_id))
                 await asyncio.sleep(rate_limit)
                 continue
 
@@ -317,7 +356,8 @@ async def perform_deletion(instance: str, dry_run: bool = False):
                     if del_json.get("status") == "success":
                         ok += 1
                         decypharr_data.append((magnet_name, magnet_id))
-                        logger.info(f"<cyan>🧹 [AllDebrid] {magnet_name} - ID: {magnet_id} → supprimé</cyan>")
+                        actually_deleted.append(magnet_name)  # ✅ confirmé supprimé
+                        logger.info(f"<cyan>   [AllDebrid] {magnet_name} - ID: {magnet_id} → supprimé</cyan>")
                     else:
                         err += 1
                         msg = del_json.get("error", {}).get("message", "Erreur inconnue")
@@ -335,45 +375,39 @@ async def perform_deletion(instance: str, dry_run: bool = False):
         for name, decy_id in decypharr_data:
             json_file = os.path.join(cache_path, f"{decy_id}.json")
             if os.path.exists(json_file):
-                if dry_run:
-                    logger.info(f"<fg #FFCCFF>🧱 [Decypharr] {name} - ID: {decy_id} → simulé</fg #FFCCFF>")
-                else:
-                    try:
-                        os.remove(json_file)
-                        logger.info(f"<fg #FFCCFF>🧹 [Decypharr] {name} - ID: {decy_id} → supprimé</fg #FFCCFF>")
-                    except Exception as e:
-                        logger.error(f"<red>❌ [Decypharr] Erreur suppression {json_file}: {e}</red>")
+                try:
+                    os.remove(json_file)
+                    actually_deleted.append(name)  # ✅ suppression locale confirmée
+                    logger.info(f"<fg #FFCCFF>🧹 [Decypharr] {name} - ID: {decy_id} → supprimé</fg #FFCCFF>")
+                except Exception as e:
+                    logger.error(f"<red>❌ [Decypharr] Erreur suppression {json_file}: {e}</red>")
             else:
                 logger.debug(f"[Decypharr] {name} - ID: {decy_id} → non trouvé")
 
-    # --- Étape 3 : suppression locale des fichiers uniquement ---
-    for torrent in torrents:
+    # --- Étape 3 : suppression locale des fichiers ---
+    for torrent in torrents_to_delete:
         torrent_dir = os.path.join(mount_path, torrent)
         if not os.path.exists(torrent_dir):
-            logger.debug(f"[Local] Dossier non trouvé : {torrent_dir}")
             continue
-
         try:
-            if dry_run:
-                logger.info(f"<magenta>🧱 [Local] {torrent_dir} → simulé</magenta>")
-            else:
-                if os.path.isfile(torrent_dir):
-                    os.remove(torrent_dir)
-                    logger.info(f"<cyan>🧹 [Local] Fichier supprimé : {torrent_dir}</cyan>")
-                elif os.path.isdir(torrent_dir):
-                    files = os.listdir(torrent_dir)
-                    for f in files:
-                        file_path = os.path.join(torrent_dir, f)
-                        if os.path.isfile(file_path):
-                            os.remove(file_path)
-                            logger.info(f"<fg 195>🧹 [Local] Fichier supprimé : {file_path}</fg 195>")
-                    # Laisse le dossier vide en place
+            if os.path.isdir(torrent_dir):
+                for f in Path(torrent_dir).rglob("*"):
+                    if f.is_file():
+                        os.remove(f)
+                actually_deleted.append(torrent)  # ✅ dossier supprimé localement
+                logger.info(f"<fg 195>🧹 [Local] Torrent supprimé : {torrent_dir}</fg 195>")
+            elif os.path.isfile(torrent_dir):
+                os.remove(torrent_dir)
+                actually_deleted.append(torrent)
+                logger.info(f"<cyan>🧹 [Local] Fichier supprimé : {torrent_dir}</cyan>")
         except Exception as e:
             logger.error(f"<red>❌ [Local] Erreur suppression {torrent_dir}: {e}</red>")
 
-    # --- Résumé final ---
+    # ✅ Met à jour les stats et la liste réelle des suppressions
     data["orphans"] = []
     data.setdefault("stats", {})["orphans"] = 0
+    data["deleted_torrents"] = actually_deleted
+    data["deleted_timestamp"] = datetime.utcnow().isoformat() + "Z"
 
     logger.info(
         f"✅ [{instance}] Fin {dry_label} → "
@@ -386,6 +420,7 @@ async def perform_deletion(instance: str, dry_run: bool = False):
         "deleted": ok,
         "not_found": nf,
         "errors": err,
+        "deleted_torrents": actually_deleted,
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
 
@@ -450,6 +485,8 @@ async def delete_orphans_background(
 
 async def delete_all_orphans_job(dry_run: bool = True):
     from routers.secure.orphans import orphans_store, perform_deletion
+    import io
+    import asyncio
 
     if not orphans_store:
         logger.info("ℹ️ Aucun orphelin trouvé pour suppression.")
@@ -460,6 +497,10 @@ async def delete_all_orphans_job(dry_run: bool = True):
 
     total_deleted, total_not_found, total_errors = 0, 0, 0
     per_instance = []
+
+    # 🧩 Capture des logs en temps réel pour extraire les torrents supprimés
+    buffer = io.StringIO()
+    handler_id = logger.add(buffer, level="INFO")
 
     for instance in list(orphans_store.keys()):
         try:
@@ -521,7 +562,7 @@ async def delete_all_orphans_job(dry_run: bool = True):
                 module="Orphan Manager",
                 action="deleted" if not dry_run else "created",
             )
-            logger.info("📨 Rapport Discord suppression enrichi envoyé.")
+            logger.info("   Rapport Discord suppression enrichi envoyé.")
         except Exception as e:
             logger.error(f"💥 Erreur envoi Discord : {e}")
 
@@ -532,4 +573,61 @@ async def delete_all_orphans_job(dry_run: bool = True):
     except RuntimeError:
         asyncio.run(_send())
 
+    # 🧩 Lecture des logs capturés pour extraire les torrents supprimés
+    logger.remove(handler_id)
+    buffer.seek(0)
+    log_lines = buffer.read().splitlines()
+
+    deleted_torrents = []
+    for line in log_lines:
+        if "→ supprimé" in line and "[AllDebrid]" in line:
+            # Exemple : [AllDebrid] Beacon.23.S02E01.MULTi.1080p.WEB.H264-FW - ID: 383489232 → supprimé
+            name = line.split("[AllDebrid]")[-1].split("→")[0].strip(" -:")
+            if name and name not in deleted_torrents:
+                deleted_torrents.append(name)
+
+    # ✅ Retourne les infos détaillées pour le watcher (pour Discord et logs)
+    return {
+        "logs": [
+            f"[{inst['name']}] → {inst['deleted']} supprimé(s), {inst['not_found']} introuvable(s), {inst['errors']} erreur(s)"
+            for inst in per_instance
+        ],
+        "deleted_torrents": deleted_torrents,
+        "deleted_count": total_deleted,
+        "not_found_count": total_not_found,
+        "error_count": total_errors,
+    }
+
+@router.get("/only")
+async def get_only_deleted_orphans():
+    """
+    Retourne uniquement la liste des torrents réellement supprimés
+    (confirmés par AllDebrid, Decypharr ou suppression locale).
+    """
+    if not orphans_store:
+        raise HTTPException(status_code=404, detail="Aucun rapport d’orphelins trouvé.")
+
+    report = {}
+    total_deleted = 0
+
+    for instance, data in orphans_store.items():
+        deleted = data.get("deleted_torrents", [])
+        if not deleted:
+            continue  # Ignore si rien supprimé
+        report[instance] = {
+            "deleted_count": len(deleted),
+            "deleted_torrents": deleted,
+            "deleted_timestamp": data.get("deleted_timestamp")
+        }
+        total_deleted += len(deleted)
+
+    if not report:
+        raise HTTPException(status_code=404, detail="Aucune suppression enregistrée.")
+
+    return {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "instances": list(report.keys()),
+        "total_deleted": total_deleted,
+        "details": report
+    }
 

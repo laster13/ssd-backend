@@ -1,7 +1,7 @@
 from typing import Optional
 from pathlib import Path
 from collections import Counter
-from fastapi import APIRouter, HTTPException, Query, Request, Depends, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Query, Request, Depends, BackgroundTasks, Header
 from fastapi.responses import StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from functools import partial
@@ -469,11 +469,32 @@ async def trigger_scan():
 # ---
 # SSE
 # ---
+
 @router.get("/events")
-async def get_events():
+async def get_events(request: Request, last_event_id: str = Header(None)):
     async def event_generator():
-        async for message in sse_manager.subscribe():
-            yield message
+        subscriber = sse_manager.subscribe()
+
+        # ✅ Si le client a un Last-Event-ID, rejoue les events manqués
+        if last_event_id:
+            missed = sse_manager.replay_events_since(last_event_id)
+            if missed:
+                logger.info(f"🔁 Rejoue {len(missed)} événements manqués (Last-Event-ID={last_event_id})")
+                for event in missed:
+                    yield event
+
+        # ⚡ Envoi immédiat d’un ping pour ouvrir le flux
+        yield "event: ping\ndata: {}\n\n"
+
+        try:
+            while True:
+                try:
+                    message = await asyncio.wait_for(subscriber.__anext__(), timeout=20)
+                    yield message
+                except asyncio.TimeoutError:
+                    yield "event: ping\ndata: {}\n\n"
+        except asyncio.CancelledError:
+            return
 
     return StreamingResponse(
         event_generator(),
@@ -481,7 +502,7 @@ async def get_events():
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "Transfer-Encoding": "chunked",
+            "X-Accel-Buffering": "no",
         },
     )
 

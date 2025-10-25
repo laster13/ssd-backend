@@ -10,6 +10,8 @@ from routers.secure.docker import router as docker_router
 from routers.secure.symlinks import router as symlinks_router
 from routers.secure.orphans import router as orphans_router
 from routers.secure.alldebrid import router as alldebrid_router
+from routers.secure.audit import router as audit_router
+
 
 
 # ➕ Seasonarr (intégré)
@@ -39,6 +41,7 @@ app_router.include_router(docker_router)
 app_router.include_router(symlinks_router)
 app_router.include_router(orphans_router)
 app_router.include_router(alldebrid_router)
+app_router.include_router(audit_router)
 
 
 # ➕ Routes Seasonarr (HTTP) sous /api/v1/seasonarr/...

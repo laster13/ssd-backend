@@ -25,7 +25,7 @@ class LibraryScanner:
         ]
 
         if not self.movie_dirs or not self.show_dirs:
-            raise RuntimeError("⚠️ Impossible de trouver movies/shows dans config.json")
+            raise RuntimeError("⚠️ Impossible de trouver les dossiers media dans config.json")
 
     @staticmethod
     def _load_config(config_path: Path):

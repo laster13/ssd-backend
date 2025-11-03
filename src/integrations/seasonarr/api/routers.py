@@ -115,12 +115,6 @@ async def websocket_secure(websocket: WebSocket, user_id: int, db: Session = Dep
 async def health_check():
     return {"status": "healthy", "service": "seasonarr-api"}
 
-@router.on_event("startup")
-async def startup_event():
-    init_db()
-    logger.info("Database initialized")
-
-
 @router.get("/setup/first-run")
 async def check_first_run():
     from src.integrations.seasonarr.db.database import check_if_first_run

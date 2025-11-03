@@ -6,6 +6,8 @@ import json
 import asyncio
 import aiohttp
 import uuid
+from threading import Event
+initial_scan_done = Event()
 from datetime import datetime, timedelta
 from pathlib import Path
 from loguru import logger
@@ -27,6 +29,7 @@ from program.radarr_cache import (
     _build_radarr_index,
     enrich_from_radarr_index,
 )
+
 
 USER = os.getenv("USER") or os.getlogin()
 YAML_PATH = f"/home/{USER}/.ansible/inventories/group_vars/all.yml"
@@ -208,6 +211,23 @@ class SymlinkEventHandler(FileSystemEventHandler):
                     "update_deleted": True  # ✅ permettra au front d’actualiser le statut du deleted
                 })
 
+            # 🧩 Vérifie si le symlink existait en "brisé" → le supprimer de la base
+            broken_deleted = db.query(SystemActivity).filter(
+                SystemActivity.path == str(symlink_path),
+                SystemActivity.action == "broken"
+            ).delete()
+            if broken_deleted:
+                db.commit()
+                # 🔔 Notifie le frontend du retrait du symlink brisé
+                sse_manager.publish_event("symlink_update", {
+                    "event": "symlink_repaired",
+                    "action": "repaired",
+                    "path": str(symlink_path),
+                    "manager": manager,
+                    "message": f"Symlink réparé détecté et supprimé des entrées brisées : {symlink_path}",
+                })
+                logger.info(f"🧩 Symlink réparé — suppression des entrées 'broken' en base : {symlink_path}")
+
             # 💾 Ajout de l'activité “created”
             db.add(SystemActivity(
                 event="symlink_added",
@@ -222,6 +242,7 @@ class SymlinkEventHandler(FileSystemEventHandler):
             logger.debug(f"Enregistré en base : {symlink_path}")
 
             # 🔔 SSE : annonce la création
+
             sse_manager.publish_event("symlink_update", {
                 "event": "symlink_added",
                 "action": "created",
@@ -244,7 +265,6 @@ class SymlinkEventHandler(FileSystemEventHandler):
                     "when": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                     "replaced_from": replaced_from,
                 })
-                logger.debug(f"Buffer Discord += created | taille={len(symlink_events_buffer)}")
 
             logger.success(f"Symlink enrichi ajouté au cache : {symlink_path}")
 
@@ -584,6 +604,13 @@ def start_symlink_watcher():
         # 🚨 Détection symlinks brisés (scan initial)
         try:
             broken_symlinks = [s for s in symlinks_data if not s.get("target_exists")]
+
+            # 🔧 Correction : marque les symlinks brisés comme tels dans le store
+            for s in broken_symlinks:
+                s["broken"] = True
+                s["target_exists"] = False
+                s["ref_count"] = 0
+
             if broken_symlinks:
                 logger.warning(f"⚠️ {len(broken_symlinks)} symlinks brisés détectés (scan initial)")
 
@@ -601,7 +628,6 @@ def start_symlink_watcher():
                         ))
                         db.commit()
                         db.close()
-                        logger.debug(f"💾 Enregistré en base (scan initial, symlink brisé) : {s['symlink']}")
                     except Exception as e:
                         logger.error(f"💥 Erreur DB ajout symlink brisé (scan initial) : {e}")
 
@@ -776,6 +802,11 @@ def start_symlink_watcher():
             "count": len(symlinks_data)
         })
 
+        # ✅ Signale que le scan initial est terminé (le monitor léger peut démarrer)
+        initial_scan_done.set()
+        logger.info("🔔 Signal envoyé : scan initial terminé")
+
+
         # 4️⃣ Boucle périodique
         scan_interval = 86400  # 6h
         last_scan = time.time()
@@ -851,71 +882,228 @@ def start_symlink_watcher():
 
 def start_replacement_cleanup_task(interval_hours: int = 6, expiry_hours: int = 12):
     """
-    🧹 Tâche périodique : marque les symlinks supprimés non remplacés après un certain délai.
-    - interval_hours → fréquence de vérification
-    - expiry_hours → délai après lequel on considère un symlink comme définitivement non remplacé
+    🧹 Tâche périodique :
+    - Marque comme "non remplacés" les symlinks supprimés non recréés après X heures.
+    - ✅ Corrige aussi les anciens supprimés qui ont été recréés bien plus tard.
     """
     def cleanup_loop():
+        logger.info("🧠 Tâche cleanup (replacement) démarrée...")
         while True:
             try:
                 from integrations.seasonarr.db.database import SessionLocal
                 from integrations.seasonarr.db.models import SystemActivity
+                from sqlalchemy import and_, or_
 
                 db = SessionLocal()
-                cutoff = datetime.utcnow() - timedelta(hours=expiry_hours)
+                now = datetime.utcnow()
+                cutoff = now - timedelta(hours=expiry_hours)
 
-                old_deleted = db.query(SystemActivity).filter(
+                # 1️⃣ Récupère tous les symlinks supprimés non remplacés (ou marqués False)
+                deleted_entries = db.query(SystemActivity).filter(
                     SystemActivity.action == "deleted",
-                    SystemActivity.replaced.is_(None),
-                    SystemActivity.created_at < cutoff
+                    or_(
+                        SystemActivity.replaced.is_(None),
+                        SystemActivity.replaced.is_(False)
+                    )
                 ).all()
 
-                if old_deleted:
-                    now = datetime.utcnow()
-                    for entry in old_deleted:
-                        entry.replaced = False
-                        entry.replaced_at = now  # ✅ On enregistre aussi la date du marquage
-                    db.commit()
-                    logger.info(f"🕒 {len(old_deleted)} symlinks marqués comme non remplacés (> {expiry_hours}h).")
-                else:
-                    logger.debug("✅ Aucun symlink à marquer comme non remplacé.")
+                updated = 0
+                marked_non_replaced = 0
 
+                for deleted in deleted_entries:
+                    parent_name = Path(deleted.path).parent.name
+                    deleted_time = deleted.created_at or now - timedelta(days=999)
+
+                    # 2️⃣ Cherche une création postérieure du même parent
+                    created_match = db.query(SystemActivity).filter(
+                        SystemActivity.action == "created",
+                        SystemActivity.path.contains(parent_name),
+                        SystemActivity.created_at > deleted_time
+                    ).order_by(SystemActivity.created_at.asc()).first()
+
+                    if created_match:
+                        deleted.replaced = True
+                        deleted.replaced_at = created_match.created_at
+                        updated += 1
+
+                        # 📡 Émet un événement SSE pour mise à jour du front
+                        try:
+                            from program.managers.sse_manager import sse_manager
+                            sse_manager.publish_event("symlink_update", {
+                                "event": "symlink_replacement_cleanup",
+                                "action": "replaced",
+                                "path": deleted.path,
+                                "manager": deleted.manager,
+                                "replaced_at": created_match.created_at.isoformat(),
+                                "message": f"Rattrapage remplacement tardif détecté ({parent_name})"
+                            })
+                        except Exception:
+                            pass
+
+                    # 3️⃣ Si trop ancien sans recréation → considéré définitivement non remplacé
+                    elif deleted.created_at < cutoff:
+                        deleted.replaced = False
+                        deleted.replaced_at = now
+                        marked_non_replaced += 1
+
+                db.commit()
                 db.close()
-            except Exception as e:
-                logger.error(f"💥 Erreur tâche nettoyage symlinks non remplacés : {e}", exc_info=True)
 
+                if updated or marked_non_replaced:
+                    logger.info(
+                        f"♻️ Tâche cleanup Rapport Activité : {updated} remplacés corrigés, "
+                        f"{marked_non_replaced} marqués non remplacés."
+                    )
+
+            except Exception as e:
+                logger.error(f"💥 Erreur tâche nettoyage symlinks : {e}", exc_info=True)
+
+            # 🕒 Pause avant la prochaine itération
             time.sleep(interval_hours * 3600)
 
     threading.Thread(target=cleanup_loop, daemon=True).start()
 
-def start_broken_symlink_monitor(interval_seconds=600):
-    """Vérifie périodiquement si des symlinks en cache sont devenus brisés."""
-    def loop():
-        from routers.secure.symlinks import symlink_store
-        handler = SymlinkEventHandler()
-        while True:
-            try:
-                broken_count = 0
-                for s in list(symlink_store):
-                    path = Path(s["symlink"])
-                    if path.is_symlink():
-                        try:
-                            path.resolve(strict=True)
-                        except FileNotFoundError:
-                            handler._handle_broken(path)
-                            broken_count += 1
-                if broken_count > 0:
-                    logger.info(f"🔍 {broken_count} symlinks brisés détectés (vérif périodique).")
-            except Exception as e:
-                logger.error(f"💥 Erreur vérif symlinks brisés : {e}", exc_info=True)
-            time.sleep(interval_seconds)
+def start_light_broken_symlink_monitor(interval_minutes=5):
+    """
+    🔍 Monitor léger des symlinks brisés.
+    Vérifie régulièrement les symlinks déjà connus (symlink_store)
+    sans rescanner tout le disque.
+    ➕ Ajoute uniquement les nouveaux symlinks brisés au store
+       pour qu’ils soient visibles côté frontend.
+    🚫 Ne modifie pas le store pour les réparations.
+    ⚙️ Met à jour la base et envoie les événements SSE.
+    """
+    from routers.secure.symlinks import symlink_store
 
-    threading.Thread(target=loop, daemon=True).start()
+    # ⏳ Attend que le scan initial soit terminé avant de commencer la surveillance
+    logger.debug("⏳ En attente du signal de fin de scan initial...")
+    initial_scan_done.wait()
+    logger.success("🚀 Signal reçu : lancement de la surveillance des symlinks brisés.")
+
+    already_notified = {
+        s["symlink"]
+        for s in symlink_store
+        if not s.get("target_exists", True)
+    }
+
+    while True:
+        try:
+            broken_now, repaired_now = [], []
+            items = list(symlink_store)
+
+            for i in items:
+                symlink_path = Path(i["symlink"])
+                if not symlink_path.exists() and not symlink_path.is_symlink():
+                    continue
+
+                exists = False
+                try:
+                    if symlink_path.is_symlink():
+                        target = os.readlink(symlink_path)
+                        if not os.path.isabs(target):
+                            target = os.path.join(symlink_path.parent, target)
+                        exists = os.path.exists(target)
+                    else:
+                        exists = symlink_path.exists()
+                except Exception:
+                    exists = False
+
+                if not exists and str(symlink_path) not in already_notified:
+                    already_notified.add(str(symlink_path))
+                    broken_now.append(i)
+                elif exists and str(symlink_path) in already_notified:
+                    already_notified.remove(str(symlink_path))
+                    repaired_now.append(i)
+
+            # === 🔴 nouveaux symlinks brisés ===
+            if broken_now:
+                db = SessionLocal()
+                for s in broken_now:
+                    db.add(SystemActivity(
+                        event="symlink_broken_light",
+                        action="broken",
+                        path=s["symlink"],
+                        manager=s.get("manager", "unknown"),
+                        message=f"Symlink brisé détecté (monitor léger) : {s['symlink']}",
+                        extra={"target": s.get("target")},
+                    ))
+                db.commit()
+                db.close()
+
+                for s in broken_now:
+                    symlink_store.append({
+                        "symlink": s["symlink"],
+                        "target": s.get("target"),
+                        "manager": s.get("manager", "unknown"),
+                        "broken": True,
+                        "target_exists": False,
+                        "ref_count": 0,
+                    })
+
+                sse_manager.publish_event("symlink_update", {
+                    "event": "broken_symlinks_light",
+                    "action": "broken",
+                    "path": "Détection symlinks brisés (monitor léger)",
+                    "message": f"{len(broken_now)} liens brisés détectés",
+                    "count": len(broken_now),
+                    "broken_symlinks": [s["symlink"] for s in broken_now],
+                })
+                logger.warning(f"⚠️ {len(broken_now)} nouveaux symlinks brisés détectés (monitor léger)")
+
+            # === 🟢 symlinks réparés ===
+            if repaired_now:
+                db = SessionLocal()
+                for s in repaired_now:
+                    db.query(SystemActivity).filter(
+                        SystemActivity.path == s["symlink"],
+                        SystemActivity.action == "broken"
+                    ).delete()
+                db.commit()
+                db.close()
+
+                sse_manager.publish_event("symlink_update", {
+                    "event": "broken_symlinks_light",
+                    "action": "repaired",
+                    "path": "Réparation symlinks (monitor léger)",
+                    "message": f"{len(repaired_now)} liens réparés détectés",
+                    "count": len(repaired_now),
+                    "repaired_symlinks": [s["symlink"] for s in repaired_now],
+                })
+                logger.info(f"🧩 {len(repaired_now)} symlinks réparés détectés (Suppression db)")
+
+            # === Logs lisibles ===
+            if broken_now:
+                logger.warning("╭───────────────────────────────────────────────")
+                logger.warning(f"│ ⚠️  {len(broken_now)} nouveaux symlinks brisés :")
+                for s in broken_now:
+                    logger.warning(f"│   • {s['symlink']}")
+                    logger.warning(f"│     ↳ {s.get('target') or '❌ (inconnu)'}")
+                logger.warning("╰───────────────────────────────────────────────")
+
+            elif repaired_now:
+                logger.info("╭───────────────────────────────────────────────")
+                logger.info(f"│ 🧩  {len(repaired_now)} symlinks réparés :")
+                for s in repaired_now:
+                    logger.info(f"│   • {s['symlink']}")
+                    logger.info(f"│     ↳ {s.get('target') or '🎯 (cible retrouvée)'}")
+                logger.info("╰───────────────────────────────────────────────")
+
+        except Exception as e:
+            logger.exception(f"💥 Erreur dans le monitor léger : {e}")
+
+        time.sleep(interval_minutes * 60)
 
 def start_all_watchers():
+    from integrations.seasonarr.db.database import init_db
+
+    logger.info("🧠 Initialisation de la base de données Seasonarr...")
+    init_db()
+    logger.info("✅ Base de données initialisée avec succès.")
+
     logger.info("🚀 Lancement des watchers YAML + Symlink...")
     threading.Thread(target=start_yaml_watcher, daemon=True).start()
     threading.Thread(target=start_symlink_watcher, daemon=True).start()
     start_discord_flusher()
-    start_replacement_cleanup_task()
-    start_broken_symlink_monitor(interval_seconds=600)
+    start_replacement_cleanup_task(interval_hours=0.0167, expiry_hours=12)
+    threading.Thread(target=start_light_broken_symlink_monitor, args=(5,), daemon=True).start()
+

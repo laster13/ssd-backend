@@ -120,7 +120,6 @@ def schedule_all():
         id="radarr_rebuild",
         replace_existing=True
     )
-    logger.debug("Tâche planifiée : rebuild Radarr (toutes les heures)")
 
 # ===== Événements =====
 @router.on_event("startup")

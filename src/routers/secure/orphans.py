@@ -4,12 +4,13 @@ from loguru import logger
 from program.settings.manager import config_manager
 from program.settings.orphans import OrphanScanResult, OrphanScanStats, OrphanActions
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import asyncio
 import subprocess
 import os
 import aiohttp
 import shutil
+import docker
 
 
 
@@ -41,6 +42,85 @@ async def run_fd_command(cmd: str) -> list[str]:
     lines = stdout.decode().strip().split("\n")
     return [os.path.normpath(l) for l in lines if l.strip()]
 
+# ═══════════════════════════════════════════════════════════
+# VERIFICATION ETAT CONTAINER DECYPHARR
+# ═══════════════════════════════════════════════════════════
+
+def check_decypharr_ready():
+    """
+    🧠 Vérifie l'état du conteneur Docker 'decypharr'.
+    Empêche le lancement du scan FD ou des suppressions si le conteneur
+    vient d'être démarré (moins de 2 minutes) ou n'est pas encore 'running'.
+    """
+    try:
+        client = docker.from_env()
+        container = client.containers.get("decypharr")
+        state = container.attrs.get("State", {})
+        status = state.get("Status", "").lower()
+        started_at = state.get("StartedAt")
+
+        # 🚫 Conteneur non 'running'
+        if status != "running":
+            logger.warning(f"⏸️ Decypharr non prêt (status={status}) — opération bloquée.")
+            raise HTTPException(
+                status_code=503,
+                detail=f"Decypharr n'est pas encore opérationnel (état : {status}). Réessayez dans quelques minutes."
+            )
+
+        # 🕒 Vérifie l'ancienneté du démarrage
+        if started_at and isinstance(started_at, str):
+            try:
+                started = datetime.strptime(started_at.split(".")[0], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                uptime = (datetime.now(timezone.utc) - started).total_seconds()
+                if uptime < 120:
+                    logger.info(f"⏳ Decypharr vient de démarrer ({int(uptime)}s) — report de l'opération.")
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Decypharr vient de démarrer ({int(uptime)}s). Réessayez dans quelques minutes."
+                    )
+            except Exception as e:
+                logger.warning(f"⚠️ Erreur de parsing de date Docker : {e}")
+
+        logger.debug("✅ Decypharr opérationnel — autorisation du scan FD.")
+
+    except docker.errors.NotFound:
+        logger.error("💥 Conteneur 'decypharr' introuvable dans Docker.")
+        raise HTTPException(
+            status_code=503,
+            detail="Conteneur 'decypharr' introuvable. Vérifiez qu'il est bien lancé."
+        )
+    except Exception as e:
+        logger.error(f"💥 Erreur lors de la vérification du conteneur Decypharr : {e}")
+        # En cas d’erreur inattendue, on bloque par sécurité
+        raise HTTPException(
+            status_code=503,
+            detail=f"Impossible de vérifier l'état de Decypharr ({e}). Réessayez plus tard."
+        )
+
+def is_decypharr_running() -> bool:
+    """
+    🩺 Vérifie silencieusement si le conteneur Decypharr est en cours d’exécution.
+    Retourne True si 'running' depuis plus de 2 minutes, sinon False.
+    """
+    try:
+        client = docker.from_env()
+        container = client.containers.get("decypharr")
+        state = container.attrs.get("State", {})
+        status = state.get("Status", "").lower()
+        started_at = state.get("StartedAt")
+
+        if status != "running":
+            return False
+
+        if started_at and isinstance(started_at, str):
+            started = datetime.strptime(started_at.split(".")[0], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+            uptime = (datetime.now(timezone.utc) - started).total_seconds()
+            if uptime < 120:
+                return False
+
+        return True
+    except Exception:
+        return False
 
 # ═══════════════════════════════════════════════════════════
 # SCAN DES FICHIERS MOUNT ET SYMLINKS
@@ -117,19 +197,41 @@ def find_orphans(mount_files: list[str], symlink_targets: list[str]) -> list[str
 # ═══════════════════════════════════════════════════════════
 
 async def scan_instance(instance) -> dict:
-    """Scanne une instance AllDebrid et détecte les orphelins."""
+    """
+    Scanne une instance AllDebrid et détecte les orphelins.
+    🧠 Intègre un watchdog Decypharr pour interrompre le scan si le conteneur
+    est redémarré ou encore en phase de démarrage (< 2 minutes).
+    """
     name = instance.name
     mount_path = Path(instance.mount_path)
     api_key = instance.api_key
     rate_limit = instance.rate_limit
-    cache_path = getattr(instance, "cache_path", "/app/cache")  # ✅ ajouté ici
+    cache_path = getattr(instance, "cache_path", "/app/cache")
 
     start = datetime.utcnow()
     logger.info(f"🔍 Scan instance: {name}")
 
     try:
+        # 🩺 Vérifie en continu que Decypharr reste prêt
+        if not is_decypharr_running():
+            logger.warning(f"🛑 Scan interrompu : Decypharr redémarre pendant le scan de {name}.")
+            return {"instance": name, "error": "Scan interrompu — Decypharr redémarré."}
+
+        # === Étape 1 : listing des fichiers du mount ===
         mount_files = await asyncio.to_thread(list_mount_files, mount_path)
+
+        if not is_decypharr_running():
+            logger.warning(f"🛑 Scan interrompu après list_mount_files : Decypharr redémarré.")
+            return {"instance": name, "error": "Scan interrompu — Decypharr redémarré."}
+
+        # === Étape 2 : collecte des cibles de symlinks ===
         symlink_targets = await list_symlink_targets(config_manager.config.links_dirs, mount_path)
+
+        if not is_decypharr_running():
+            logger.warning(f"🛑 Scan interrompu avant comparaison : Decypharr redémarré.")
+            return {"instance": name, "error": "Scan interrompu — Decypharr redémarré."}
+
+        # === Étape 3 : comparaison pour trouver les orphelins ===
         orphans = find_orphans(mount_files, symlink_targets)
 
         duration = (datetime.utcnow() - start).total_seconds()
@@ -147,14 +249,14 @@ async def scan_instance(instance) -> dict:
             "orphans": orphans,
             "actions": {
                 "auto_delete": getattr(config_manager.config.orphan_manager, "auto_delete", False),
-                "deletable": len(orphans)
-            }
+                "deletable": len(orphans),
+            },
         }
 
-        # ✅ stockage complet des infos pour suppression future
+        # ✅ Stockage en mémoire pour suppression future
         orphans_store[name] = {
             "orphans": orphans,
-            "symlinks_list": symlink_targets,   # ✅ ajout essentiel ici
+            "symlinks_list": symlink_targets,
             "api_key": api_key,
             "mount_path": str(mount_path),
             "cache_path": cache_path,
@@ -167,7 +269,7 @@ async def scan_instance(instance) -> dict:
         return result
 
     except Exception as e:
-        logger.error(f"Erreur durant le scan de {name}: {e}")
+        logger.error(f"💥 Erreur durant le scan de {name}: {e}")
         return {"instance": name, "error": str(e)}
 
 
@@ -184,6 +286,7 @@ async def get_instances():
 @router.post("/scan")
 async def scan_all_instances(background_tasks: BackgroundTasks):
     """Lance le scan sur toutes les instances AllDebrid actives (lecture seule)."""
+    check_decypharr_ready()
     instances = getattr(config_manager.config, "alldebrid_instances", [])
     if not instances:
         raise HTTPException(status_code=400, detail="Aucune instance AllDebrid configurée.")
@@ -244,13 +347,19 @@ async def perform_deletion(instance: str, dry_run: bool = False):
     Supprime (ou simule la suppression) des orphelins AllDebrid,
     en évitant de supprimer un torrent complet si un seul fichier est encore lié.
     Supprime aussi les fichiers JSON du cache Decypharr et les fichiers locaux correspondants.
+    🧠 Protégé par un watchdog : stoppe immédiatement si Decypharr redémarre.
     """
+    # 🔒 Vérifie l’état initial de Decypharr avant toute action
+    if not is_decypharr_running():
+        logger.warning(f"🛑 Suppression interrompue : Decypharr redémarre pendant la suppression {instance}.")
+        return {"instance": instance, "error": "Decypharr non opérationnel — suppression annulée."}
+
     data = orphans_store.get(instance)
     if not data:
         logger.error(f"<red>[{instance}] Instance introuvable dans orphans_store</red>")
-        return
+        return {"instance": instance, "error": "Instance non trouvée"}
 
-    dry_run = False
+    dry_run = False  # ⚠️ forcé à False pour éviter les suppressions simulées inutiles
     orphans = data.get("orphans", [])
     api_key = data.get("api_key")
     mount_path = data.get("mount_path")
@@ -276,6 +385,10 @@ async def perform_deletion(instance: str, dry_run: bool = False):
     torrents_to_delete = []
 
     for torrent in all_torrents:
+        if not is_decypharr_running():
+            logger.warning(f"🛑 Suppression interrompue pendant l’analyse des torrents ({instance}).")
+            return {"instance": instance, "error": "Decypharr redémarré — arrêt du traitement."}
+
         torrent_dir = os.path.join(mount_path, torrent)
         if not os.path.exists(torrent_dir):
             torrents_to_delete.append(torrent)
@@ -283,12 +396,11 @@ async def perform_deletion(instance: str, dry_run: bool = False):
 
         # Vérifie si un fichier de ce torrent est encore lié
         files_in_torrent = [str(p) for p in Path(torrent_dir).rglob("*") if p.is_file()]
-        still_linked = False
-        for file in files_in_torrent:
-            real_file = os.path.normpath(os.path.realpath(file))
-            if any(real_file == os.path.normpath(os.path.realpath(s)) for s in symlinks_list):
-                still_linked = True
-                break
+        still_linked = any(
+            os.path.normpath(os.path.realpath(f)) in 
+            {os.path.normpath(os.path.realpath(s)) for s in symlinks_list}
+            for f in files_in_torrent
+        )
 
         if still_linked:
             logger.debug(f"🧩 Torrent conservé (fichiers encore liés) : {torrent}")
@@ -300,11 +412,15 @@ async def perform_deletion(instance: str, dry_run: bool = False):
         return
 
     ok, nf, err = 0, 0, 0
-    decypharr_data = []  # [(nom, id)]
-    actually_deleted = []  # ✅ torrents réellement supprimés
+    decypharr_data = []   # [(nom, id)]
+    actually_deleted = [] # ✅ torrents réellement supprimés
 
     # --- Connexion à AllDebrid ---
     async with aiohttp.ClientSession() as session:
+        if not is_decypharr_running():
+            logger.warning(f"🛑 Suppression interrompue avant requête API : Decypharr redémarre.")
+            return {"instance": instance, "error": "Decypharr redémarré avant suppression AllDebrid."}
+
         async with session.get(
             f"{ALLDEBRID_API_BASE}/magnet/status",
             headers={"Authorization": f"Bearer {api_key}"}
@@ -331,6 +447,10 @@ async def perform_deletion(instance: str, dry_run: bool = False):
             return None
 
         for torrent in torrents_to_delete:
+            if not is_decypharr_running():
+                logger.warning(f"🛑 Suppression interrompue pendant le cycle AllDebrid ({instance}).")
+                return {"instance": instance, "error": "Decypharr redémarré en cours de suppression."}
+
             info = find_magnet_info(torrent)
             if not info:
                 nf += 1
@@ -356,7 +476,7 @@ async def perform_deletion(instance: str, dry_run: bool = False):
                     if del_json.get("status") == "success":
                         ok += 1
                         decypharr_data.append((magnet_name, magnet_id))
-                        actually_deleted.append(magnet_name)  # ✅ confirmé supprimé
+                        actually_deleted.append(magnet_name)
                         logger.info(f"<cyan>   [AllDebrid] {magnet_name} - ID: {magnet_id} → supprimé</cyan>")
                     else:
                         err += 1
@@ -373,11 +493,15 @@ async def perform_deletion(instance: str, dry_run: bool = False):
         logger.warning(f"<yellow>⚠️ [Decypharr] Dossier cache introuvable : {cache_path}</yellow>")
     else:
         for name, decy_id in decypharr_data:
+            if not is_decypharr_running():
+                logger.warning(f"🛑 Interruption : Decypharr redémarre pendant le nettoyage du cache.")
+                return {"instance": instance, "error": "Decypharr redémarré — arrêt du nettoyage local."}
+
             json_file = os.path.join(cache_path, f"{decy_id}.json")
             if os.path.exists(json_file):
                 try:
                     os.remove(json_file)
-                    actually_deleted.append(name)  # ✅ suppression locale confirmée
+                    actually_deleted.append(name)
                     logger.info(f"<fg #FFCCFF>🧹 [Decypharr] {name} - ID: {decy_id} → supprimé</fg #FFCCFF>")
                 except Exception as e:
                     logger.error(f"<red>❌ [Decypharr] Erreur suppression {json_file}: {e}</red>")
@@ -386,6 +510,10 @@ async def perform_deletion(instance: str, dry_run: bool = False):
 
     # --- Étape 3 : suppression locale des fichiers ---
     for torrent in torrents_to_delete:
+        if not is_decypharr_running():
+            logger.warning(f"🛑 Suppression locale interrompue : Decypharr redémarre.")
+            return {"instance": instance, "error": "Decypharr redémarré pendant suppression locale."}
+
         torrent_dir = os.path.join(mount_path, torrent)
         if not os.path.exists(torrent_dir):
             continue
@@ -394,16 +522,16 @@ async def perform_deletion(instance: str, dry_run: bool = False):
                 for f in Path(torrent_dir).rglob("*"):
                     if f.is_file():
                         os.remove(f)
-                actually_deleted.append(torrent)  # ✅ dossier supprimé localement
+                actually_deleted.append(torrent)
                 logger.info(f"<fg 195>🧹 [Local] Torrent supprimé : {torrent_dir}</fg 195>")
             elif os.path.isfile(torrent_dir):
                 os.remove(torrent_dir)
                 actually_deleted.append(torrent)
-                logger.info(f"<cyan>🧹 [Local] Fichier supprimé : {torrent_dir}</cyan>")
+                logger.info(f"<cyan>�� [Local] Fichier supprimé : {torrent_dir}</cyan>")
         except Exception as e:
             logger.error(f"<red>❌ [Local] Erreur suppression {torrent_dir}: {e}</red>")
 
-    # ✅ Met à jour les stats et la liste réelle des suppressions
+    # ✅ Met à jour les stats
     data["orphans"] = []
     data.setdefault("stats", {})["orphans"] = 0
     data["deleted_torrents"] = actually_deleted
@@ -432,6 +560,8 @@ async def delete_all_orphans(
     """
     Supprime (ou simule) les torrents orphelins pour toutes les instances connues.
     """
+    check_decypharr_ready()
+
     if not orphans_store:
         raise HTTPException(status_code=404, detail="Aucun orphelin trouvé.")
 
@@ -456,6 +586,8 @@ async def delete_orphans_background(
     """
     Lance la suppression ou le dry-run des torrents orphelins en tâche de fond.
     """
+    check_decypharr_ready()
+
     if instance not in orphans_store:
         raise HTTPException(status_code=404, detail=f"Aucune donnée trouvée pour {instance}.")
 
@@ -487,6 +619,8 @@ async def delete_all_orphans_job(dry_run: bool = True):
     from routers.secure.orphans import orphans_store, perform_deletion
     import io
     import asyncio
+    check_decypharr_ready()
+
 
     if not orphans_store:
         logger.info("ℹ️ Aucun orphelin trouvé pour suppression.")

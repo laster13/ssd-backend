@@ -7,6 +7,7 @@ import asyncio
 import aiohttp
 import uuid
 from threading import Event
+from sqlalchemy import and_, or_
 initial_scan_done = Event()
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -211,6 +212,43 @@ class SymlinkEventHandler(FileSystemEventHandler):
                     "update_deleted": True  # ✅ permettra au front d’actualiser le statut du deleted
                 })
 
+            # 🧠 Vérifie remplacement par correspondance d'identifiant média (ex: IMDb / TMDB)
+            if not recent_deleted and (item.get("tmdbId") or item.get("imdb_id")):
+                media_id = item.get("tmdbId") or item.get("imdb_id")
+                logger.debug(f"🔎 Recherche remplacement par ID média : {media_id}")
+                similar_deleted = db.query(SystemActivity).filter(
+                    SystemActivity.action.in_(["deleted", "broken"]),
+                    SystemActivity.extra.contains({"tmdbId": media_id})
+                ).order_by(SystemActivity.created_at.desc()).first()
+
+                if similar_deleted:
+                    similar_deleted.replaced = True
+                    similar_deleted.replaced_at = datetime.utcnow()
+                    replaced_from = similar_deleted.path
+                    db.commit()
+                    logger.info(f"♻️ Remplacement par ID média détecté ({similar_deleted.path} → {symlink_path})")
+
+                    # 🔔 SSE : signale au frontend un remplacement par correspondance de média
+                    sse_manager.publish_event("symlink_update", {
+                        "event": "symlink_replacement",
+                        "action": "replaced",
+                        "old_path": str(similar_deleted.path),
+                        "new_path": str(symlink_path),
+                        "imdb_id": item.get("imdb_id"),
+                        "tmdb_id": item.get("tmdbId"),
+                        "manager": manager,
+                        "replaced": True,
+                        "replaced_at": datetime.utcnow().isoformat(),
+                        "message": f"Remplacement détecté via ID média {media_id}"
+                    })
+
+                    # 🧩 Supprime aussi les entrées “broken” liées au même média
+                    db.query(SystemActivity).filter(
+                        SystemActivity.action == "broken",
+                        SystemActivity.extra.contains({"tmdbId": media_id})
+                    ).delete()
+                    db.commit()
+
             # 🧩 Vérifie si le symlink existait en "brisé" → le supprimer de la base
             broken_deleted = db.query(SystemActivity).filter(
                 SystemActivity.path == str(symlink_path),
@@ -327,7 +365,6 @@ class SymlinkEventHandler(FileSystemEventHandler):
                 "manager": manager,
                 "when": datetime.utcnow().isoformat(timespec="seconds") + "Z",
             })
-            logger.debug(f"📬 Discord buffer += deleted | size={len(symlink_events_buffer)}")
 
     def _handle_broken(self, symlink_path: Path):
         """Gère un symlink dont la cible est devenue invalide."""
@@ -379,7 +416,6 @@ class SymlinkEventHandler(FileSystemEventHandler):
                     "manager": manager,
                     "when": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                 })
-                logger.debug(f"📬 Discord buffer += broken | size={len(symlink_events_buffer)}")
 
             # --- 💬 Envoi Discord direct si configuré ---
             webhook = config_manager.config.discord_webhook_url
@@ -972,8 +1008,14 @@ def start_light_broken_symlink_monitor(interval_minutes=5):
        pour qu’ils soient visibles côté frontend.
     🚫 Ne modifie pas le store pour les réparations.
     ⚙️ Met à jour la base et envoie les événements SSE.
+    🧠 Ne s'exécute pas si le conteneur 'decypharr' vient de démarrer (< 2 min).
+    ♻️ Se met automatiquement en pause si Decypharr redémarre pendant l’exécution.
     """
     from routers.secure.symlinks import symlink_store
+    import docker
+    from datetime import datetime, timezone
+
+    client = docker.from_env()
 
     # ⏳ Attend que le scan initial soit terminé avant de commencer la surveillance
     logger.debug("⏳ En attente du signal de fin de scan initial...")
@@ -988,6 +1030,54 @@ def start_light_broken_symlink_monitor(interval_minutes=5):
 
     while True:
         try:
+            # 🧩 Vérifie l’état du conteneur Decypharr avant chaque cycle
+            try:
+                container = client.containers.get("decypharr")
+                state = container.attrs["State"]
+                status = state.get("Status", "").lower()
+                started_at = state.get("StartedAt")
+
+                # Convertit la date de démarrage Docker en datetime UTC
+                start_time = None
+                if started_at and started_at not in ("", None):
+                    start_time = datetime.strptime(started_at.split(".")[0], "%Y-%m-%dT%H:%M:%S").replace(
+                        tzinfo=timezone.utc
+                    )
+
+                # Si le conteneur n’est pas actif
+                if status != "running":
+                    logger.warning(f"⏸️ Monitor léger en pause : Decypharr status = {status}")
+                    time.sleep(60)
+                    continue
+
+                # Si le conteneur vient juste de démarrer (< 2 min)
+                if start_time:
+                    uptime = (datetime.now(timezone.utc) - start_time).total_seconds()
+                    if uptime < 120:
+                        logger.info(f"⏳ Decypharr actif depuis {int(uptime)}s — report du monitor léger...")
+                        time.sleep(60)
+                        continue
+
+                # --- 🔍 Watchdog runtime : surveille les redémarrages de Decypharr ---
+                last_started_at = getattr(start_light_broken_symlink_monitor, "_last_started_at", None)
+                current_started_at = started_at
+
+                # Si le conteneur a redémarré (StartedAt différent)
+                if last_started_at and current_started_at and current_started_at != last_started_at:
+                    logger.warning("♻️ Redémarrage de Decypharr détecté — mise en pause du monitor léger.")
+                    setattr(start_light_broken_symlink_monitor, "_last_started_at", current_started_at)
+                    time.sleep(120)
+                    continue
+
+                # Mémorise le StartedAt actuel
+                setattr(start_light_broken_symlink_monitor, "_last_started_at", current_started_at)
+
+            except Exception as e:
+                logger.warning(f"⚠️ Impossible de vérifier l’état du conteneur Decypharr : {e}")
+                time.sleep(30)
+                continue  # On saute ce cycle par précaution
+
+            # --- Routine normale du monitor ---
             broken_now, repaired_now = [], []
             items = list(symlink_store)
 
@@ -1090,6 +1180,60 @@ def start_light_broken_symlink_monitor(interval_minutes=5):
 
         except Exception as e:
             logger.exception(f"💥 Erreur dans le monitor léger : {e}")
+
+        # === 🧠 Routine de validation de cohérence ===
+        try:
+            logger.debug("🧠 Vérification de cohérence entre la base et le store...")
+
+            db = SessionLocal()
+            cleaned_count = 0
+
+            # Récupère toutes les entrées "broken" en base
+            broken_db_entries = db.query(SystemActivity).filter(
+                SystemActivity.action == "broken"
+            ).all()
+
+            # Index rapide des chemins brisés dans le store
+            broken_in_store = {str(s["symlink"]) for s in symlink_store if s.get("broken", False)}
+
+            for entry in broken_db_entries:
+                if entry.path not in broken_in_store:
+                    # 🧹 Si la base contient un "broken" que le store considère réparé
+                    logger.info(f"🧹 Nettoyage cohérence base : {entry.path} n'est plus marqué brisé (suppression DB).")
+                    db.delete(entry)
+                    cleaned_count += 1
+
+            db.commit()
+            db.close()
+
+            if cleaned_count > 0:
+                sse_manager.publish_event("symlink_update", {
+                    "event": "broken_symlinks_cleanup",
+                    "action": "cleanup_db",
+                    "message": f"{cleaned_count} entrées 'broken' nettoyées dans la base (réparées côté store)",
+                    "count": cleaned_count,
+                })
+                logger.success(f"🧹 Nettoyage cohérence base terminé : {cleaned_count} entrées supprimées.")
+            else:
+                logger.debug("✅ Base déjà cohérente avec le store.")
+
+            # === 🔄 Recalcul du compteur global ===
+            total_broken = sum(1 for s in symlink_store if s.get("broken", False))
+            total_ok = len(symlink_store) - total_broken
+
+            sse_manager.publish_event("symlink_update", {
+                "event": "symlink_count_refresh",
+                "action": "count_update",
+                "message": f"Recalcul du compteur global : {total_broken} liens brisés / {total_ok} valides",
+                "broken_count": total_broken,
+                "ok_count": total_ok,
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            })
+
+            logger.info(f"🔄 Compteur global mis à jour : {total_broken} brisés / {total_ok} valides.")
+
+        except Exception as e:
+            logger.error(f"💥 Erreur pendant la validation de cohérence (base ↔ store) : {e}")
 
         time.sleep(interval_minutes * 60)
 

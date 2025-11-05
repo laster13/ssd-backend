@@ -29,7 +29,6 @@ def run(cmd: str, cwd=None) -> bool:
     result = subprocess.run(cmd, cwd=cwd, shell=True, capture_output=True, text=True)
 
     if result.returncode != 0:
-        logger.error(result.stderr.strip() or "Erreur inconnue")
         return False
 
     if result.stdout.strip():
@@ -68,7 +67,7 @@ def update_backend():
 def update_frontend():
     """Met à jour, reconstruit et redémarre le frontend (pnpm ou npm), sans bruit de console."""
     if not FRONTEND_PATH.exists():
-        logger.warning(⚠️ Aucun dossier frontend trouvé — mise à jour ignorée.")
+        logger.warning("⚠️ Aucun dossier frontend trouvé — mise à jour ignorée.")
         return
 
     logger.info("🎨 Mise à jour du frontend en cours...")
@@ -143,7 +142,7 @@ def notify_backend_update_done(success=True, message="✅ Mise à jour terminée
         requests.post(BACKEND_NOTIFY_URL, json=payload, timeout=10)
         logger.info("📡 Notification SSE envoyée au backend (update_finished).")
     except requests.exceptions.ReadTimeout:
-        logger.warning(⚠️ Notification SSE : le frontend redémarre probablement (timeout ignoré).")
+        logger.warning("⚠️ Notification SSE : le frontend redémarre probablement (timeout ignoré).")
     except requests.exceptions.ConnectionError:
         logger.warning("⚠️ Notification SSE : le frontend est injoignable (en redémarrage ?)")
     except Exception as e:

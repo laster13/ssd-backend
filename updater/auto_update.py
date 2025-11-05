@@ -153,8 +153,22 @@ def notify_backend_update_done(success=True, message="✅ Mise à jour terminée
 # 🚀 MAIN — Logique globale
 # ==========================================================
 
-def main():
+def main(target: str | None = None):
+    """Met à jour backend, frontend ou les deux."""
     try:
+        logger.info(f"🧩 Lancement de la mise à jour (target={target})")
+
+        if target == "backend":
+            update_backend()
+            notify_backend_update_done(success=True, message="✅ Backend mis à jour avec succès.")
+            return
+
+        if target == "frontend":
+            update_frontend()
+            notify_backend_update_done(success=True, message="✅ Frontend mis à jour avec succès.")
+            return
+
+        # --- Sinon mise à jour complète ---
         local_versions = get_version()
         local_backend = local_versions.get("backend", "0.0.0")
         local_frontend = local_versions.get("frontend", "0.0.0")

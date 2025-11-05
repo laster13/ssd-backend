@@ -66,30 +66,66 @@ def update_backend():
 # ==========================================================
 
 def update_frontend():
+    """Met à jour, reconstruit et redémarre le frontend (pnpm ou npm), sans bruit de console."""
     if not FRONTEND_PATH.exists():
-        logger.warning("⚠️ Aucun dossier frontend trouvé — mise à jour ignorée.")
+        logger.warning(⚠️ Aucun dossier frontend trouvé — mise à jour ignorée.")
         return
 
     logger.info("🎨 Mise à jour du frontend en cours...")
-    run("git fetch --all", cwd=FRONTEND_PATH)
-    run("git reset --hard origin/main", cwd=FRONTEND_PATH)
+    run("git fetch --all > /dev/null 2>&1", cwd=FRONTEND_PATH)
+    run("git reset --hard origin/main > /dev/null 2>&1", cwd=FRONTEND_PATH)
 
-    # Utilise pnpm si disponible, sinon npm
-    has_pnpm = run("pnpm --version")
+    # ======================================================
+    # 🧹 Nettoyage avant installation
+    # ======================================================
+    logger.info("🧹 Nettoyage du frontend avant installation...")
+    import shutil
+
+    node_modules = FRONTEND_PATH / "node_modules"
+    if node_modules.exists():
+        try:
+            shutil.rmtree(node_modules)
+            logger.debug("🗑️ node_modules supprimé.")
+        except Exception as e:
+            logger.warning(f"⚠️ Impossible de supprimer node_modules : {e}")
+
+    lockfile = FRONTEND_PATH / "package-lock.json"
+    if lockfile.exists():
+        try:
+            lockfile.unlink()
+            logger.debug("🗑️ package-lock.json supprimé.")
+        except Exception as e:
+            logger.warning(f"⚠️ Impossible de supprimer package-lock.json : {e}")
+
+    # ======================================================
+    # 📦 Installation des dépendances (PNPM ou NPM)
+    # ======================================================
+    logger.info("📦 Vérification de PNPM...")
+    has_pnpm = run("command -v pnpm >/dev/null 2>&1")
+
     if has_pnpm:
-        logger.info("📦 Installation via PNPM détectée.")
-        run("pnpm install", cwd=FRONTEND_PATH)
-        run("pnpm run build", cwd=FRONTEND_PATH)
+        logger.info("📦 PNPM détecté — installation avec pnpm.")
+        if not run("pnpm install --frozen-lockfile > /dev/null 2>&1", cwd=FRONTEND_PATH):
+            logger.warning("⚠️ Erreur pendant l'installation PNPM — tentative avec NPM.")
+            run("npm install --silent > /dev/null 2>&1", cwd=FRONTEND_PATH)
     else:
         logger.warning("⚠️ PNPM non trouvé — utilisation de NPM.")
-        if (FRONTEND_PATH / "package-lock.json").exists():
-            run("npm ci", cwd=FRONTEND_PATH)
-        else:
-            run("npm install", cwd=FRONTEND_PATH)
-        run("npm run build", cwd=FRONTEND_PATH)
+        run("npm install --silent > /dev/null 2>&1", cwd=FRONTEND_PATH)
 
-    run("pm2 restart frontend || true")
-    logger.success("✅ Frontend mis à jour et reconstruit avec succès.")
+    # ======================================================
+    # 🏗️ Build du frontend
+    # ======================================================
+    logger.info("🏗️ Construction du frontend...")
+    if not run("npm run build --silent > /dev/null 2>&1", cwd=FRONTEND_PATH):
+        logger.error("❌ Échec de la construction du frontend.")
+        return
+
+    # ======================================================
+    # 🔁 Redémarrage du frontend
+    # ======================================================
+    logger.info("🔁 Redémarrage du frontend (pm2)...")
+    run("pm2 restart frontend > /dev/null 2>&1", cwd=FRONTEND_PATH)
+    logger.success("✅ Frontend mis à jour, reconstruit et redémarré avec succès.")
 
 
 # ==========================================================
@@ -104,11 +140,14 @@ def notify_backend_update_done(success=True, message="✅ Mise à jour terminée
             "message": message if success else "❌ Erreur pendant la mise à jour.",
             "success": success
         }
-        requests.post(BACKEND_NOTIFY_URL, json=payload, timeout=3)
+        requests.post(BACKEND_NOTIFY_URL, json=payload, timeout=10)
         logger.info("📡 Notification SSE envoyée au backend (update_finished).")
+    except requests.exceptions.ReadTimeout:
+        logger.warning(⚠️ Notification SSE : le frontend redémarre probablement (timeout ignoré).")
+    except requests.exceptions.ConnectionError:
+        logger.warning("⚠️ Notification SSE : le frontend est injoignable (en redémarrage ?)")
     except Exception as e:
         logger.warning(f"⚠️ Impossible d’envoyer la notification SSE : {e}")
-
 
 # ==========================================================
 # 🚀 MAIN — Logique globale

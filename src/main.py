@@ -9,12 +9,13 @@ from loguru import logger
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-
+from version_checker import check_updates_loop
 from program import Program
-from program.settings.models import get_version
+from src.version import get_version
 from routers import app_router
 from program.file_watcher import start_all_watchers
 from integrations.seasonarr.api.routers import router_ws as seasonarr_ws_router
+
 
 COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN")
 
@@ -208,7 +209,13 @@ async def lifespan(app: FastAPI):
     logger.log("SYSTEM", "🚀 SSDv2 - Startup sequence...")
     app.program = Program()
     app.program.start()
+
+    # Lancer les watchers normaux
     asyncio.create_task(start_watchers_async())
+
+    # Lancer la surveillance des versions toutes les X minutes
+    asyncio.create_task(check_updates_loop())
+
     logger.success("✅ SSD is now running!")
     yield
     logger.log("SYSTEM", "🛑 SSD - Shutdown sequence")

@@ -192,7 +192,6 @@ async def check_updates(db: Session = Depends(get_db)):
                 Notification.message_type == "system_update"
             ).delete()
             db.commit()
-            logger.info(f"🧽 Toutes les versions à jour — {deleted} notification(s) supprimée(s).")
             return {
                 "update_available": False,
                 "message": "✅ Toutes les versions sont à jour.",
@@ -311,7 +310,7 @@ def save_update_notification(db: Session, target: str, version: str, message: st
     )
     db.add(notif)
     db.commit()
-    logger.info(f"🆕 Nouvelle notification persistante {target.upper()} enregistrée (v{version})")
+    logger.succes(f"🆕 Nouvelle Mise à Jour {target.upper()} enregistrée (v{version})")
 
 def mark_update_as_finished(_, target: str):
     """

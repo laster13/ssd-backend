@@ -35,11 +35,11 @@ async def run_update():
 
     async def update_task():
         try:
-            # 🧩 Lance la mise à jour complète
+            # 🧩 Lancement complet (backend + frontend)
             run_auto_update()
             logger.success("✅ Mise à jour terminée avec succès")
 
-            # 🔔 Notifie tous les clients via SSE
+            # 🔔 Notifie les clients SSE
             sse_manager.publish_event(
                 "update_finished",
                 {"message": "✅ Mise à jour terminée, rechargez la page."}
@@ -52,38 +52,27 @@ async def run_update():
                 {"message": f"❌ Erreur pendant la mise à jour : {e}"}
             )
 
-    # Lancement en arrière-plan
     loop = asyncio.get_event_loop()
     loop.run_in_executor(None, asyncio.run, update_task())
 
     return {"status": "update started"}
 
-import sqlite3
 
 # ==========================================================
 # 🚀 Lancer uniquement la mise à jour BACKEND
 # ==========================================================
 @router.post("/run/backend")
 async def run_update_backend(db: Session = Depends(get_db)):
+    """
+    Met à jour uniquement le backend. Le nettoyage SQLite est géré
+    directement dans auto_update.py avant le redémarrage.
+    """
     logger.info("🔧 Mise à jour BACKEND déclenchée")
 
     try:
-        # 🧩 Lance la mise à jour du backend
         run_auto_update(target="backend")
 
-        # 🧹 Supprime toutes les anciennes notifications (équivalent SQLite CLI)
-        try:
-            DB_PATH = "/home/maman/seedbox/docker/maman/projet-ssd/ssd-backend/seasonarr.db"
-            conn = sqlite3.connect(DB_PATH)
-            cur = conn.cursor()
-            cur.execute("DELETE FROM notifications WHERE message_type='system_update';")
-            conn.commit()
-            conn.close()
-            logger.info("🧽 Anciennes notifications system_update supprimées (SQLite direct OK).")
-        except Exception as clean_err:
-            logger.warning(f"⚠️ Impossible de nettoyer les anciennes notifications backend : {clean_err}")
-
-        # 🔔 Notifie tous les clients connectés via SSE
+        # 🔔 Notifie tous les clients via SSE
         sse_manager.publish_event(
             "update_finished",
             {"message": "✅ Mise à jour BACKEND terminée."}
@@ -99,29 +88,20 @@ async def run_update_backend(db: Session = Depends(get_db)):
 
 
 # ==========================================================
-# 🎨 Lancer uniquement la mise à jour FRONTEND
+# 🎨 Lancer uniquement la mise à jour FRONTEND 
 # ==========================================================
 @router.post("/run/frontend")
 async def run_update_frontend(db: Session = Depends(get_db)):
+    """
+    Met à jour uniquement le frontend. Le nettoyage SQLite est géré
+    directement dans auto_update.py avant le redémarrage.
+    """
     logger.info("🎨 Mise à jour FRONTEND déclenchée")
 
     try:
-        # 🧩 Lance la mise à jour du frontend
         run_auto_update(target="frontend")
 
-        # 🧹 Supprime toutes les anciennes notifications (équivalent SQLite CLI)
-        try:
-            DB_PATH = "/home/maman/seedbox/docker/maman/projet-ssd/ssd-backend/seasonarr.db"
-            conn = sqlite3.connect(DB_PATH)
-            cur = conn.cursor()
-            cur.execute("DELETE FROM notifications WHERE message_type='system_update';")
-            conn.commit()
-            conn.close()
-            logger.info("🧽 Anciennes notifications system_update supprimées (SQLite direct OK).")
-        except Exception as clean_err:
-            logger.warning(f"⚠️ Impossible de nettoyer les anciennes notifications frontend : {clean_err}")
-
-        # 🔔 Notifie tous les clients connectés via SSE
+        # 🔔 Notifie tous les clients via SSE
         sse_manager.publish_event(
             "update_finished",
             {"message": "✅ Mise à jour FRONTEND terminée."}
@@ -134,20 +114,6 @@ async def run_update_frontend(db: Session = Depends(get_db)):
         logger.error(f"❌ Erreur MAJ frontend : {e}")
         sse_manager.publish_event("update_error", {"message": str(e)})
         return {"status": "error", "message": f"Erreur MAJ frontend : {e}"}
-
-# ==========================================================
-# 🧠 2. Notification SSE “update_finished”
-# ==========================================================
-@router.post("/sse/update_finished")
-async def notify_update_finished(request: Request):
-    """
-    Permet à un script externe (auto_update.py) d’envoyer la notification SSE
-    après la fin d’une mise à jour.
-    """
-    payload = await request.json()
-    event_type = payload.get("event", "update_finished")  # 👈 ajoute cette ligne
-    sse_manager.publish_event(event_type, payload)         # 👈 utilise event_type
-    return {"status": "ok"}
 
 
 # ==========================================================

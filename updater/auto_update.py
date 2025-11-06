@@ -2,6 +2,7 @@
 
 import subprocess
 import json
+import sqlite3
 import urllib.request
 from pathlib import Path
 import requests
@@ -46,17 +47,55 @@ def get_remote_version(url: str) -> str:
         logger.error(f"❌ Impossible de lire la version distante ({url}) : {e}")
         return "0.0.0"
 
+# ==========================================================
+# 🧹 NETTOYAGE DES NOTIFICATIONS DE MISE À JOUR 
+# ==========================================================
+
+
+def clean_update_notifications():
+    """🧹 Supprime toutes les notifications 'system_update' avant la mise à jour."""
+    try:
+        # Recherche dynamique du fichier de base
+        backend_root = Path(__file__).resolve().parents[1]  # ← dossier ssd-backend
+        db_candidates = list(backend_root.glob("seasonarr.db"))
+
+        if not db_candidates:
+            logger.warning(f"⚠️ Base SQLite 'seasonarr.db' introuvable dans {backend_root}")
+            return
+
+        DB_PATH = db_candidates[0]
+        logger.debug(f"🧠 Suppression notifications system_update dans {DB_PATH}")
+
+        import sqlite3
+        conn = sqlite3.connect(DB_PATH, isolation_level=None, timeout=5)
+        cur = conn.cursor()
+        cur.execute("PRAGMA busy_timeout = 1000;")
+        cur.execute("PRAGMA journal_mode=DELETE;")
+        cur.execute("DELETE FROM notifications WHERE message_type='system_update';")
+        conn.commit()
+        conn.close()
+
+        logger.success("🧽 Notifications 'system_update' supprimées avant la mise à jour.")
+    except Exception as e:
+        logger.error(f"💥 Erreur lors du nettoyage des notifications avant MAJ : {e}")
+
 
 # ==========================================================
 # 🔧 MISE À JOUR BACKEND
 # ==========================================================
 
 def update_backend():
+    """Met à jour le backend."""
     logger.info("🚀 Mise à jour du backend en cours...")
+
+    # 🧹 Nettoyage avant tout
+    clean_update_notifications()
+
     run("git fetch --all", cwd=BACKEND_PATH)
     run("git reset --hard origin/main", cwd=BACKEND_PATH)
     run("poetry install --no-interaction --no-root", cwd=BACKEND_PATH)
     run("pm2 restart backend || true")
+
     logger.success("✅ Backend mis à jour et redémarré avec succès.")
 
 
@@ -71,6 +110,12 @@ def update_frontend():
         return
 
     logger.info("🎨 Mise à jour du frontend en cours...")
+
+    # ======================================================
+    # 🧽 Nettoyage des notifications avant redémarrage
+    # ======================================================
+    clean_update_notifications()
+
     run("git fetch --all > /dev/null 2>&1", cwd=FRONTEND_PATH)
     run("git reset --hard origin/main > /dev/null 2>&1", cwd=FRONTEND_PATH)
 

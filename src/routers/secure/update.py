@@ -11,6 +11,8 @@ from src.integrations.seasonarr.db.models import Notification
 from src.integrations.seasonarr.db.database import get_db
 from packaging import version  # ✅ pour compare_versions
 from src.integrations.seasonarr.db.database import SessionLocal
+import sqlite3
+from pathlib import Path
 
 
 router = APIRouter(prefix="/update", tags=["update"])
@@ -56,22 +58,30 @@ async def run_update():
 
     return {"status": "update started"}
 
+import sqlite3
+
 # ==========================================================
 # 🚀 Lancer uniquement la mise à jour BACKEND
 # ==========================================================
 @router.post("/run/backend")
 async def run_update_backend(db: Session = Depends(get_db)):
     logger.info("🔧 Mise à jour BACKEND déclenchée")
+
     try:
         # 🧩 Lance la mise à jour du backend
         run_auto_update(target="backend")
 
-        # ✅ Marque la notification persistante comme terminée (si existante)
+        # 🧹 Supprime toutes les anciennes notifications (équivalent SQLite CLI)
         try:
-            mark_update_as_finished(next(db), target="backend")
-            logger.info("🧹 Notification BACKEND marquée comme terminée.")
-        except Exception as notif_err:
-            logger.warning(f"⚠️ Impossible de marquer la notification backend comme terminée : {notif_err}")
+            DB_PATH = "/home/maman/seedbox/docker/maman/projet-ssd/ssd-backend/seasonarr.db"
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute("DELETE FROM notifications WHERE message_type='system_update';")
+            conn.commit()
+            conn.close()
+            logger.info("🧽 Anciennes notifications system_update supprimées (SQLite direct OK).")
+        except Exception as clean_err:
+            logger.warning(f"⚠️ Impossible de nettoyer les anciennes notifications backend : {clean_err}")
 
         # 🔔 Notifie tous les clients connectés via SSE
         sse_manager.publish_event(
@@ -94,16 +104,22 @@ async def run_update_backend(db: Session = Depends(get_db)):
 @router.post("/run/frontend")
 async def run_update_frontend(db: Session = Depends(get_db)):
     logger.info("🎨 Mise à jour FRONTEND déclenchée")
+
     try:
         # 🧩 Lance la mise à jour du frontend
         run_auto_update(target="frontend")
 
-        # ✅ Marque la notification persistante comme terminée (si existante)
+        # 🧹 Supprime toutes les anciennes notifications (équivalent SQLite CLI)
         try:
-            mark_update_as_finished(next(db), target="frontend")
-            logger.info("🧹 Notification FRONTEND marquée comme terminée.")
-        except Exception as notif_err:
-            logger.warning(f"⚠️ Impossible de marquer la notification frontend comme terminée : {notif_err}")
+            DB_PATH = "/home/maman/seedbox/docker/maman/projet-ssd/ssd-backend/seasonarr.db"
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute("DELETE FROM notifications WHERE message_type='system_update';")
+            conn.commit()
+            conn.close()
+            logger.info("🧽 Anciennes notifications system_update supprimées (SQLite direct OK).")
+        except Exception as clean_err:
+            logger.warning(f"⚠️ Impossible de nettoyer les anciennes notifications frontend : {clean_err}")
 
         # 🔔 Notifie tous les clients connectés via SSE
         sse_manager.publish_event(
@@ -118,7 +134,6 @@ async def run_update_frontend(db: Session = Depends(get_db)):
         logger.error(f"❌ Erreur MAJ frontend : {e}")
         sse_manager.publish_event("update_error", {"message": str(e)})
         return {"status": "error", "message": f"Erreur MAJ frontend : {e}"}
-
 
 # ==========================================================
 # 🧠 2. Notification SSE “update_finished”

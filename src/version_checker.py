@@ -74,10 +74,6 @@ async def check_updates_loop():
                     },
                 )
 
-            # --- Rien de nouveau ---
-            if remote_backend == current_backend and remote_frontend == current_frontend:
-                logger.debug(f"Aucune mise à jour — Backend={current_backend}, Frontend={current_frontend}")
-
         except Exception as e:
             logger.error(f"💥 Erreur dans la boucle de vérification de mise à jour : {e}")
 

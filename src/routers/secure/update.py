@@ -259,7 +259,6 @@ async def check_updates(db: Session = Depends(get_db)):
             "message": message,
         }
 
-        logger.info(f"🔍 Vérification de mise à jour : {result}")
         return result
 
     except Exception as e:
@@ -290,7 +289,6 @@ def save_update_notification(db: Session, target: str, version: str, message: st
 
     if existing:
         # 🔁 Déjà notifiée → rien à faire
-        logger.debug(f"⏸️ Notification {target.upper()} v{version} déjà existante, pas de duplication.")
         return
 
     # 🧹 Marque les anciennes comme lues

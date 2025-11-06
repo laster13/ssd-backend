@@ -24,7 +24,6 @@ def get_version() -> dict:
             with open(backend_version_file, "r") as f:
                 data = json.load(f)
                 backend_version = data.get("version", "—")
-                logger.debug(f"📦 Backend version locale : {backend_version}")
         else:
             logger.warning(f"⚠️ Fichier backend/version.json introuvable à {backend_version_file}")
 
@@ -34,7 +33,6 @@ def get_version() -> dict:
             with open(frontend_version_file, "r") as f:
                 data = json.load(f)
                 frontend_version = data.get("version", "—")
-                logger.debug(f"💅 Frontend version locale : {frontend_version}")
         else:
             logger.warning(f"⚠️ Fichier frontend/version.json introuvable à {frontend_version_file}")
 

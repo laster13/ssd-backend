@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from src.integrations.seasonarr.db.models import Notification
 from src.integrations.seasonarr.db.database import get_db
 from packaging import version  # ✅ pour compare_versions
+from src.integrations.seasonarr.db.database import SessionLocal
 
 
 router = APIRouter(prefix="/update", tags=["update"])
@@ -67,7 +68,7 @@ async def run_update_backend(db: Session = Depends(get_db)):
 
         # ✅ Marque la notification persistante comme terminée (si existante)
         try:
-            mark_update_as_finished(db, target="backend")
+            mark_update_as_finished(next(db), target="backend")
             logger.info("🧹 Notification BACKEND marquée comme terminée.")
         except Exception as notif_err:
             logger.warning(f"⚠️ Impossible de marquer la notification backend comme terminée : {notif_err}")
@@ -99,7 +100,7 @@ async def run_update_frontend(db: Session = Depends(get_db)):
 
         # ✅ Marque la notification persistante comme terminée (si existante)
         try:
-            mark_update_as_finished(db, target="frontend")
+            mark_update_as_finished(next(db), target="frontend")
             logger.info("🧹 Notification FRONTEND marquée comme terminée.")
         except Exception as notif_err:
             logger.warning(f"⚠️ Impossible de marquer la notification frontend comme terminée : {notif_err}")
@@ -172,6 +173,7 @@ async def check_updates(db: Session = Depends(get_db)):
     Vérifie s’il existe une nouvelle version du backend et du frontend.
     Compare les fichiers version.json locaux et distants,
     et enregistre une notification persistante si une mise à jour est disponible.
+    Nettoie les notifications si tout est à jour.
     """
     try:
         # =====================================================
@@ -202,7 +204,32 @@ async def check_updates(db: Session = Depends(get_db)):
             logger.warning(f"⚠️ Impossible de récupérer la version FRONTEND distante : {e}")
 
         # =====================================================
-        # 🧮 3. Comparaison intelligente
+        # 🧠 3. Protection : si les versions locales == distantes
+        # =====================================================
+        if local_backend == remote_backend and local_frontend == remote_frontend:
+            db.query(Notification).filter(
+                Notification.message_type == "system_update",
+                Notification.read == False
+            ).update({"read": True})
+            db.commit()
+            logger.info("✅ Toutes les versions à jour, notifications nettoyées.")
+            return {
+                "update_available": False,
+                "message": "✅ Toutes les versions sont à jour.",
+                "backend": {
+                    "current": local_backend,
+                    "remote": remote_backend,
+                    "has_update": False
+                },
+                "frontend": {
+                    "current": local_frontend,
+                    "remote": remote_frontend,
+                    "has_update": False
+                },
+            }
+
+        # =====================================================
+        # 🧮 4. Comparaison intelligente
         # =====================================================
         def compare_versions(local_v, remote_v):
             try:
@@ -215,7 +242,7 @@ async def check_updates(db: Session = Depends(get_db)):
         update_available = backend_has_update or frontend_has_update
 
         # =====================================================
-        # 💬 4. Message dynamique
+        # 💬 5. Message dynamique
         # =====================================================
         if backend_has_update and frontend_has_update:
             message = f"🚀 Nouvelle version BACKEND {remote_backend} et FRONTEND {remote_frontend} disponibles"
@@ -227,16 +254,15 @@ async def check_updates(db: Session = Depends(get_db)):
             message = "✅ Toutes les versions sont à jour."
 
         # =====================================================
-        # 🧱 5. Persistance en base (Notification)
+        # 🧱 6. Persistance en base (Notification)
         # =====================================================
-        # Utilise la fonction globale (corrigée) définie plus bas
         if backend_has_update:
             save_update_notification(db, "backend", remote_backend, message)
         if frontend_has_update:
             save_update_notification(db, "frontend", remote_frontend, message)
 
         # =====================================================
-        # 🧾 6. Log + retour
+        # 🧾 7. Log + retour
         # =====================================================
         result = {
             "update_available": update_available,
@@ -269,23 +295,37 @@ async def check_updates(db: Session = Depends(get_db)):
 
 def save_update_notification(db: Session, target: str, version: str, message: str):
     """
-    Crée ou met à jour une notification persistante en base
-    pour signaler une mise à jour disponible.
-    Nettoie d'abord toutes les anciennes notifications non lues.
+    Crée ou met à jour une notification persistante uniquement
+    si la version est nouvelle. Ne duplique pas les notifications identiques.
     """
-    # 🧹 Nettoie les anciennes notifications du même type encore non lues
+    existing = (
+        db.query(Notification)
+        .filter(
+            Notification.message_type == "system_update",
+            Notification.notification_type == target,
+            Notification.extra_data["version"].as_string() == version  # version déjà notifiée
+        )
+        .first()
+    )
+
+    if existing:
+        # 🔁 Déjà notifiée → rien à faire
+        logger.debug(f"⏸️ Notification {target.upper()} v{version} déjà existante, pas de duplication.")
+        return
+
+    # 🧹 Marque les anciennes comme lues
     db.query(Notification).filter(
         Notification.message_type == "system_update",
         Notification.notification_type == target,
         Notification.read == False
     ).update({"read": True})
 
-    # 🆕 Crée une nouvelle notification propre
+    # 🆕 Crée la nouvelle notification
     notif = Notification(
-        user_id=1,  # ou un utilisateur système si applicable
+        user_id=1,
         title=f"Mise à jour {target.upper()} disponible",
         message=message,
-        notification_type=target,  # backend ou frontend
+        notification_type=target,
         message_type="system_update",
         persistent=True,
         read=False,
@@ -293,30 +333,42 @@ def save_update_notification(db: Session, target: str, version: str, message: st
     )
     db.add(notif)
     db.commit()
-
     logger.info(f"🆕 Nouvelle notification persistante {target.upper()} enregistrée (v{version})")
 
-def mark_update_as_finished(db: Session, target: str):
+def mark_update_as_finished(_, target: str):
     """
-    Marque comme lue la notification de mise à jour correspondante.
+    Marque comme lue la notification de mise à jour correspondante,
+    en rouvrant une session locale indépendante.
     """
-    notif = (
-        db.query(Notification)
-        .filter(
-            Notification.message_type == "system_update",
-            Notification.notification_type.ilike(target),  # insensible à la casse
-            Notification.read == False
-        )
-        .order_by(Notification.created_at.desc())
-        .first()
-    )
+    from sqlalchemy import and_
 
-    if notif:
-        notif.read = True
-        db.commit()
-        logger.info(f"✅ Notification {target.upper()} marquée comme lue en base (id={notif.id}).")
-    else:
-        logger.warning(f"⚠️ Aucune notification non lue trouvée pour {target}.")
+    target = target.strip().lower()
+    db = SessionLocal()
+
+    try:
+        notif = (
+            db.query(Notification)
+            .filter(
+                and_(
+                    Notification.message_type == "system_update",
+                    Notification.notification_type.ilike(f"%{target}%"),
+                    Notification.read == False,
+                )
+            )
+            .order_by(Notification.created_at.desc())
+            .first()
+        )
+
+        if notif:
+            notif.read = True
+            db.commit()
+            logger.success(f"✅ Notification {target.upper()} marquée comme lue (id={notif.id}).")
+        else:
+            logger.warning(f"⚠️ Aucune notification non lue trouvée pour {target}.")
+    except Exception as e:
+        logger.error(f"💥 Erreur mark_update_as_finished({target}) : {e}")
+    finally:
+        db.close()
 
 @router.get("/persistent")
 def get_persistent_update_notification(db: Session = Depends(get_db)):

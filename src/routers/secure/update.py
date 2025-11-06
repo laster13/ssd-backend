@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Depends
 from loguru import logger
 import asyncio
 import json
@@ -6,6 +6,11 @@ import urllib.request
 from updater.auto_update import main as run_auto_update
 from program.managers.sse_manager import sse_manager
 from src.version import get_version
+from sqlalchemy.orm import Session
+from src.integrations.seasonarr.db.models import Notification
+from src.integrations.seasonarr.db.database import get_db
+from packaging import version  # ✅ pour compare_versions
+
 
 router = APIRouter(prefix="/update", tags=["update"])
 
@@ -54,40 +59,58 @@ async def run_update():
 # 🚀 Lancer uniquement la mise à jour BACKEND
 # ==========================================================
 @router.post("/run/backend")
-async def run_update_backend():
+async def run_update_backend(db: Session = Depends(get_db)):
     logger.info("🔧 Mise à jour BACKEND déclenchée")
     try:
-        # Exemple : ton script actuel fait déjà tout, tu peux passer un paramètre
+        # 🧩 Lance la mise à jour du backend
         run_auto_update(target="backend")
 
+        # 🧹 Marque la notification persistante comme terminée
+        mark_update_as_finished(db, target="backend")
+
+        # 🔔 Notifie tous les clients connectés via SSE
         sse_manager.publish_event(
             "update_finished",
             {"message": "✅ Mise à jour BACKEND terminée."}
         )
+
+        logger.success("✅ Mise à jour BACKEND terminée avec succès")
         return {"status": "ok", "message": "Mise à jour BACKEND terminée"}
+
     except Exception as e:
         logger.error(f"❌ Erreur MAJ backend : {e}")
+
         sse_manager.publish_event("update_error", {"message": str(e)})
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Erreur MAJ backend : {e}"}
+
 
 # ==========================================================
 # 🎨 Lancer uniquement la mise à jour FRONTEND
 # ==========================================================
 @router.post("/run/frontend")
-async def run_update_frontend():
+async def run_update_frontend(db: Session = Depends(get_db)):
     logger.info("🎨 Mise à jour FRONTEND déclenchée")
     try:
+        # 🧩 Lance la mise à jour du frontend
         run_auto_update(target="frontend")
 
+        # 🧹 Marque la notification persistante comme terminée
+        mark_update_as_finished(db, target="frontend")
+
+        # 🔔 Notifie tous les clients connectés via SSE
         sse_manager.publish_event(
             "update_finished",
             {"message": "✅ Mise à jour FRONTEND terminée."}
         )
+
+        logger.success("✅ Mise à jour FRONTEND terminée avec succès")
         return {"status": "ok", "message": "Mise à jour FRONTEND terminée"}
+
     except Exception as e:
         logger.error(f"❌ Erreur MAJ frontend : {e}")
+
         sse_manager.publish_event("update_error", {"message": str(e)})
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Erreur MAJ frontend : {e}"}
 
 
 # ==========================================================
@@ -138,10 +161,11 @@ async def get_versions():
 # ==========================================================
 
 @router.get("/check")
-async def check_updates():
+async def check_updates(db: Session = Depends(get_db)):
     """
     Vérifie s’il existe une nouvelle version du backend et du frontend.
-    Compare les fichiers version.json locaux et distants.
+    Compare les fichiers version.json locaux et distants,
+    et enregistre une notification persistante si une mise à jour est disponible.
     """
     try:
         # =====================================================
@@ -157,7 +181,6 @@ async def check_updates():
         remote_backend = "—"
         remote_frontend = "—"
 
-        # --- Backend distant
         try:
             with urllib.request.urlopen(BACKEND_VERSION_URL, timeout=5) as response:
                 data = json.load(response)
@@ -165,7 +188,6 @@ async def check_updates():
         except Exception as e:
             logger.warning(f"⚠️ Impossible de récupérer la version BACKEND distante : {e}")
 
-        # --- Frontend distant
         try:
             with urllib.request.urlopen(FRONTEND_VERSION_URL, timeout=5) as response:
                 data = json.load(response)
@@ -174,17 +196,16 @@ async def check_updates():
             logger.warning(f"⚠️ Impossible de récupérer la version FRONTEND distante : {e}")
 
         # =====================================================
-        # 🧮 3. Comparaison intelligente (version.parse)
+        # 🧮 3. Comparaison intelligente
         # =====================================================
         def compare_versions(local_v, remote_v):
             try:
                 return version.parse(remote_v) > version.parse(local_v)
             except Exception:
-                return remote_v != local_v  # fallback simple
+                return remote_v != local_v
 
         backend_has_update = compare_versions(local_backend, remote_backend)
         frontend_has_update = compare_versions(local_frontend, remote_frontend)
-
         update_available = backend_has_update or frontend_has_update
 
         # =====================================================
@@ -200,21 +221,58 @@ async def check_updates():
             message = "✅ Toutes les versions sont à jour."
 
         # =====================================================
-        # 🧾 5. Log + retour
+        # 🧱 5. Persistance en base (Notification)
+        # =====================================================
+        def save_update_notification(target: str, version_str: str, msg: str):
+            existing = (
+                db.query(Notification)
+                .filter(
+                    Notification.message_type == "system_update",
+                    Notification.notification_type == target,
+                    Notification.read == False,
+                )
+                .first()
+            )
+
+            if not existing:
+                notif = Notification(
+                    user_id=1,  # utilisateur système
+                    title=f"Mise à jour {target.upper()} disponible",
+                    message=msg,
+                    notification_type=target,  # backend / frontend
+                    message_type="system_update",
+                    persistent=True,
+                    read=False,
+                    extra_data={"version": version_str},
+                )
+                db.add(notif)
+            else:
+                existing.message = msg
+                existing.extra_data = {"version": version_str}
+            db.commit()
+
+        # Enregistre seulement si une mise à jour est dispo
+        if backend_has_update:
+            save_update_notification("backend", remote_backend, message)
+        if frontend_has_update:
+            save_update_notification("frontend", remote_frontend, message)
+
+        # =====================================================
+        # 🧾 6. Log + retour
         # =====================================================
         result = {
             "update_available": update_available,
             "backend": {
                 "current": local_backend,
                 "remote": remote_backend,
-                "has_update": backend_has_update
+                "has_update": backend_has_update,
             },
             "frontend": {
                 "current": local_frontend,
                 "remote": remote_frontend,
-                "has_update": frontend_has_update
+                "has_update": frontend_has_update,
             },
-            "message": message
+            "message": message,
         }
 
         logger.info(f"🔍 Vérification de mise à jour : {result}")
@@ -224,5 +282,77 @@ async def check_updates():
         logger.error(f"💥 Erreur pendant la vérification de mise à jour : {e}")
         return {
             "update_available": False,
-            "message": "❌ Erreur pendant la vérification des mises à jour."
+            "message": "❌ Erreur pendant la vérification des mises à jour.",
         }
+
+# ==========================================================
+# 🧱 5. Persistance des notifications de mise à jour
+# ==========================================================
+
+def save_update_notification(db: Session, target: str, version: str, message: str):
+    """
+    Crée ou met à jour une notification persistante en base
+    pour signaler une mise à jour disponible.
+    """
+    existing = (
+        db.query(Notification)
+        .filter(Notification.message_type == "system_update",
+                Notification.notification_type == target,
+                Notification.read == False)
+        .first()
+    )
+
+    if not existing:
+        notif = Notification(
+            user_id=1,  # ou un utilisateur système si applicable
+            title=f"Mise à jour {target.upper()} disponible",
+            message=message,
+            notification_type=target,  # backend ou frontend
+            message_type="system_update",
+            persistent=True,
+            read=False,
+            extra_data={"version": version},
+        )
+        db.add(notif)
+    else:
+        existing.message = message
+        existing.extra_data = {"version": version}
+
+    db.commit()
+
+def mark_update_as_finished(db: Session, target: str):
+    """
+    Marque la notification de mise à jour comme lue une fois la MAJ terminée.
+    """
+    notif = (
+        db.query(Notification)
+        .filter(Notification.message_type == "system_update",
+                Notification.notification_type == target,
+                Notification.read == False)
+        .first()
+    )
+    if notif:
+        notif.read = True
+        db.commit()
+
+@router.get("/persistent")
+def get_persistent_update_notification(db: Session = Depends(get_db)):
+    """
+    Retourne la notification persistante de mise à jour (si existante).
+    """
+    notif = (
+        db.query(Notification)
+        .filter(Notification.message_type == "system_update",
+                Notification.read == False)
+        .order_by(Notification.created_at.desc())
+        .first()
+    )
+    if not notif:
+        return {"has_update": False}
+
+    return {
+        "has_update": True,
+        "type": notif.notification_type,
+        "message": notif.message,
+        "version": notif.extra_data.get("version") if notif.extra_data else None,
+    }

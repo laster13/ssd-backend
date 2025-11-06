@@ -299,32 +299,30 @@ def save_update_notification(db: Session, target: str, version: str, message: st
     """
     Crée ou met à jour une notification persistante en base
     pour signaler une mise à jour disponible.
+    Nettoie d'abord toutes les anciennes notifications non lues.
     """
-    existing = (
-        db.query(Notification)
-        .filter(Notification.message_type == "system_update",
-                Notification.notification_type == target,
-                Notification.read == False)
-        .first()
+    # 🧹 Nettoie les anciennes notifications du même type encore non lues
+    db.query(Notification).filter(
+        Notification.message_type == "system_update",
+        Notification.notification_type == target,
+        Notification.read == False
+    ).update({"read": True})
+
+    # 🆕 Crée une nouvelle notification propre
+    notif = Notification(
+        user_id=1,  # ou un utilisateur système si applicable
+        title=f"Mise à jour {target.upper()} disponible",
+        message=message,
+        notification_type=target,  # backend ou frontend
+        message_type="system_update",
+        persistent=True,
+        read=False,
+        extra_data={"version": version},
     )
-
-    if not existing:
-        notif = Notification(
-            user_id=1,  # ou un utilisateur système si applicable
-            title=f"Mise à jour {target.upper()} disponible",
-            message=message,
-            notification_type=target,  # backend ou frontend
-            message_type="system_update",
-            persistent=True,
-            read=False,
-            extra_data={"version": version},
-        )
-        db.add(notif)
-    else:
-        existing.message = message
-        existing.extra_data = {"version": version}
-
+    db.add(notif)
     db.commit()
+
+    logger.info(f"🆕 Nouvelle notification persistante {target.upper()} enregistrée (v{version})")
 
 def mark_update_as_finished(db: Session, target: str):
     """

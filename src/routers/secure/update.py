@@ -229,39 +229,11 @@ async def check_updates(db: Session = Depends(get_db)):
         # =====================================================
         # 🧱 5. Persistance en base (Notification)
         # =====================================================
-        def save_update_notification(target: str, version_str: str, msg: str):
-            existing = (
-                db.query(Notification)
-                .filter(
-                    Notification.message_type == "system_update",
-                    Notification.notification_type == target,
-                    Notification.read == False,
-                )
-                .first()
-            )
-
-            if not existing:
-                notif = Notification(
-                    user_id=1,  # utilisateur système
-                    title=f"Mise à jour {target.upper()} disponible",
-                    message=msg,
-                    notification_type=target,  # backend / frontend
-                    message_type="system_update",
-                    persistent=True,
-                    read=False,
-                    extra_data={"version": version_str},
-                )
-                db.add(notif)
-            else:
-                existing.message = msg
-                existing.extra_data = {"version": version_str}
-            db.commit()
-
-        # Enregistre seulement si une mise à jour est dispo
+        # Utilise la fonction globale (corrigée) définie plus bas
         if backend_has_update:
-            save_update_notification("backend", remote_backend, message)
+            save_update_notification(db, "backend", remote_backend, message)
         if frontend_has_update:
-            save_update_notification("frontend", remote_frontend, message)
+            save_update_notification(db, "frontend", remote_frontend, message)
 
         # =====================================================
         # 🧾 6. Log + retour
@@ -326,18 +298,25 @@ def save_update_notification(db: Session, target: str, version: str, message: st
 
 def mark_update_as_finished(db: Session, target: str):
     """
-    Marque la notification de mise à jour comme lue une fois la MAJ terminée.
+    Marque comme lue la notification de mise à jour correspondante.
     """
     notif = (
         db.query(Notification)
-        .filter(Notification.message_type == "system_update",
-                Notification.notification_type == target,
-                Notification.read == False)
+        .filter(
+            Notification.message_type == "system_update",
+            Notification.notification_type.ilike(target),  # insensible à la casse
+            Notification.read == False
+        )
+        .order_by(Notification.created_at.desc())
         .first()
     )
+
     if notif:
         notif.read = True
         db.commit()
+        logger.info(f"✅ Notification {target.upper()} marquée comme lue en base (id={notif.id}).")
+    else:
+        logger.warning(f"⚠️ Aucune notification non lue trouvée pour {target}.")
 
 @router.get("/persistent")
 def get_persistent_update_notification(db: Session = Depends(get_db)):

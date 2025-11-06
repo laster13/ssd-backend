@@ -65,8 +65,12 @@ async def run_update_backend(db: Session = Depends(get_db)):
         # 🧩 Lance la mise à jour du backend
         run_auto_update(target="backend")
 
-        # 🧹 Marque la notification persistante comme terminée
-        mark_update_as_finished(db, target="backend")
+        # ✅ Marque la notification persistante comme terminée (si existante)
+        try:
+            mark_update_as_finished(db, target="backend")
+            logger.info("🧹 Notification BACKEND marquée comme terminée.")
+        except Exception as notif_err:
+            logger.warning(f"⚠️ Impossible de marquer la notification backend comme terminée : {notif_err}")
 
         # 🔔 Notifie tous les clients connectés via SSE
         sse_manager.publish_event(
@@ -79,7 +83,6 @@ async def run_update_backend(db: Session = Depends(get_db)):
 
     except Exception as e:
         logger.error(f"❌ Erreur MAJ backend : {e}")
-
         sse_manager.publish_event("update_error", {"message": str(e)})
         return {"status": "error", "message": f"Erreur MAJ backend : {e}"}
 
@@ -94,8 +97,12 @@ async def run_update_frontend(db: Session = Depends(get_db)):
         # 🧩 Lance la mise à jour du frontend
         run_auto_update(target="frontend")
 
-        # 🧹 Marque la notification persistante comme terminée
-        mark_update_as_finished(db, target="frontend")
+        # ✅ Marque la notification persistante comme terminée (si existante)
+        try:
+            mark_update_as_finished(db, target="frontend")
+            logger.info("🧹 Notification FRONTEND marquée comme terminée.")
+        except Exception as notif_err:
+            logger.warning(f"⚠️ Impossible de marquer la notification frontend comme terminée : {notif_err}")
 
         # 🔔 Notifie tous les clients connectés via SSE
         sse_manager.publish_event(
@@ -108,7 +115,6 @@ async def run_update_frontend(db: Session = Depends(get_db)):
 
     except Exception as e:
         logger.error(f"❌ Erreur MAJ frontend : {e}")
-
         sse_manager.publish_event("update_error", {"message": str(e)})
         return {"status": "error", "message": f"Erreur MAJ frontend : {e}"}
 

@@ -310,7 +310,7 @@ def save_update_notification(db: Session, target: str, version: str, message: st
     )
     db.add(notif)
     db.commit()
-    logger.succes(f"🆕 Nouvelle Mise à Jour {target.upper()} enregistrée (v{version})")
+    logger.success(f"🆕 Nouvelle Mise à Jour {target.upper()} enregistrée (v{version})")
 
 def mark_update_as_finished(_, target: str):
     """

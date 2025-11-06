@@ -154,7 +154,7 @@ async def check_updates(db: Session = Depends(get_db)):
     Vérifie s’il existe une nouvelle version du backend et du frontend.
     Compare les fichiers version.json locaux et distants,
     et enregistre une notification persistante si une mise à jour est disponible.
-    Nettoie les notifications si tout est à jour.
+    Supprime les notifications obsolètes si tout est à jour.
     """
     try:
         # =====================================================
@@ -185,15 +185,14 @@ async def check_updates(db: Session = Depends(get_db)):
             logger.warning(f"⚠️ Impossible de récupérer la version FRONTEND distante : {e}")
 
         # =====================================================
-        # 🧠 3. Protection : si les versions locales == distantes
+        # 🧠 3. Si tout est à jour → nettoyage complet 
         # =====================================================
         if local_backend == remote_backend and local_frontend == remote_frontend:
-            db.query(Notification).filter(
-                Notification.message_type == "system_update",
-                Notification.read == False
-            ).update({"read": True})
+            deleted = db.query(Notification).filter(
+                Notification.message_type == "system_update"
+            ).delete()
             db.commit()
-            logger.info("✅ Toutes les versions à jour, notifications nettoyées.")
+            logger.info(f"🧽 Toutes les versions à jour — {deleted} notification(s) supprimée(s).")
             return {
                 "update_available": False,
                 "message": "✅ Toutes les versions sont à jour.",

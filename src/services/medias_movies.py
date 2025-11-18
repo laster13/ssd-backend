@@ -28,7 +28,7 @@ class MediasMovies:
     def __init__(
         self,
         base_dir: Path,
-        cache_file: str = "/home/maman/.cache/radarr_cache.json",
+        cache_file: Path = Path.home() / ".cache" / "radarr_cache.json",
     ):
         self.base_dir = Path(base_dir)
         self.cache_file = cache_file

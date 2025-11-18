@@ -1,9 +1,12 @@
 import requests
-from pathlib import Path
 import json
-from typing import Optional
+import aiohttp
 import re
+import asyncio
+from typing import Optional
+from pathlib import Path
 from fastapi import HTTPException
+from loguru import logger
 import logging
 from program.utils.text_utils import normalize_name, clean_movie_name, clean_series_name
 
@@ -20,6 +23,128 @@ def load_config():
     with open(CONFIG_PATH) as f:
         return json.load(f)
 
+class TMDbService:
+    """
+    🎬 Service pour interroger TMDb et récupérer IMDb IDs.
+    - Supporte les modes synchrone et asynchrone
+    - Utilise HTTP/2 pour l’asynchrone (via aiohttp)
+    - Gère automatiquement les erreurs et timeouts
+    """
+
+    def __init__(self):
+        config = load_config()
+        self.api_key = config.get("tmdb_api_key")
+        if not self.api_key:
+            raise ValueError("❌ Clé TMDb introuvable dans config.json")
+        self.base_url = "https://api.themoviedb.org/3"
+
+    # ----------------------------------------------------------------------
+    # 🌍 VERSION SYNCHRONE (compatible avec l’existant)
+    # ----------------------------------------------------------------------
+    def search_movie(self, query: str, year: int | None = None):
+        """Recherche un film sur TMDb par nom + année (version synchrone)."""
+        params = {"api_key": self.api_key, "query": query}
+        if year:
+            params["year"] = year
+
+        try:
+            res = requests.get(f"{self.base_url}/search/movie", params=params, timeout=10)
+            res.raise_for_status()
+
+            results = res.json().get("results", [])
+            if not results:
+                logger.debug(f"⚠️ Aucun résultat TMDb pour '{query}'")
+                return None
+
+            tmdb_id = results[0].get("id")
+            return self.get_movie_details(tmdb_id)
+
+        except requests.RequestException as e:
+            logger.error(f"❌ Erreur TMDb search_movie({query}): {e}")
+            return None
+
+    def get_movie_details(self, tmdb_id: int):
+        """Récupère les détails d’un film TMDb (inclut IMDb ID si dispo)."""
+        url = f"{self.base_url}/movie/{tmdb_id}"
+        params = {"api_key": self.api_key, "append_to_response": "external_ids"}
+        try:
+            res = requests.get(url, params=params, timeout=10)
+            res.raise_for_status()
+
+            data = res.json()
+            imdb_id = data.get("external_ids", {}).get("imdb_id")
+            return {
+                "id": data.get("id"),
+                "title": data.get("title"),
+                "year": data.get("release_date", "")[:4],
+                "imdb_id": imdb_id,
+            }
+
+        except requests.RequestException as e:
+            logger.error(f"💥 Erreur TMDb get_movie_details({tmdb_id}): {e}")
+            return None
+
+    # ----------------------------------------------------------------------
+    # ⚡ VERSION ASYNCHRONE (utilisée par /fix/imdb ultra-rapide)
+    # ----------------------------------------------------------------------
+    async def async_search_movie(self, session: aiohttp.ClientSession, query: str, year: int | None = None):
+        """🔍 Recherche un film en mode asynchrone (rapide, HTTP/2)."""
+        params = {"api_key": self.api_key, "query": query}
+        if year:
+            params["year"] = year
+
+        url = f"{self.base_url}/search/movie"
+
+        try:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as res:
+                if res.status != 200:
+                    text = await res.text()
+                    logger.error(f"❌ Erreur TMDb async_search_movie({query}): {res.status} {text}")
+                    return None
+
+                data = await res.json()
+                results = data.get("results", [])
+                if not results:
+                    logger.debug(f"⚠️ Aucun résultat TMDb pour '{query}'")
+                    return None
+
+                tmdb_id = results[0].get("id")
+                return await self.async_get_movie_details(session, tmdb_id)
+
+        except asyncio.TimeoutError:
+            logger.warning(f"⏱ Timeout TMDb async_search_movie({query})")
+            return None
+        except Exception as e:
+            logger.warning(f"💥 Erreur TMDb async_search_movie({query}): {e}")
+            return None
+
+    async def async_get_movie_details(self, session: aiohttp.ClientSession, tmdb_id: int):
+        """📄 Récupère les détails TMDb d’un film en mode asynchrone."""
+        url = f"{self.base_url}/movie/{tmdb_id}"
+        params = {"api_key": self.api_key, "append_to_response": "external_ids"}
+
+        try:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as res:
+                if res.status != 200:
+                    text = await res.text()
+                    logger.error(f"❌ Erreur TMDb async_get_movie_details({tmdb_id}): {res.status} {text}")
+                    return None
+
+                data = await res.json()
+                imdb_id = data.get("external_ids", {}).get("imdb_id")
+                return {
+                    "id": data.get("id"),
+                    "title": data.get("title"),
+                    "year": data.get("release_date", "")[:4],
+                    "imdb_id": imdb_id,
+                }
+
+        except asyncio.TimeoutError:
+            logger.warning(f"⏱ Timeout TMDb async_get_movie_details({tmdb_id})")
+            return None
+        except Exception as e:
+            logger.warning(f"💥 Erreur TMDb async_get_movie_details({tmdb_id}): {e}")
+            return None
 
 class RadarrService:
     def __init__(self):
@@ -28,6 +153,16 @@ class RadarrService:
         self.host = config.get("radarr_host", "localhost")
         self.base_url = f"http://{self.host}:{RADARR_PORT}/api/v3"
         self.headers = {"X-Api-Key": self.api_key}
+        self.profile_cache = {}  # { imdb_id: qualityProfileId }
+
+    def cache_profile(self, imdb_id: str, profile_id: int):
+        """🧠 Sauvegarde le profil qualité en mémoire."""
+        self.profile_cache[imdb_id] = profile_id
+
+    def get_cached_profile(self, imdb_id: str) -> Optional[int]:
+        """🔎 Récupère le profil qualité sauvegardé (si dispo)."""
+        return self.profile_cache.get(imdb_id)
+
 
     def get_movie_by_clean_title(self, raw_name: str):
         logger.debug(f"📥 Titre brut reçu : {raw_name}")
@@ -165,6 +300,36 @@ class RadarrService:
         except requests.exceptions.RequestException as e:
             logger.error(f"🌐 Erreur Radarr lookup IMDb {imdb_id} : {e}")
             return None
+
+    def get_movie_by_tmdb(self, tmdb_id: int):
+        """
+        Recherche un film dans Radarr via TMDb ID.
+        Renvoie un objet complet (avec 'id') si le film est déjà importé,
+        sinon renvoie l'objet lookup brut.
+        """
+        try:
+            lookup_url = f"{self.base_url}/movie/lookup/tmdb?tmdbId={tmdb_id}"
+            res = requests.get(lookup_url, headers=self.headers)
+            res.raise_for_status()
+            lookup_movie = res.json()
+
+            if not lookup_movie or "title" not in lookup_movie:
+                logger.warning(f"❌ Aucun film trouvé via TMDb {tmdb_id}")
+                return None
+
+            all_movies = self.get_all_movies()
+            for movie in all_movies:
+                if movie.get("tmdbId") == tmdb_id:
+                    logger.debug(f"✅ Film trouvé dans Radarr par TMDb {tmdb_id} → {movie['title']}")
+                    return movie
+
+            logger.debug(f"⚠️ Film TMDb {tmdb_id} trouvé en lookup mais pas importé")
+            return lookup_movie
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"🌐 Erreur Radarr lookup TMDb {tmdb_id} : {e}", exc_info=True)
+            return None
+
 
 class SonarrService:
     def __init__(self):

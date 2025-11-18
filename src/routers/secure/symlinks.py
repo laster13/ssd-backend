@@ -23,8 +23,6 @@ from program.settings.manager import config_manager
 from program.settings.models import SymlinkConfig
 from program.utils.text_utils import normalize_name, clean_movie_name
 from program.utils.discord_notifier import send_discord_message
-from src.services.medias_movies import MediasMovies
-from src.services.medias_series import MediasSeries
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from program.file_watcher import start_symlink_watcher
 from services.scan_librairies import LibraryScanner
@@ -37,11 +35,14 @@ from program.radarr_cache import (
     _build_radarr_index,
     enrich_from_radarr_index,
 )
+from pathlib import Path
+from collections import Counter
 
 router = APIRouter(
     prefix="/symlinks",
     tags=["Symlinks"],
 )
+
 
 # ⚠️ Ne JAMAIS réassigner cette liste : toujours modifier en place (clear/extend, slices, etc.)
 symlink_store = []
@@ -91,56 +92,6 @@ def filter_items_by_folder(items, folder: Optional[str]):
         folder_paths = [(p / folder).resolve() for p in roots]
     return [i for i in items if any(is_relative_to(Path(i["symlink"]), fp) for fp in folder_paths)]
 
-def get_movies_manager() -> MediasMovies:
-    """Instancie MediasMovies avec config.json"""
-    cfg = config_manager.config
-    api_key = cfg.tmdb_api_key
-
-    # Trouver le dossier Radarr/movies
-    movies_dir = None
-    for ld in cfg.links_dirs:
-        if ld.manager == "radarr":  # ou "movies" selon ta convention
-            movies_dir = Path(ld.path)
-            break
-
-    if not api_key:
-        raise RuntimeError("⚠️ TMDB API key manquante dans config.json")
-    if not movies_dir or not movies_dir.exists():
-        raise RuntimeError("⚠️ Dossier films introuvable dans config.json")
-
-    return MediasMovies(base_dir=movies_dir, api_key=api_key)
-
-def get_series_managers(apply: bool = False) -> list[MediasSeries]:
-    """Instancie MediasSeries pour TOUS les dossiers Sonarr définis dans config.json"""
-    cfg = config_manager.config
-
-    sonarr_url = "http://localhost:8989"  # fixé en dur
-    sonarr_key = cfg.sonarr_api_key
-
-    if not sonarr_key:
-        raise RuntimeError("⚠️ Sonarr API key manquante dans config.json")
-
-    managers: list[MediasSeries] = []
-    for ld in cfg.links_dirs:
-        if ld.manager == "sonarr":
-            base_dir = Path(ld.path)
-            if base_dir.exists():
-                managers.append(
-                    MediasSeries(
-                        base_dir=base_dir,
-                        sonarr_url=sonarr_url,
-                        sonarr_key=sonarr_key,
-                        apply=apply
-                    )
-                )
-            else:
-                logger.warning(f"⚠️ Dossier introuvable : {base_dir}")
-
-    if not managers:
-        raise RuntimeError("⚠️ Aucun dossier séries (sonarr) trouvé dans config.json")
-
-    return managers
-
 # -------------
 # Settings manager
 # -------------
@@ -175,77 +126,78 @@ async def set_symlinks_config(new_config: SymlinkConfig, background_tasks: Backg
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-# -------------
-# Scan symlinks
-# -------------
-def scan_symlinks_parallel(workers: int = 32):
+def scan_symlinks_parallel(workers: int = 32, fast: bool = True, ultra_fast: bool = True):
     """
-    Scan des symlinks optimisé avec os.scandir et ThreadPoolExecutor.
-    ⚡ Ne dépend pas d’un cache disque symlinks.
+    ⚡ Scan des symlinks ultra-rapide.
+    - `fast=True`  → désactive Path.exists()
+    - `ultra_fast=True` → saute aussi lstat() (scan instantané)
+    - `workers` → nombre de threads (par défaut 32)
     """
     config = config_manager.config
     links_dirs = [(Path(ld.path).resolve(), ld.manager) for ld in config.links_dirs]
     mount_dirs = [Path(d).resolve() for d in config.mount_dirs]
 
-    for links_dir, _ in links_dirs:
-        if not links_dir.exists():
-            raise RuntimeError(f"Dossier introuvable : {links_dir}")
-    for mount_dir in mount_dirs:
-        if not mount_dir.exists():
-            raise RuntimeError(f"Dossier introuvable : {mount_dir}")
+    for d, _ in links_dirs + [(m, "") for m in mount_dirs]:
+        if not d.exists():
+            raise RuntimeError(f"Dossier introuvable : {d}")
 
-    tasks = []
     symlinks_list = []
+    tasks = []
 
     def process_symlink(symlink_path: str, root: Path, manager: str):
         try:
-            # Résolution de la cible
+            # Lecture rapide du lien symbolique
             try:
-                target_path = Path(os.readlink(symlink_path))
+                target_raw = os.readlink(symlink_path)
+                target_path = Path(target_raw)
                 if not target_path.is_absolute():
                     target_path = (Path(symlink_path).parent / target_path).resolve()
             except Exception:
                 target_path = Path(symlink_path).resolve(strict=False)
 
-            # 🔗 Adaptation mount_dir (repris de l’ancien code)
-            matched_mount = None
-            relative_target = None
+            # 🔗 Adaptation mount_dir
+            full_target = str(target_path)
             for mount_dir in mount_dirs:
                 try:
                     relative_target = target_path.relative_to(mount_dir)
-                    matched_mount = mount_dir
+                    full_target = str(mount_dir / relative_target)
                     break
                 except ValueError:
                     continue
-            full_target = str(matched_mount / relative_target) if matched_mount else str(target_path)
 
-            try:
-                relative_path = str(Path(symlink_path).resolve().relative_to(root))
-            except Exception:
-                relative_path = str(symlink_path).replace(str(root) + "/", "")
+            # Lecture stat (désactivée si ultra_fast)
+            if not ultra_fast:
+                stat = os.lstat(symlink_path)
+                created_at = datetime.fromtimestamp(stat.st_mtime).isoformat()
+            else:
+                created_at = None
 
-            stat = os.lstat(symlink_path)
-            created_at = datetime.fromtimestamp(stat.st_mtime).isoformat()
+            # Vérification existence cible (très lente)
+            if fast or ultra_fast:
+                target_exists = True
+            else:
+                target_exists = Path(full_target).exists()
 
             item = {
                 "symlink": symlink_path,
-                "relative_path": relative_path,
-                "target": str(target_path),
-                "target_exists": target_path.exists(),
+                "relative_path": os.path.relpath(symlink_path, root),
+                "target": full_target,
+                "target_exists": target_exists,
                 "manager": manager,
                 "type": manager,
                 "created_at": created_at,
             }
 
-            # 🎬 Enrichissement uniquement si manager = radarr
+            # 🎬 Enrichissement Radarr uniquement si manager = radarr
             if manager == "radarr":
                 extra = enrich_from_radarr_index(Path(symlink_path))
                 if extra:
                     item.update(extra)
 
             return item
+
         except Exception as e:
-            logger.warning(f"⚠️ Erreur traitement symlink {symlink_path}: {e!r}")
+            logger.debug(f"⚠️ Erreur symlink {symlink_path}: {e!r}")
             return None
 
     def walk_dir(root: Path, manager: str):
@@ -259,12 +211,9 @@ def scan_symlinks_parallel(workers: int = 32):
                             yield entry.path, root, manager
                         elif entry.is_dir(follow_symlinks=False):
                             stack.append(Path(entry.path))
-            except PermissionError:
-                logger.warning(f"⛔ Permission refusée: {current}")
-            except FileNotFoundError:
+            except (PermissionError, FileNotFoundError):
                 continue
 
-    # ⚡ Dispatch des tâches
     with ThreadPoolExecutor(max_workers=workers) as executor:
         for root, manager in links_dirs:
             for symlink_path, r, m in walk_dir(root, manager):
@@ -275,17 +224,18 @@ def scan_symlinks_parallel(workers: int = 32):
             if result:
                 symlinks_list.append(result)
 
-    # Comptage des références
+    # ✅ Calcul des ref_count (rapide)
     target_counts = Counter(item["target"] for item in symlinks_list if item["target_exists"])
-    results = [{
-        **item,
-        "ref_count": target_counts.get(item["target"], 0) if item["target_exists"] else 0
-    } for item in symlinks_list]
+    for item in symlinks_list:
+        item["ref_count"] = target_counts.get(item["target"], 0) if item["target_exists"] else 0
 
-    logger.success(f"{len(results)} symlinks scannés (workers={workers})")
-    return results
+    logger.success(
+        f"{len(symlinks_list)} symlinks scannés "
+        f"(workers={workers}, fast={fast}, ultra_fast={ultra_fast})"
+    )
+    return symlinks_list
 
-# ⚡ Remplace l’ancien scan
+# ⚡ Remplace l’ancien alias
 scan_symlinks = scan_symlinks_parallel
 
 # ---------------
@@ -1606,118 +1556,6 @@ async def get_tmdb_data(
         "certification": certification
     }
 
-# --------------------------
-# Renommage symlinks movies radarr et tmdbid
-# --------------------------
-
-@router.post("/movies/scan")
-async def scan_all_movies(dry_run: bool = Query(True, description="Simulation ou exécution réelle")):
-    """
-    Scan et renomme les films dans TOUS les dossiers Radarr (ex: movies + anime_movies).
-    - dry_run=True → simulation (affiche seulement)
-    - dry_run=False → applique réellement les renommages
-    """
-    cfg = config_manager.config
-    api_key = cfg.tmdb_api_key
-
-    if not api_key:
-        raise HTTPException(status_code=500, detail="⚠️ Clé TMDb manquante dans config.json")
-
-    results = []
-    stats = {
-        "total": 0,
-        "renamed": 0,
-        "already_conform": 0,
-        "not_found": 0,
-        "errors": 0,
-    }
-
-    try:
-        for ld in cfg.links_dirs:
-            if ld.manager == "radarr":
-                base_dir = Path(ld.path)
-                if not base_dir.exists():
-                    logger.warning(f"⚠️ Dossier introuvable : {base_dir}")
-                    continue
-
-                logger.info(f"🎬 Scan Radarr → {base_dir}")
-                manager = MediasMovies(base_dir=base_dir, api_key=api_key)
-                res = await manager.run(dry_run=dry_run)
-
-                # ⚠️ IMPORTANT : n'ajouter que la partie "results"
-                results.extend(res["results"])
-
-                # Agréger les stats globales
-                for k, v in res["stats"].items():
-                    if k in stats:
-                        stats[k] += v
-
-        return {
-            "message": "✅ Scan terminé pour tous les dossiers Radarr",
-            "dry_run": dry_run,
-            "stats": stats,
-            "results": results,
-        }
-
-    except Exception as e:
-        logger.error(f"💥 Erreur pendant le scan films : {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-# --------------------------
-# Renommage symlinks series avec tmdbid
-# --------------------------
-@router.post("/series/scan")
-async def scan_all_series(
-    dry_run: bool = Query(True, description="Simulation ou exécution réelle")
-):
-    """
-    Scan et renomme les séries dans TOUS les dossiers Sonarr.
-    - dry_run=True → simulation (affiche seulement)
-    - dry_run=False → applique réellement les renommages
-    """
-    try:
-        logger.info(f"🚀 Lancement du scan séries (dry_run={dry_run})")
-
-        # On instancie les managers avec le flag dry_run
-        managers = get_series_managers(apply=not dry_run)
-
-        # Exécution en parallèle
-        all_results = await asyncio.gather(*(m.run() for m in managers))
-
-        results = []
-        stats = {
-            "total": 0,
-            "renamed": 0,
-            "already_conform": 0,
-            "not_found": 0,
-            "errors": 0,
-        }
-
-        # Fusionner proprement les résultats et les stats
-        for res in all_results:
-            results.extend(res["results"])  # ⚠️ on prend uniquement la clé "results"
-            for k, v in res["stats"].items():
-                if k in stats:
-                    stats[k] += v
-
-        return {
-            "message": "✅ Scan terminé pour tous les dossiers Sonarr",
-            "dry_run": dry_run,
-            "stats": stats,
-            "results": results,
-        }
-
-    except Exception as e:
-        logger.error(f"💥 Erreur pendant le scan séries : {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/libraries")
-def scan_libraries(scanner: LibraryScanner = Depends(LibraryScanner)):
-    """
-    Lance un scan Movies + Shows et retourne un résumé.
-    """
-    return scanner.scan()
-
 # -------------------
 # Suppression Symlink local doublons
 # -------------------
@@ -1786,3 +1624,78 @@ async def delete_local_symlink(
     except Exception as e:
         logger.error(f"💥 Erreur suppression symlink : {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Erreur interne : {e}")
+
+
+#-------------------------------------------
+#explorateur pour configuration dossiers symlinks
+#-------------------------------------------
+
+@router.get("/fs")
+async def list_media_folders_and_files(
+    path: str = Query("", description="Sous-chemin relatif à $HOME/Medias"),
+    limit: int = Query(1000, gt=1, le=10000),
+    show_hidden: bool = Query(False, description="Inclure les dossiers cachés"),
+    include_files: bool = Query(True, description="Inclure les fichiers vidéos (.mkv, .mp4, etc.)"),
+):
+    """
+    📂 Explore $HOME/Medias : dossiers + fichiers vidéos (.mkv, .mp4…)
+    """
+    try:
+        home_dir = Path(os.getenv("HOME", "/home/ubuntu"))
+        root_dir = home_dir / "Medias"
+
+        if not root_dir.exists():
+            raise HTTPException(status_code=404, detail=f"Le dossier {root_dir} n'existe pas")
+
+        # Sécurisation du chemin
+        target = (root_dir / path).resolve()
+        try:
+            target.relative_to(root_dir)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="Accès en dehors du répertoire autorisé")
+
+        if not target.exists() or not target.is_dir():
+            raise HTTPException(status_code=404, detail=f"{target} n'est pas un dossier valide")
+
+        # --- Récupération des dossiers et fichiers ---
+        folders, files = [], []
+        video_exts = {".mkv", ".mp4", ".avi", ".mov", ".m4v"}
+
+        with os.scandir(target) as it:
+            for entry in it:
+                if entry.name.startswith(".") and not show_hidden:
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    folders.append({
+                        "name": entry.name,
+                        "path": str(Path(entry.path).relative_to(root_dir)),
+                        "is_dir": True,
+                        "mtime": entry.stat().st_mtime
+                    })
+                elif include_files and entry.is_file():
+                    ext = Path(entry.name).suffix.lower()
+                    if ext in video_exts:
+                        files.append({
+                            "name": entry.name,
+                            "path": str(Path(entry.path).relative_to(root_dir)),
+                            "is_dir": False,
+                            "size": entry.stat().st_size,
+                            "mtime": entry.stat().st_mtime,
+                            "ext": ext
+                        })
+
+        folders.sort(key=lambda e: e["name"].lower())
+        files.sort(key=lambda e: e["name"].lower())
+
+        return {
+            "root": str(root_dir),
+            "current": str(target.relative_to(root_dir)),
+            "count": len(folders) + len(files),
+            "folders": folders,
+            "files": files,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

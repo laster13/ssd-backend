@@ -33,13 +33,13 @@ async def _fetch_tmdb_details(session, tmdb_id: int, lang: str, api_key: str, se
             return await resp.json()
 
 
+# ✅ VERSION CORRIGÉE _build_radarr_index() AVEC IMDb DE RADARR
+
 async def _build_radarr_index(force: bool = False) -> None:
     """
     Construit (ou recharge) l’index Radarr partagé.
-    ⚡ Version optimisée : index léger + catalogue unique.
-    ⚡ Ajout : cache disque persistant (_CACHE_FILE).
-    ⚡ Ajout : parallélisme TMDb (10 max).
-    ⚡ Ajout : enrichissement imdbId via TMDb external_ids.
+    ⚡ Version optimisée + cache disque
+    ⚡ Ajout IMDb via TMDb external_ids + ✅ via Radarr DIRECT
     """
     global _radarr_index, _radarr_catalog, _radarr_host, _last_index_build
     now = time.time()
@@ -54,7 +54,7 @@ async def _build_radarr_index(force: bool = False) -> None:
             return [_sanitize(v) for v in obj]
         return str(obj)
 
-    # --- 1. Lecture depuis cache disque si valide ---
+    # --- 1. Lecture cache disque ---
     if not force and _CACHE_FILE.exists():
         try:
             mtime = _CACHE_FILE.stat().st_mtime
@@ -66,8 +66,7 @@ async def _build_radarr_index(force: bool = False) -> None:
                 _radarr_host = data.get("host")
                 _last_index_build = mtime
                 logger.info(
-                    f"✅ Cache Radarr chargé depuis disque "
-                    f"({len(_radarr_index)} clés, {len(_radarr_catalog)} films)"
+                    f"✅ Cache Radarr chargé ({len(_radarr_index)} clés, {len(_radarr_catalog)} films)"
                 )
                 return
         except Exception as e:
@@ -84,7 +83,7 @@ async def _build_radarr_index(force: bool = False) -> None:
 
         api_key = config_manager.config.tmdb_api_key
         if not api_key:
-            logger.error("❌ Pas de clé TMDb → pas d’ajout FR/EN")
+            logger.error("❌ Pas de clé TMDb")
             return
 
         async with aiohttp.ClientSession() as session:
@@ -96,7 +95,7 @@ async def _build_radarr_index(force: bool = False) -> None:
                 if not tmdb_id:
                     continue
 
-                # --- Index basé sur titre Radarr ---
+                # --- Index basé sur nom radarr ---
                 title = m.get("title") or ""
                 year = m.get("year")
                 cleaned = clean_movie_name(title)
@@ -126,10 +125,20 @@ async def _build_radarr_index(force: bool = False) -> None:
                         "ratings": m.get("ratings"),
                     }
 
-                # --- Prépare les tâches TMDb FR/EN ---
+                # ✅✅✅ AJOUT CRUCIAL ICI ✅✅✅
+                # ---------------------------------------------------------
+                # Récupère IMDb directement depuis Radarr (fiable à 100 %)
+                # ---------------------------------------------------------
+                imdb_direct = m.get("imdbId")
+                if imdb_direct:
+                    catalog[str(tmdb_id)]["imdbId"] = imdb_direct
+                # ---------------------------------------------------------
+
+                # --- Tâches TMDb FR/EN ---
                 for lang in ["en-US", "fr-FR"]:
                     tasks.append(_fetch_tmdb_details(session, tmdb_id, lang, api_key, sem))
 
+            # --- Résultats TMDb ---
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             for details in results:
@@ -143,12 +152,12 @@ async def _build_radarr_index(force: bool = False) -> None:
                 if not tmdb_id or not alt_title:
                     continue
 
-                # --- Enrichissement IMDb ID ---
+                # --- Enrichissement IMDb via TMDb external_ids ---
                 imdb_id = details.get("external_ids", {}).get("imdb_id")
                 if imdb_id and str(tmdb_id) in catalog:
                     catalog[str(tmdb_id)]["imdbId"] = imdb_id
 
-                # --- Ajout d’alias de titres normalisés ---
+                # --- Aliases normalisés ---
                 cleaned_alt = clean_movie_name(alt_title)
                 norm_alt = normalize_name(cleaned_alt)
                 if norm_alt:
@@ -156,7 +165,7 @@ async def _build_radarr_index(force: bool = False) -> None:
                     if year:
                         index[f"{norm_alt}{year}"] = tmdb_id
 
-        # --- Correction des posters relatifs avec host ---
+        # --- Correction poster host ---
         from routers.secure.symlinks import get_traefik_host
         host = get_traefik_host("radarr")
         for meta in catalog.values():
@@ -171,7 +180,7 @@ async def _build_radarr_index(force: bool = False) -> None:
             _radarr_host = host
             _last_index_build = now
 
-        # --- Sauvegarde sur disque ---
+        # --- Sauvegarde ---
         try:
             with open(_CACHE_FILE, "w", encoding="utf-8") as f:
                 json.dump(
@@ -185,14 +194,13 @@ async def _build_radarr_index(force: bool = False) -> None:
                     indent=2,
                 )
             logger.success(
-                f"💾 Cache Radarr sauvegardé ({_CACHE_FILE}) "
-                f"| {len(_radarr_index)} clés, {len(_radarr_catalog)} films"
+                f"💾 Cache Radarr sauvegardé | {len(_radarr_index)} clés, {len(_radarr_catalog)} films"
             )
         except Exception as e:
             logger.warning(f"⚠️ Sauvegarde cache disque échouée : {e}")
 
         logger.success(
-            f"🗂️ Index Radarr prêt: {len(_radarr_index)} clés | {len(_radarr_catalog)} films | host={host}"
+            f"🗂️ Index Radarr prêt : {len(_radarr_index)} clés | {len(_radarr_catalog)} films | host={host}"
         )
 
     except Exception as e:

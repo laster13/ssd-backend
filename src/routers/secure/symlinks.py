@@ -13,6 +13,14 @@ import os
 import httpx
 import docker
 import threading
+from sqlalchemy.orm import Session
+from integrations.seasonarr.db.database import get_db
+from integrations.seasonarr.core.auth import get_current_user
+from integrations.seasonarr.db.models import User
+from integrations.seasonarr.services.season_it_service import SeasonItService
+from integrations.seasonarr.clients.sonarr_client import SonarrClient
+from integrations.seasonarr.db.models import SonarrInstance
+from integrations.seasonarr.db.models import UserSettings
 from datetime import datetime
 from loguru import logger
 from urllib.parse import unquote
@@ -25,7 +33,6 @@ from program.utils.text_utils import normalize_name, clean_movie_name
 from program.utils.discord_notifier import send_discord_message
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from program.file_watcher import start_symlink_watcher
-from services.scan_librairies import LibraryScanner
 from program.utils.imdb import is_missing_imdb 
 from program.radarr_cache import (
     _radarr_index,
@@ -1020,51 +1027,51 @@ async def delete_symlink_sonarr(
         logger.error(f"💥 Erreur inattendue delete_symlink_sonarr : {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Erreur interne : {e}")
 
-# ------------------------------------
-# Suppression en masse (Sonarr, séries)
-# ------------------------------------
+
 @router.post("/delete_broken_sonarr")
 async def delete_broken_sonarr_symlinks(
     folder: Optional[str] = None,
-    sonarr: SonarrService = Depends(SonarrService)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-    logger.info("🚀 Suppression en masse des symlinks Sonarr cassés demandée")
+    logger.info("🚀 Suppression des symlinks Sonarr cassés + réparation SeasonIt")
 
     if not symlink_store:
-        raise HTTPException(status_code=503, detail="Cache vide, lancez un scan d'abord.")
+        raise HTTPException(status_code=503, detail="Cache vide : lancez un scan d'abord.")
 
-    # 📁 Racines Sonarr uniquement (même logique que Radarr)
+    # ----------------------------------------------------------------------
+    # 1) Racines Sonarr
+    # ----------------------------------------------------------------------
     try:
         roots = [
             Path(ld.path).resolve()
             for ld in config_manager.config.links_dirs
-            if getattr(ld, "manager", "") == "sonarr"
+            if ld.manager == "sonarr"
         ]
         root_map = {
             Path(ld.path).name.lower(): Path(ld.path).resolve()
             for ld in config_manager.config.links_dirs
-            if getattr(ld, "manager", "") == "sonarr"
+            if ld.manager == "sonarr"
         }
-        logger.debug(f"📁 Racines Sonarr détectées : {roots}")
-    except Exception as e:
-        logger.error(f"❌ Impossible de lire links_dirs : {e}", exc_info=True)
+    except Exception:
         raise HTTPException(status_code=500, detail="Configuration invalide")
 
     if not roots:
-        logger.warning("⚠️ Aucun dossier racine Sonarr trouvé")
         return {"message": "Aucune racine Sonarr trouvée", "deleted": 0}
 
-    def is_relative_to(child: Path, parent: Path) -> bool:
+    def is_relative(child: Path, parent: Path):
         try:
             child.relative_to(parent)
             return True
-        except Exception:
+        except ValueError:
             return False
 
+    # ----------------------------------------------------------------------
+    # 2) Extraction depuis le STORE
+    # ----------------------------------------------------------------------
     items = list(symlink_store)
-    logger.debug(f"📦 Total symlinks en cache : {len(items)}")
 
-    # 🔍 Filtrage par dossier (identique à Radarr)
+    # Filtre folder
     if folder:
         key = folder.lower()
         if key in root_map:
@@ -1072,372 +1079,141 @@ async def delete_broken_sonarr_symlinks(
         else:
             folder_paths = [(r / folder) for r in roots]
 
-        # Debug ciblé
-        logger.debug(f"🧭 folder='{folder}' | folder_paths={folder_paths}")
-        _sample = items if len(items) <= 200 else items[:200]
-        for i in _sample:
-            child = Path(i["symlink"])
-            for fp in folder_paths:
-                try:
-                    _ = is_relative_to(child, fp)
-                except Exception as e:
-                    logger.debug(f"TEST_ERROR child={child} parent={fp} err={e}")
-
-        before_count = len(items)
+        before = len(items)
         items = [
             i for i in items
-            if any(is_relative_to(Path(i["symlink"]), fp) for fp in folder_paths)
+            if any(is_relative(Path(i["symlink"]), fp) for fp in folder_paths)
         ]
-        logger.debug(f"📁 Filtrage sur '{folder}' — {before_count} → {len(items)} éléments restants")
+        logger.debug(f"📁 Filtre '{folder}' : {before} → {len(items)} éléments")
 
-    # 🎯 Ne garder que les symlinks cassés ET sous les racines Sonarr
-    before_filter = len(items)
+    # ----------------------------------------------------------------------
+    # 3) Symlinks cassés
+    # ----------------------------------------------------------------------
     broken_symlinks = [
         i for i in items
-        if i.get("ref_count", 0) == 0 and any(is_relative_to(Path(i["symlink"]), r) for r in roots)
+        if not i.get("target_exists", True)
+        and any(is_relative(Path(i["symlink"]), r) for r in roots)
     ]
-    logger.debug(f"🧹 Filtre symlinks cassés : {before_filter} → {len(broken_symlinks)}")
+
+    logger.info(f"🧹 {len(broken_symlinks)} symlinks cassés détectés")
 
     if not broken_symlinks:
-        return {"message": "Aucun symlink cassé Sonarr à supprimer", "deleted": 0}
+        return {"message": "Aucun symlink cassé Sonarr", "deleted": 0}
 
-    logger.info(f"🔍 {len(broken_symlinks)} symlinks Sonarr cassés à traiter")
+    # ----------------------------------------------------------------------
+    # 4) Préparation services
+    # ----------------------------------------------------------------------
+    service = SeasonItService(db, current_user.id)
+    FIXED_INSTANCE_ID = 1
 
-    deleted_count = 0
-    errors: list[str] = []
+    instance: SonarrInstance = db.query(SonarrInstance).get(FIXED_INSTANCE_ID)
+    if not instance:
+        raise HTTPException(status_code=500, detail="Instance Sonarr 1 introuvable")
 
-    for item in broken_symlinks:
-        try:
-            symlink_path = Path(item["symlink"])
+    sonarr_client = SonarrClient(
+        base_url=instance.url,
+        api_key=instance.api_key,
+        instance_id=FIXED_INSTANCE_ID,
+    )
 
-            if not any(is_relative_to(symlink_path, r) for r in roots):
-                logger.warning(f"⛔ Chemin interdit (hors racines Sonarr) : {symlink_path}")
-                continue
-
-            if not symlink_path.is_symlink():
-                continue
-
-            # 🧹 Suppression physique
-            logger.debug(f"🧹 Suppression du symlink : {symlink_path}")
-            symlink_path.unlink()
-            logger.info(f"🗑️ Supprimé : {symlink_path}")
-            deleted_count += 1
-
-            # 📂 Identifier la série avec resolve_series
-            series_dir = symlink_path.parent.parent
-            raw_series_name = series_dir.name
-
-            match = sonarr.resolve_series(raw_series_name)
-            if not match:
-                logger.warning(f"❗ Aucune série trouvée (resolve) pour : {raw_series_name}")
-                continue
-
-            series_id = match.get("id")
-            logger.info(f"📺 Série trouvée : {match.get('title', raw_series_name)} (ID={series_id})")
-
-            try:
-                sonarr.refresh_series(series_id)
-                await asyncio.sleep(2)
-            except Exception as e:
-                err_msg = f"{symlink_path}: refresh Sonarr échoué — {e}"
-                logger.error(err_msg)
-                errors.append(err_msg)
-
-            # 📂 Vérifie si la saison est vide
-            season_dir = symlink_path.parent
-            valid_exts = {".mkv", ".mp4", ".m4v"}
-            try:
-                if season_dir.exists() and season_dir.is_dir():
-                    remaining = [
-                        f for f in season_dir.iterdir()
-                        if f.suffix.lower() in valid_exts and f.exists()
-                    ]
-                    logger.debug(f"📂 Fichiers restants dans {season_dir} : {[f.name for f in remaining]}")
-                else:
-                    logger.warning(f"⚠️ Saison introuvable ou inaccessible : {season_dir}")
-                    remaining = None
-            except Exception as e:
-                logger.warning(f"⚠️ Erreur lors du scan du dossier de saison : {e}")
-                remaining = None
-
-            if remaining is not None and not remaining:
-                match_season = re.search(r"(\d{1,2})", season_dir.name)
-                if match_season:
-                    season_number = int(match_season.group(1))
-                    logger.debug(f"🔢 Numéro de saison extrait : {season_number}")
-
-                    try:
-                        async with httpx.AsyncClient(timeout=20.0) as client:
-                            response = await client.post(
-                                "http://localhost:8080/api/v1/symlinks/delete-sonarr-season",
-                                params={"series_name": raw_series_name, "season_number": season_number}
-                            )
-                            if response.status_code != 200:
-                                logger.error(f"❌ Appel API delete-sonarr-season échoué : {response.text}")
-                            else:
-                                logger.info(f"✅ Suppression de la saison {season_number} pour {raw_series_name}")
-                    except Exception as e:
-                        logger.error(f"❌ Erreur appel API : {e}")
-
-        except Exception as e:
-            msg = f"Erreur {item['symlink']}: {str(e)}"
-            logger.error(msg, exc_info=True)
-            errors.append(msg)
-
-    try:
-        sse_manager.publish_event("symlink_update", json.dumps({"event": "refreshed"}))
-    except Exception as e:
-        logger.warning(f"⚠️ Impossible d'envoyer l'événement SSE : {e}")
-
-    return {
-        "message": f"{deleted_count} symlinks Sonarr cassés supprimés",
-        "deleted": deleted_count,
-        "errors": errors
-    }
-
-# ---------------------------------------
-# Réinitialisation d'une saison Sonarr
-# ---------------------------------------
-@router.post("/delete-sonarr-season")
-async def delete_sonarr_season(
-    series_name: str = Query(..., description="Nom complet de la série"),
-    season_number: int = Query(..., description="Numéro de la saison"),
-    sonarr: SonarrService = Depends(SonarrService)
-):
-    logger.info(f"🔁 [delete-sonarr-season] Traitement saison {season_number} pour : {series_name}")
-
-    try:
-        # ✅ Résolution directe avec resolve_series
-        series = sonarr.resolve_series(series_name)
-        if not series:
-            logger.warning(f"❗ Série introuvable dans Sonarr pour : {series_name}")
-            raise HTTPException(status_code=404, detail="Série introuvable")
-
-        series_id = series["id"]
-        logger.info(f"📺 Série trouvée : {series['title']} (ID={series_id})")
-
-        # 🔄 Refresh + relancer recherche
-        sonarr.refresh_series(series_id)
-        await asyncio.sleep(2)
-        sonarr.search_missing_episodes(series_id)
-        logger.info(f"📥 Recherche manuelle lancée pour : {series['title']}")
-        await asyncio.sleep(3)
-
-        # 📂 Vérification des dossiers de saison
-        try:
-            sonarr_roots = [
-                Path(ld.path) for ld in config_manager.config.links_dirs
-                if getattr(ld, "manager", "") == "sonarr"
-            ]
-        except Exception as e:
-            logger.error(f"❌ Impossible de lire links_dirs : {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail="Configuration invalide")
-
-        if not sonarr_roots:
-            raise HTTPException(status_code=404, detail="Aucune racine Sonarr trouvée")
-
-        def is_under(child: Path, parent: Path) -> bool:
-            try:
-                child.relative_to(parent)
-                return True
-            except ValueError:
-                return False
-
-        # 🔍 Trouver le dossier série (FR OU EN accepté)
-        series_dir = None
-        for root in sonarr_roots:
-            if not root.exists():
-                continue
-            for d in root.iterdir():
-                if not d.is_dir():
-                    continue
-                if (
-                    normalize_name(d.name) == normalize_name(series["title"])  # titre officiel Sonarr (souvent EN)
-                    or normalize_name(d.name) == normalize_name(series_name)  # titre venant du symlink (FR possible)
-                ) and is_under(d, root):
-                    series_dir = d
-                    break
-            if series_dir:
-                break
-
-        if not series_dir:
-            logger.error(f"❌ Répertoire série introuvable pour {series_name} (attendu : {series['title']})")
-            raise HTTPException(status_code=404, detail="Répertoire série introuvable")
-
-        logger.debug(f"📁 Répertoire série trouvé : {series_dir}")
-
-        # 🔍 Trouver la saison
-        season_dir = next((d for d in series_dir.glob(f"*{season_number:02d}*") if d.is_dir()), None)
-        if not season_dir:
-            raise HTTPException(status_code=404, detail="Répertoire saison introuvable")
-
-        logger.debug(f"📁 Répertoire saison trouvé : {season_dir}")
-
-        # 📂 Vérifier si fichiers restants
-        valid_exts = {".mkv", ".mp4", ".m4v"}
-        remaining_files = [f for f in season_dir.iterdir() if f.is_file() and f.suffix.lower() in valid_exts]
-
-        if remaining_files:
-            return {
-                "message": f"Recherche relancée pour la saison {season_number} de {series['title']}. Fichiers présents."
-            }
-
-        # 🚮 Aucun fichier → purge
-        logger.warning(f"🚫 Aucun fichier vidéo trouvé dans la saison {season_number} — suppression dossiers/fichiers résiduels")
-        for f in season_dir.iterdir():
-            try:
-                if f.is_file() or f.is_symlink():
-                    f.unlink()
-                elif f.is_dir():
-                    shutil.rmtree(f, ignore_errors=True)
-                logger.info(f"🗑️ Supprimé : {f}")
-            except Exception as e:
-                logger.warning(f"⚠️ Échec suppression {f} : {e}")
-
-        # 🔄 Refresh + recherche complète
-        sonarr.refresh_series(series_id)
-        await asyncio.sleep(2)
-        sonarr.search_missing_episodes(series_id)
-
-        return {
-            "message": f"✅ Saison {season_number} réinitialisée pour {series['title']} — recherche complète relancée"
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"⚠️ Erreur traitement saison {season_number} de {series_name} : {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Erreur traitement saison Sonarr")
-
-# ---------------------------------------
-# Réparation des saisons manquantes (SSE)
-# ---------------------------------------
-@router.post("/repair-missing-seasons")
-async def repair_missing_seasons(
-    folder: Optional[str] = None,
-    sonarr: SonarrService = Depends(SonarrService)
-):
-    logger.info("🛠️ Réparation des saisons manquantes demandée")
-
-    if not symlink_store:
-        raise HTTPException(status_code=503, detail="Cache vide, lancez un scan d'abord.")
-
-    try:
-        sonarr_roots = [
-            Path(ld.path) for ld in config_manager.config.links_dirs
-            if getattr(ld, "manager", "") == "sonarr"
-        ]
-    except Exception as e:
-        logger.error(f"❌ Impossible de lire links_dirs : {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Configuration invalide")
-
-    if not sonarr_roots:
-        return {"message": "Aucune racine Sonarr trouvée", "symlinks_deleted": 0}
-
-    def is_under(child: Path, parent: Path) -> bool:
-        try:
-            child.relative_to(parent)
-            return True
-        except ValueError:
-            return False
-
-    items = list(symlink_store)
-    if folder:
-        folder_paths = [(root / folder) for root in sonarr_roots]
-        items = [i for i in items if any(is_under(Path(i["symlink"]), fp) for fp in folder_paths)]
-        logger.debug(f"📁 Filtrage sur dossier '{folder}' — {len(items)} éléments restants")
+    local_resolver = SonarrService()
+    season_regex = re.compile(r"(?:saison|season)\s*0?(\d{1,2})", re.IGNORECASE)
 
     deleted_count = 0
     errors = []
+    tasks = []  # (series_id, title, season_number)
 
-    try:
-        missing_list = sonarr.get_all_series_with_missing_seasons()
-    except Exception as e:
-        logger.error(f"❌ Erreur récupération séries Sonarr : {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Erreur récupération des séries avec saisons manquantes")
-
-    for entry in missing_list:
-        series_id = entry["id"]
-        series_title = entry["title"]
-        raw_missing_seasons = [s for s in entry.get("missing_seasons", []) if s != 0]
-
-        if not raw_missing_seasons:
-            continue
-
-        logger.info(f"   '{series_title}' - Saisons manquantes : {raw_missing_seasons}")
+    # ----------------------------------------------------------------------
+    # 5) PHASE 1 : suppression + collecte des tâches SeasonIt
+    # ----------------------------------------------------------------------
+    for item in broken_symlinks:
+        symlink_path = Path(item["symlink"])
 
         try:
-            all_episodes = sonarr.get_all_episodes(series_id)
-        except Exception as e:
-            logger.error(f"❌ Erreur récupération épisodes pour '{series_title}': {e}", exc_info=True)
-            errors.append(f"{series_title} - episodes")
-            continue
-
-        confirmed_missing = []
-        for season_num in raw_missing_seasons:
-            season_eps = [ep for ep in all_episodes if ep.get("seasonNumber") == season_num]
-            if not season_eps:
-                confirmed_missing.append(season_num)
+            # Suppression physique
+            if symlink_path.is_symlink():
+                symlink_path.unlink(missing_ok=True)
+                logger.info(f"🗑️ Suppression symlink : {symlink_path}")
+                deleted_count += 1
+            else:
                 continue
-            future_eps = [
-                ep for ep in season_eps
-                if ep.get("airDateUtc") and ep["airDateUtc"] > datetime.utcnow().isoformat()
-            ]
-            if not future_eps:
-                confirmed_missing.append(season_num)
 
-        if not confirmed_missing:
-            continue
+            # Résolution série
+            season_dir = symlink_path.parent
+            series_dir = season_dir.parent
+            raw_series = series_dir.name
 
-        # ✅ Filtrage des symlinks : on ne passe plus par normalize_name
-        # On compare directement avec le dossier parent de symlink (nom série dans symlink)
-        def match_path(path_str: str) -> bool:
-            return Path(path_str).parent.parent.name.lower() == series_title.lower()
+            resolved = local_resolver.resolve_series(raw_series)
+            if not resolved:
+                errors.append(f"{symlink_path}: série '{raw_series}' non trouvée")
+                continue
 
-        matching_items = [i for i in items if match_path(i["symlink"])]
-        if not matching_items:
-            continue
+            series_id = resolved["id"]
 
-        for season_num in confirmed_missing:
-            logger.debug(f"🔍 Saison {season_num} pour '{series_title}' (ID={series_id})")
-            pattern = f"S{season_num:02}"
-            filtered_symlinks = [
-                i for i in matching_items if pattern.lower() in i["symlink"].lower()
-            ]
+            # Détecter saison
+            m = season_regex.search(season_dir.name)
+            if not m:
+                errors.append(f"{symlink_path}: saison introuvable")
+                continue
 
-            for item in filtered_symlinks:
-                symlink_path = Path(item["symlink"])
+            season_number = int(m.group(1))
 
-                if not any(is_under(symlink_path, root) for root in sonarr_roots):
-                    continue
+            # Stocker la tâche à exécuter plus tard
+            tasks.append((series_id, resolved["title"], season_number))
 
-                try:
-                    if symlink_path.exists() and symlink_path.is_symlink():
-                        symlink_path.unlink()
-                        logger.info(f"🗑️ Symlink supprimé : {symlink_path}")
-                        deleted_count += 1
-                except Exception as e:
-                    logger.warning(f"⚠️ Erreur suppression symlink {symlink_path}: {e}")
-                    errors.append(str(symlink_path))
+            # Event SSE immédiat (symlink supprimé)
+            payload = {
+                "event": "sonarr_symlink_removed",
+                "path": str(symlink_path),
+                "series": {"id": series_id, "title": resolved["title"]},
+                "season": season_number,
+            }
+            sse_manager.publish_event("symlink_update", payload)
 
-            try:
-                sonarr.refresh_series(series_id)
-                await asyncio.sleep(2)
-                sonarr.search_season(series_id=series_id, season_number=season_num)
-                logger.info(f"📥 Recherche relancée pour S{season_num:02} de '{series_title}'")
-            except Exception as e:
-                logger.error(f"❌ Échec recherche saison {season_num} de '{series_title}' : {e}", exc_info=True)
-                errors.append(f"{series_title} - S{season_num:02}")
+        except Exception as e:
+            errors.append(f"{symlink_path}: {e}")
 
-    try:
-        sse_manager.publish_event("symlink_update", json.dumps({"event": "refreshed"}))
-    except Exception as e:
-        logger.warning(f"⚠️ Impossible d'envoyer l'événement SSE : {e}")
+    # ----------------------------------------------------------------------
+    # 6) PHASE 2 : Refresh Sonarr pour toutes les séries
+    # ----------------------------------------------------------------------
+    unique_series = {series_id for (series_id, _, _) in tasks}
 
+    for sid in unique_series:
+        try:
+            logger.info(f"🔄 Refresh Sonarr pour série ID={sid}")
+            local_resolver.refresh_series(sid)
+            await asyncio.sleep(3)
+        except Exception as e:
+            logger.warning(f"⚠️ Refresh failed for {sid}: {e}")
+
+    # ----------------------------------------------------------------------
+    # 7) PHASE 3 : SeasonIt
+    # ----------------------------------------------------------------------
+
+    # Forcer le mode SAFE
+    settings = db.query(UserSettings).filter(UserSettings.user_id == current_user.id).first()
+    if settings:
+        settings.skip_episode_deletion = True
+        settings.disable_season_pack_check = True
+        db.commit()
+        db.refresh(settings)
+        logger.info(f"🛡️ Mode SAFE activé : skip_episode_deletion=True pour user={current_user.id}")
+
+    for (series_id, title, season_number) in tasks:
+        try:
+            logger.info(f"🎬 SeasonIt: {title} S{season_number}")
+            await service.process_season_it(series_id, season_number, FIXED_INSTANCE_ID)
+
+        except Exception as e:
+            errors.append(f"{title} S{season_number} : SeasonIt failed — {e}")
+
+    # ----------------------------------------------------------------------
+    # FIN
+    # ----------------------------------------------------------------------
     return {
-        "message": "Saisons manquantes traitées",
-        "symlinks_deleted": deleted_count,
-        "errors": errors
+        "message": f"{deleted_count} symlinks supprimés (Sonarr) + SeasonIt exécuté",
+        "deleted": deleted_count,
+        "errors": errors,
     }
 
 # -----------------

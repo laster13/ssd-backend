@@ -276,7 +276,7 @@ class SymlinkEventHandler(FileSystemEventHandler):
                     "path": str(symlink_path),
                     "manager": manager
                 })
-                logger.info(f"🧩 Broken supprimé de la base : {symlink_path}")
+                logger.info(f"🧩 Symlink Brisé -> Réparé et supprimé de la base : {symlink_path}")
 
             # ───────────────────────────────
             # 6. Enregistrement créé
@@ -761,8 +761,41 @@ def start_symlink_watcher():
         symlink_store.extend(symlinks_data)
         logger.success(f"✔️ Scan initial terminé — {len(symlinks_data)} symlinks chargés")
 
+        try:
+            import docker
+            from datetime import datetime, timezone
+
+            client = docker.from_env()
+
+            container = client.containers.get("decypharr")
+            state = container.attrs["State"]
+            status = state.get("Status", "").lower()
+            started_at = state.get("StartedAt")
+
+            start_time = None
+            if started_at and started_at not in ("", None):
+                start_time = datetime.strptime(
+                    started_at.split(".")[0],
+                    "%Y-%m-%dT%H:%M:%S"
+                ).replace(tzinfo=timezone.utc)
+
+            # 1️⃣ Si pas running → on attend
+            if status != "running":
+                logger.warning(f"⏸️ Symlink watcher en pause : Decypharr status = {status}")
+                time.sleep(60)
+
+            # 2️⃣ Si uptime < 120 sec → on attend aussi
+            if start_time:
+                uptime = (datetime.now(timezone.utc) - start_time).total_seconds()
+                if uptime < 120:
+                    logger.info(f"⏳ Decypharr actif depuis {int(uptime)}s — report du scan initial...")
+                    time.sleep(120 - int(uptime))
+
+        except Exception as e:
+            logger.warning(f"⚠️ Impossible de vérifier l’état du conteneur Decypharr : {e}")
+
         # 🧹 Process orphelins initial (scan + suppression)
-        # run_orphans_process()
+        run_orphans_process()
 
         # --- 5️⃣ Fin du scan initial ---
         sse_manager.publish_event("symlink_update", {
@@ -999,7 +1032,7 @@ def start_periodic_orphans_task(interval_hours: float = 24.0):
     def loop():
         logger.info(
             f"🧹 Tâche périodique orphelins démarrée "
-            f"(premier run dans {interval_hours}h, puis toutes les {interval_hours}h)..."
+            f"(premier run immédiat, puis toutes les {interval_hours}h)..."
         )
 
         # ⏳ On attend d'abord un intervalle complet pour ne pas doubler le run initial

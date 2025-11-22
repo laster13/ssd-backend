@@ -303,7 +303,6 @@ class SonarrClient:
                     "seasonNumber": season_number
                 }
                 
-                logger.info(f"Triggering SeasonSearch command for series {series_id} season {season_number}")
                 response = await client.post(
                     f"{self.base_url}/api/v3/command",
                     headers=self.headers,
@@ -315,11 +314,9 @@ class SonarrClient:
                     raise Exception(f"SeasonSearch command failed: {response.status_code}")
                 
                 command_id = response.json()["id"]
-                logger.info(f"Commande SeasonSearch {command_id} soumise avec succès")
                 
                 # Wait for the command to complete
                 await self._wait_for_command(command_id)
-                logger.info(f"Commande SeasonSearch {command_id} complète")
                 
                 return command_id
                 
@@ -638,7 +635,22 @@ class SonarrClient:
                     raise Exception(f"Échec de la récupération des épisodes : {response.status_code}")
                 
                 episodes = response.json()
-                logger.info(f"Récupération {len(episodes)} episodes pour la série {series_id}")
+
+                # Get series title
+                series_title = f"ID {series_id}"
+                try:
+                    series_response = await client.get(
+                        f"{self.base_url}/api/v3/series/{series_id}",
+                        headers=self.headers,
+                        timeout=10.0
+                    )
+                    if series_response.status_code == 200:
+                        series_data = series_response.json()
+                        series_title = series_data.get("title", series_title)
+                except Exception as e:
+                    logger.warning(f"Impossible de récupérer le titre de la série {series_id} : {e}")
+
+                logger.info(f"Récupération de {len(episodes)} épisodes pour la série '{series_title}'")
                 
                 # Filter episodes based on criteria
                 missing_episodes = []

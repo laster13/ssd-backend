@@ -17,7 +17,7 @@ class SeasonItService:
         self.user_id = user_id
 
     def _create_activity_log(self, instance_id: int, show_id: int, show_title: str, season_number: Optional[int] = None) -> ActivityLog:
-        """Créer une nouvelle entrée dans le journal d’activité"""
+        """Create a new activity log entry"""
         activity = ActivityLog(
             user_id=self.user_id,
             instance_id=instance_id,
@@ -26,55 +26,15 @@ class SeasonItService:
             show_title=show_title,
             season_number=season_number,
             status="in_progress",
-            message=f"🚀 Début de la recherche pour {show_title}" + (f" Saison {season_number}" if season_number else " (Toutes les saisons)")
+            message=f"Started Season It for {show_title}" + (f" Season {season_number}" if season_number else " (All Seasons)")
         )
         self.db.add(activity)
         self.db.commit()
         self.db.refresh(activity)
         return activity
 
-    def _filter_approved_releases(self, releases):
-        """Ne garder que les releases approuvées par Sonarr (required terms OK)."""
-        releases = [r for r in releases if isinstance(r, dict)]
-        total = len(releases)
-
-        filtered = [r for r in releases if r.get("approved", False) is True]
-        rejected = total - len(filtered)
-
-        if rejected > 0:
-            sample = []
-            for r in releases:
-                if r.get("approved", False) is True:
-                    continue
-
-                rej = r.get("rejections", [])
-
-                # Normaliser en liste
-                if isinstance(rej, (str, dict)):
-                    rej = [rej]
-                elif not isinstance(rej, list):
-                    rej = [str(rej)]
-
-                reason = "Unknown rejection"
-                if rej:
-                    first = rej[0]
-                    if isinstance(first, dict):
-                        reason = first.get("reason") or first.get("message") or str(first)
-                    elif isinstance(first, str):
-                        reason = first
-                    else:
-                        reason = str(first)
-
-                sample.append(reason)
-                if len(sample) >= 3:
-                    break
-
-            logger.info(f"Filtré {rejected}/{total} releases non approuvées. Exemples : {sample}")
-
-        return filtered
-
     def _update_activity_log(self, activity: ActivityLog, status: str, message: str = None, error_details: str = None):
-        """Mettre à jour une entrée du journal d’activité"""
+        """Update an activity log entry"""
         activity.status = status
         if message:
             activity.message = message
@@ -87,28 +47,28 @@ class SeasonItService:
     async def process_season_it(self, show_id: int, season_number: Optional[int] = None, instance_id: Optional[int] = None) -> Dict[str, Any]:
         activity = None
         try:
-            # Récupérer les données de la série pour inclure l’affiche
+            # Get series data first so we can include poster info
             instance = self._get_sonarr_instance_by_id(instance_id) if instance_id else self._get_sonarr_instance(show_id)
             if not instance:
-                raise Exception("Aucune instance Sonarr trouvée pour cette série")
+                raise Exception("No Sonarr instance found for this show")
 
             client = SonarrClient(instance.url, instance.api_key, instance.id)
             series_data = await self._get_series_data(client, show_id)
-            show_title = series_data.get("title", "Série inconnue")
+            show_title = series_data.get("title", "Unknown Show")
             poster_url = client._get_banner_url(series_data.get("images", []), client.instance_id)
 
-            # Envoyer une mise à jour de progression améliorée
+            # Send enhanced progress update instead of regular one
             await manager.send_enhanced_progress_update(
                 self.user_id, 
                 show_title,
                 "season_it_single" if season_number else "season_it_all",
-                "🚀 Initialisation du processus Season It...", 
+                "🚀 Initializing Season It process...", 
                 10,
-                current_step="Initialisation",
+                current_step="Initialize",
                 details={"poster_url": poster_url, "season_number": season_number}
             )
 
-            # Créer une entrée dans le journal d’activité
+            # Create activity log entry
             activity = self._create_activity_log(instance.id, show_id, show_title, season_number)
 
             if season_number:
@@ -116,72 +76,72 @@ class SeasonItService:
             else:
                 result = await self._process_all_seasons(client, show_id, show_title, series_data)
 
-            # Mettre à jour le journal d’activité en cas de succès
+            # Update activity log on success
             self._update_activity_log(
                 activity, 
                 "success", 
-                f"Saison récupérée avec succès pour {show_title}" + (f" Saison {season_number}" if season_number else " (Toutes les saisons)")
+                f"Season It completed successfully for {show_title}" + (f" Season {season_number}" if season_number else " (All Seasons)")
             )
             
             return result
 
         except Exception as e:
-            # Mettre à jour le journal d’activité en cas d’erreur
+            # Update activity log on error
             if activity:
                 self._update_activity_log(
                     activity, 
                     "error", 
-                    f"Échec de Season It pour {activity.show_title}",
+                    f"Season It failed for {activity.show_title}",
                     str(e)
                 )
             
             await manager.send_enhanced_progress_update(
                 self.user_id, 
-                activity.show_title if activity else "Série inconnue",
+                activity.show_title if activity else "Unknown Show",
                 "season_it_error",
-                f"❌ Échec de Season It : {str(e)}", 
+                f"❌ Season It failed: {str(e)}", 
                 100, 
                 "error",
-                current_step="Erreur",
+                current_step="Error",
                 details={"error": str(e)}
             )
             raise
 
     async def _process_single_season_with_data(self, client: SonarrClient, show_id: int, season_number: int, show_title: str, series_data: Dict) -> Dict[str, Any]:
-        """Traitement amélioré d'une saison unique avec suivi détaillé de la progression (15+ étapes)"""
+        """Enhanced single season processing with detailed progress tracking (15+ steps)"""
         
-        # Récupérer l’URL de l’affiche à partir des données de la série
+        # Get poster URL from the series data
         poster_url = client._get_poster_url(series_data.get("images", []), client.instance_id)
         
         return await self._process_single_season(client, show_id, season_number, show_title, poster_url, series_data)
 
     async def _process_single_season(self, client: SonarrClient, show_id: int, season_number: int, show_title: str, poster_url: str = None, series_data: Dict = None) -> Dict[str, Any]:
-        """Traitement amélioré d'une saison unique avec suivi détaillé de la progression (15+ étapes)"""
+        """Enhanced single season processing with detailed progress tracking (15+ steps)"""
         
-        # Si les données de la série ne sont pas fournies, les récupérer
+        # If series_data is not provided, fetch it
         if series_data is None:
             series_data = await self._get_series_data(client, show_id)
             poster_url = client._get_banner_url(series_data.get("images", []), client.instance_id)
         
-        # Étape 1 : Initialiser le processus
+        # Step 1: Initialize process
         await manager.send_enhanced_progress_update(
             self.user_id, 
             show_title,
             "season_it_single",
-            f"🔄 Initialisation de Season It pour {show_title} Saison {season_number}...", 
+            f"🔄 Initializing Season It for {show_title} Season {season_number}...", 
             5,
-            current_step="Initialisation",
+            current_step="Initialize",
             details={"poster_url": poster_url, "season_number": season_number}
         )
         
-        # Étape 2 : Vérifier la présence d’épisodes futurs
+        # Step 2: Check for future episodes
         await manager.send_enhanced_progress_update(
             self.user_id, 
             show_title,
             "season_it_single",
-            f"📅 Vérification si la Saison {season_number} contient des épisodes non diffusés...", 
+            f"📅 Checking if Season {season_number} has unaired episodes...", 
             8,
-            current_step="Vérification épisodes futurs",
+            current_step="Check Future Episodes",
             details={"poster_url": poster_url, "season_number": season_number}
         )
         
@@ -191,325 +151,316 @@ class SeasonItService:
                 self.user_id, 
                 show_title,
                 "season_it_single",
-                f"⏳ La saison {season_number} de '{show_title}' contient des épisodes qui n’ont pas encore été diffusés. Season It est ignoré afin d’éviter les packs de saison incomplets.", 
+                f"⏳ Season {season_number} of '{show_title}' has episodes that haven't aired yet. Skipping Season It to avoid incomplete season packs.", 
                 100, 
                 "warning",
-                current_step="Terminé",
+                current_step="Complete",
                 details={"poster_url": poster_url, "season_number": season_number}
             )
-            return {"status": "incomplete_season", "message": "La saison contient des épisodes non diffusés"}
+            return {"status": "incomplete_season", "message": "Season has episodes that haven't aired yet"}
         
-        # Étape 3 : Valider les données de la série
+        # Step 3: Validate series data
         await manager.send_enhanced_progress_update(
             self.user_id, 
             show_title,
             "season_it_single",
-            f"📋 Validation des données de la série {show_title}...", 
+            f"📋 Validating series data for {show_title}...", 
             10,
-            current_step="Validation des données",
+            current_step="Validate Data",
             details={"poster_url": poster_url, "season_number": season_number}
         )
         
-        # Étape 4 : Vérifier les épisodes manquants
+        # Step 4: Check for missing episodes
         await manager.send_enhanced_progress_update(
             self.user_id, 
             show_title,
             "season_it_single",
-            f"🔍 Analyse des épisodes manquants dans la Saison {season_number}...", 
+            f"🔍 Scanning for missing episodes in Season {season_number}...", 
             15,
-            current_step="Analyse épisodes",
+            current_step="Scan Episodes",
             details={"poster_url": poster_url, "season_number": season_number}
         )
 
         missing_data = await client.get_missing_episodes(show_id, season_number)
         seasons_with_missing = missing_data.get("seasons_with_missing", {})
+        missing_episodes = seasons_with_missing.get(season_number, [])
 
-        missing_count = len(seasons_with_missing.get(season_number, []))
-        episode_nums = [ep.get("episodeNumber") for ep in seasons_with_missing.get(season_number, [])]
-
-        logger.info(
-            f"Épisodes manquants pour série {show_id} saison {season_number} : "
-            f"{missing_count} épisodes ({episode_nums})"
-        )
-
+        missing_list = [
+            f"S{ep['seasonNumber']:02d}E{ep['episodeNumber']:02d} - {ep['title']}"
+            for ep in missing_episodes
+        ]
+        
+        logger.info(f"Episodes manquant pour la serie {show_title} season {season_number}: {missing_list}")
+        
         if season_number not in seasons_with_missing:
             await manager.send_enhanced_progress_update(
                 self.user_id, 
                 show_title,
                 "season_it_single",
-                f"✅ La saison {season_number} de '{show_title}' n'a pas d'épisodes manquants", 
+                f"✅ Season {season_number} of '{show_title}' has no missing episodes", 
                 100, 
                 "warning",
-                current_step="Terminé",
+                current_step="Complete",
                 details={"poster_url": poster_url, "season_number": season_number}
             )
-            return {"status": "no_missing_episodes", "message": "Aucun épisode trouvé"}
+            return {"status": "no_missing_episodes", "message": "No missing episodes found"}
 
         missing_count = len(seasons_with_missing[season_number])
         
-        # Étape 4 : Charger les paramètres utilisateur
+        # Step 4: Load user settings
         await manager.send_enhanced_progress_update(
             self.user_id, 
             show_title,
             "season_it_single",
-            f"⚙️ Chargement des préférences et paramètres utilisateur...", 
+            f"⚙️ Loading user preferences and settings...", 
             20,
-            current_step="Chargement paramètres",
+            current_step="Load Settings",
             details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count}
         )
         
         settings = self.db.query(UserSettings).filter(UserSettings.user_id == self.user_id).first()
         skip_season_pack_check = settings and settings.disable_season_pack_check
         
-        # Étape 6 : Déterminer la stratégie de traitement
+        # Step 5: Determine processing strategy
         await manager.send_enhanced_progress_update(
             self.user_id, 
             show_title,
             "season_it_single",
-            f"🎯 Détermination de la stratégie de traitement optimale pour {missing_count} épisodes manquants...", 
+            f"🎯 Determining optimal processing strategy for {missing_count} missing episodes...", 
             25,
-            current_step="Stratégie",
+            current_step="Strategy",
             details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count}
         )
         
         if skip_season_pack_check:
-            # Stratégie : ignorer la recherche de pack de saison
+            # Strategy: Skip season pack search
             await manager.send_enhanced_progress_update(
                 self.user_id, 
                 show_title,
                 "season_it_single",
-                f"📝 Vérification des packs de saison désactivée – utilisation de la stratégie de recherche classique…", 
+                f"📝 Season pack check disabled - using regular search strategy...", 
                 30,
-                current_step="Ignorer Pack Saison",
+                current_step="Skip Season Pack",
                 details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count}
             )
             
             if settings and settings.skip_episode_deletion:
-                # Étape 7a : Ignorer la suppression d’épisodes
+                # Step 6a: Skip deletion path
                 await manager.send_enhanced_progress_update(
                     self.user_id, 
                     show_title,
                     "season_it_single",
-                    f"⚠️ Suppression des épisodes ignorée selon les paramètres utilisateur...", 
+                    f"⚠️ Skipping episode deletion as per user settings...", 
                     35,
-                    current_step="Ignorer Suppression",
+                    current_step="Skip Deletion",
                     details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count}
                 )
-                logger.info(f"Recherche de pack de saison et suppression d’épisodes ignorées pour la série {show_id} saison {season_number} en raison des paramètres utilisateur")
+                logger.info(f"Pas de recherche de pack pour la série {show_title} season {season_number}")
             else:
-                # Étape 7b : Supprimer les épisodes
+                # Step 6b: Delete episodes path
                 await manager.send_enhanced_progress_update(
                     self.user_id, 
                     show_title,
                     "season_it_single",
-                    f"🗑️ Préparation à la suppression de {missing_count} épisodes individuels…", 
+                    f"🗑️ Preparing to delete {missing_count} individual episodes...", 
                     35,
-                    current_step="Préparer Suppression",
+                    current_step="Prepare Deletion",
                     details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count}
                 )
                 
-                # Étape 8 : Exécuter la suppression
+                # Step 7: Execute deletion
                 await manager.send_enhanced_progress_update(
                     self.user_id, 
                     show_title,
                     "season_it_single",
-                    f"🧹 Suppression des épisodes existants de la saison {season_number}...", 
+                    f"🧹 Deleting existing episodes from Season {season_number}...", 
                     40,
-                    current_step="Exécuter Suppression",
+                    current_step="Execute Deletion",
                     details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count}
                 )
                 
-                logger.info(f"Suppression des épisodes pour la série {show_id} saison {season_number}")
+                logger.info(f"Suppression des épisodes pour la série {show_title} saison {season_number}")
                 await client.delete_season_episodes(show_id, season_number)
                 
-                # Étape 9 : Confirmer la suppression
+                # Step 8: Confirm deletion
                 await manager.send_enhanced_progress_update(
                     self.user_id, 
                     show_title,
                     "season_it_single",
-                    f"✅ Suppression des épisodes terminée avec succès…", 
+                    f"✅ Episode deletion completed successfully...", 
                     45,
-                    current_step="Confirmer Suppression",
+                    current_step="Confirm Deletion",
                     details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count}
                 )
         else:
-            # Stratégie : vérifier d’abord la présence de packs de saison
+            # Strategy: Check for season packs first
             await manager.send_enhanced_progress_update(
                 self.user_id, 
                 show_title,
                 "season_it_single",
-                f"🔍 Recherche de packs de saison disponibles…", 
+                f"🔍 Searching for available season packs...", 
                 30,
-                current_step="Recherche Pack Saison",
+                current_step="Search Season Packs",
                 details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count}
             )
 
-            # Étape 7 : Recherche de packs de saison
+            # Step 6: Search for season packs
+            logger.info(f"Searching for season packs for series {show_id} season {season_number}")
             releases = await client._get_releases(show_id, season_number)
-            logger.info(f"Found {len(releases)} season packs (raw)")
-
-            if not all(isinstance(r, dict) for r in releases):
-                logger.error(f"❌ Données inattendues dans releases: {[type(r).__name__ for r in releases]}")
-                releases = [r for r in releases if isinstance(r, dict)]
-
-            releases = self._filter_approved_releases(releases)
-            logger.info(f"{len(releases)} season packs after approved filter")
-
+            logger.info(f"Found {len(releases)} season packs")
             
-            # Étape 8 : Analyse des résultats des packs de saison
+            # Step 7: Analyze season pack results
             await manager.send_enhanced_progress_update(
                 self.user_id, 
                 show_title,
                 "season_it_single",
-                f"📊 Analyse en cours de {len(releases)} packs de saison disponibles…", 
+                f"📊 Analyzing {len(releases)} available season packs...", 
                 35,
-                current_step="Analyser Packs Saison",
+                current_step="Analyze Season Packs",
                 current_step_number=7,
                 total_steps=17,
                 details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count, "releases_found": len(releases)}
             )
             
             if not releases:
-                # Étape 9a : Aucun pack de saison trouvé
+                # Step 8a: No season packs found
                 await manager.send_enhanced_progress_update(
                     self.user_id, 
                     show_title,
                     "season_it_single",
-                    f"❌ Aucun pack de saison trouvé – retour à la recherche classique…", 
+                    f"❌ No season packs found - falling back to regular search...", 
                     40, 
                     "warning",
-                    current_step="Aucun Pack Saison",
+                    current_step="No Season Packs",
                     details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count}
                 )
             else:
-                # Étape 9b : Packs de saison trouvés
+                # Step 8b: Season packs found
                 await manager.send_enhanced_progress_update(
                     self.user_id, 
                     show_title,
                     "season_it_single",
-                    f"🎯 Packs de saison adaptés trouvés – préparation à l’optimisation…", 
+                    f"🎯 Found suitable season packs - preparing for optimization...", 
                     40,
-                    current_step="Packs Saison Trouvés",
+                    current_step="Season Packs Found",
                     details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count, "releases_found": len(releases)}
                 )
                 
                 if settings and settings.skip_episode_deletion:
-                    # Étape 10a : Ignorer suppression avec packs de saison
+                    # Step 9a: Skip deletion with season packs
                     await manager.send_enhanced_progress_update(
                         self.user_id, 
                         show_title,
                         "season_it_single",
-                        f"⚠️ Suppression des épisodes ignorée conformément aux paramètres utilisateur…", 
+                        f"⚠️ Skipping episode deletion as per user settings...", 
                         45,
-                        current_step="Ignorer Suppression",
+                        current_step="Skip Deletion",
                         details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count}
                     )
-                    logger.info(f"Suppression des épisodes ignorée pour la série {show_id} saison {season_number} en raison des paramètres utilisateur")
+                    logger.info(f"Skipping episode deletion for series {show_id} season {season_number} due to user settings")
                 else:
-                    # Étape 10b : Supprimer épisodes avec packs de saison
+                    # Step 9b: Delete episodes with season packs
                     await manager.send_enhanced_progress_update(
                         self.user_id, 
                         show_title,
                         "season_it_single",
-                        f"🗑️ Préparation à la suppression de {missing_count} épisodes individuels...", 
+                        f"🗑️ Preparing to delete {missing_count} individual episodes...", 
                         45,
-                        current_step="Préparer Suppression",
+                        current_step="Prepare Deletion",
                         details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count}
                     )
 
-                    # Étape 11 : Exécuter la suppression
+                    # Step 10: Execute deletion
                     await manager.send_enhanced_progress_update(
                         self.user_id, 
                         show_title,
                         "season_it_single",
-                        f"🧹 Suppression des épisodes existants de la saison {season_number}...", 
+                        f"🧹 Deleting existing episodes from Season {season_number}...", 
                         50,
-                        current_step="Exécuter Suppression",
+                        current_step="Execute Deletion",
                         details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count}
                     )
                     
-                    logger.info(f"Suppression des épisodes existants pour la série {show_id} saison {season_number}")
+                    logger.info(f"Deleting existing episodes for series {show_id} season {season_number}")
                     await client.delete_season_episodes(show_id, season_number)
 
-                    # Étape 12 : Confirmer la suppression
+                    # Step 11: Confirm deletion
                     await manager.send_enhanced_progress_update(
                         self.user_id, 
                         show_title,
                         "season_it_single",
-                        f"✅ Suppression des épisodes terminée avec succès...", 
+                        f"✅ Episode deletion completed successfully...", 
                         55,
-                        current_step="Confirmer Suppression",
+                        current_step="Confirm Deletion",
                         details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count}
                     )
 
-        # Étape 12 : Préparer la commande de recherche
+        # Step 12: Prepare search command
         await manager.send_enhanced_progress_update(
             self.user_id, 
             show_title,
             "season_it_single",
-            f"🎬 Préparation de la commande de recherche de saison pour Sonarr...", 
+            f"🎬 Preparing season search command for Sonarr...", 
             60,
-            current_step="Préparer Recherche",
+            current_step="Prepare Search",
             details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count}
         )
         
-        # Étape 13 : Valider les paramètres de recherche
+        # Step 13: Validate search parameters
         await manager.send_enhanced_progress_update(
             self.user_id, 
             show_title,
             "season_it_single",
-            f"🔧 Validation des paramètres de recherche pour la saison {season_number}...", 
+            f"🔧 Validating search parameters for Season {season_number}...", 
             65,
-            current_step="Valider Paramètres",
+            current_step="Validate Parameters",
             details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count}
         )
         
-        # Étape 14 : Exécuter la commande de recherche
-        logger.info(f"Lancement de la recherche de saison pour la série {show_id} saison {season_number}")
+        # Step 14: Execute search command
         await manager.send_enhanced_progress_update(
             self.user_id, 
             show_title,
             "season_it_single",
-            f"🚀 Envoi de la requête de recherche de saison à Sonarr...", 
+            f"🚀 Sending season search request to Sonarr...", 
             70,
-            current_step="Envoyer Requête Recherche",
+            current_step="Send Search Request",
             details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count}
         )
         
-        # Étape 15 : Traitement de la requête de recherche
+        # Step 15: Process search request
         await manager.send_enhanced_progress_update(
             self.user_id, 
             show_title,
             "season_it_single",
-            f"⏳ Sonarr traite la requête de recherche de saison...", 
+            f"⏳ Sonarr is processing the season search request...", 
             80,
-            current_step="Traitement Recherche",
+            current_step="Process Search",
             details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count}
         )
         
         command_id = await client.search_season_pack(show_id, season_number)
-        logger.info(f"La commande de recherche de saison {command_id} a été exécutée avec succès")
         
-        # Étape 16 : Vérifier l’exécution de la commande
+        # Step 16: Verify command execution
         await manager.send_enhanced_progress_update(
             self.user_id, 
             show_title,
             "season_it_single",
-            f"✅ Commande de recherche exécutée avec succès (ID : {command_id})...", 
+            f"✅ Search command executed successfully (ID: {command_id})...", 
             90,
-            current_step="Vérifier Commande",
+            current_step="Verify Command",
             details={"poster_url": poster_url, "season_number": season_number, "command_id": command_id}
         )
         
-        # Étape 17 : Finaliser le processus
+        # Step 17: Finalize process
         await manager.send_enhanced_progress_update(
             self.user_id, 
             show_title,
             "season_it_single",
-            f"🎉 Season It terminé ! {show_title} Saison {season_number} est maintenant en cours de traitement par Sonarr.", 
+            f"🎉 Season It completed! {show_title} Season {season_number} is now being processed by Sonarr.", 
             100, 
             "success",
-            current_step="Terminé",
+            current_step="Complete",
             details={"poster_url": poster_url, "season_number": season_number, "command_id": command_id}
         )
         
@@ -519,32 +470,32 @@ class SeasonItService:
             "show": show_title,
             "missing_episodes": missing_count,
             "command_id": command_id,
-            "message": f"Recherche de saison déclenchée avec succès pour la saison {season_number}"
+            "message": f"Successfully triggered season search for Season {season_number}"
         }
 
     async def _process_all_seasons(self, client: SonarrClient, show_id: int, show_title: str, series_data: Dict) -> Dict[str, Any]:
-        """Traitement amélioré de toutes les saisons avec suivi détaillé de la progression"""
+        """Enhanced all seasons processing with detailed progress tracking"""
         
-        # Étape 1 : Initialiser le processus pour toutes les saisons
+        # Step 1: Initialize all seasons process
         poster_url = client._get_poster_url(series_data.get("images", []), client.instance_id)
         await manager.send_enhanced_progress_update(
             self.user_id, 
             show_title,
             "season_it_all",
-            f"🔄 Initialisation de Season It pour toutes les saisons de '{show_title}'...", 
+            f"🔄 Initializing Season It for all seasons of '{show_title}'...", 
             5,
-            current_step="Initialisation",
+            current_step="Initialize",
             details={"poster_url": poster_url}
         )
         
-        # Étape 2 : Analyser toutes les saisons pour trouver les épisodes manquants
+        # Step 2: Scan all seasons for missing episodes
         await manager.send_enhanced_progress_update(
             self.user_id, 
             show_title,
             "season_it_all",
-            f"🔍 Analyse de toutes les saisons pour trouver les épisodes manquants...", 
+            f"🔍 Scanning all seasons for missing episodes...", 
             10,
-            current_step="Analyse Épisodes",
+            current_step="Scan Episodes",
             details={"poster_url": poster_url}
         )
         
@@ -556,42 +507,42 @@ class SeasonItService:
                 self.user_id, 
                 show_title,
                 "season_it_all",
-                f"✅ Aucun épisode manquant trouvé pour '{show_title}'", 
+                f"✅ No missing episodes found for '{show_title}'", 
                 100, 
                 "warning",
-                current_step="Terminé",
+                current_step="Complete",
                 details={"poster_url": poster_url}
             )
-            return {"status": "no_missing_episodes", "message": "Aucun épisode manquant trouvé"}
+            return {"status": "no_missing_episodes", "message": "No missing episodes found"}
 
-        # Étape 3 : Vérifier les saisons avec des épisodes non diffusés
+        # Step 3: Check for future episodes
         await manager.send_enhanced_progress_update(
             self.user_id, 
             show_title,
             "season_it_all",
-            f"📅 Vérification des saisons contenant des épisodes non diffusés...", 
+            f"📅 Checking for seasons with unaired episodes...", 
             12,
-            current_step="Vérification Épisodes Futurs",
+            current_step="Check Future Episodes",
             details={"poster_url": poster_url}
         )
         
         future_check = await client.has_future_episodes(show_id)
         complete_seasons = set(future_check.get("seasons_complete", []))
         
-        # Étape 4 : Analyser la structure de la série
+        # Step 4: Analyze series structure
         await manager.send_enhanced_progress_update(
             self.user_id, 
             show_title,
             "season_it_all",
-            f"📊 Analyse de la structure de la série et des saisons surveillées...", 
+            f"   Analyzing series structure and monitored seasons...", 
             15,
-            current_step="Analyse Structure",
+            current_step="Analyze Structure",
             details={"poster_url": poster_url}
         )
         
         seasons = series_data.get("seasons", [])
         monitored_seasons = [s for s in seasons if s.get("monitored", False) and s.get("seasonNumber", 0) > 0]
-        # Filtrer uniquement les saisons manquantes ET complètes (sans épisodes futurs)
+        # Filter out seasons with missing episodes AND seasons that have future episodes
         seasons_to_process = [s for s in monitored_seasons if s["seasonNumber"] in seasons_with_missing and s["seasonNumber"] in complete_seasons]
         
         if not seasons_to_process:
@@ -599,34 +550,34 @@ class SeasonItService:
                 self.user_id, 
                 show_title,
                 "season_it_all",
-                f"⚠️ Aucune saison complète avec des épisodes manquants trouvée pour '{show_title}' (les saisons incomplètes avec épisodes futurs sont exclues)", 
+                f"⚠️ No complete seasons with missing episodes found for '{show_title}' (incomplete seasons with future episodes are excluded)", 
                 100, 
                 "warning",
-                current_step="Terminé",
+                current_step="Complete",
                 details={"poster_url": poster_url}
             )
             return {"status": "no_seasons_to_process"}
 
-        # Étape 5 : Calculer l’étendue du traitement
+        # Step 4: Calculate processing scope
         total_missing = sum(len(episodes) for episodes in seasons_with_missing.values())
         await manager.send_enhanced_progress_update(
             self.user_id, 
             show_title,
             "season_it_all",
-            f"📈 Portée du traitement : {total_missing} épisodes manquants sur {len(seasons_to_process)} saisons", 
+            f"📈 Processing scope: {total_missing} missing episodes across {len(seasons_to_process)} seasons", 
             20,
-            current_step="Calcul Portée",
+            current_step="Calculate Scope",
             details={"poster_url": poster_url, "total_missing": total_missing, "seasons_count": len(seasons_to_process)}
         )
 
-        # Étape 6 : Initialiser la file de traitement
+        # Step 5: Initialize processing queue
         await manager.send_enhanced_progress_update(
             self.user_id, 
             show_title,
             "season_it_all",
-            f"🎯 Préparation du traitement séquentiel de {len(seasons_to_process)} saisons...", 
+            f"🎯 Preparing to process {len(seasons_to_process)} seasons sequentially...", 
             25,
-            current_step="Initialiser File",
+            current_step="Initialize Queue",
             details={"poster_url": poster_url, "seasons_count": len(seasons_to_process)}
         )
 
@@ -639,57 +590,57 @@ class SeasonItService:
             base_progress = 30 + (i * 60 // total_seasons)
             
             try:
-                # Étape 7+ : Traiter les saisons individuellement
+                # Step 6+: Process individual seasons
                 await manager.send_enhanced_progress_update(
                     self.user_id, 
                     show_title,
                     "season_it_all",
-                    f"🎬 Démarrage du traitement de la saison {season_num} ({i+1}/{total_seasons}) - {season_missing} épisodes manquants", 
+                    f"🎬 Starting Season {season_num} ({i+1}/{total_seasons}) - {season_missing} missing episodes", 
                     base_progress,
-                    current_step=f"Traitement Saison {season_num}",
+                    current_step=f"Process Season {season_num}",
                     details={"poster_url": poster_url, "season_number": season_num, "current_season": i+1, "total_seasons": total_seasons}
                 )
                 
-                # Récupérer l’URL de l’affiche pour cette série
+                # Get poster URL for this show
                 poster_url = client._get_banner_url(series_data.get("images", []), client.instance_id)
                 result = await self._process_single_season(client, show_id, season_num, show_title, poster_url, series_data)
                 results.append(result)
                 
-                # Mise à jour de la progression après chaque saison
+                # Progress update after each season
                 completed_progress = 30 + ((i + 1) * 60 // total_seasons)
                 await manager.send_enhanced_progress_update(
                     self.user_id, 
                     show_title,
                     "season_it_all",
-                    f"✅ Saison {season_num} terminée ({i+1}/{total_seasons})", 
+                    f"✅ Season {season_num} completed ({i+1}/{total_seasons})", 
                     completed_progress,
-                    current_step=f"Saison {season_num} Terminée",
+                    current_step=f"Season {season_num} Complete",
                     details={"poster_url": poster_url, "season_number": season_num, "current_season": i+1, "total_seasons": total_seasons}
                 )
                 
-                # Ajouter un délai entre les saisons pour éviter de surcharger Sonarr
+                # Add delay between seasons to avoid overwhelming Sonarr
                 if i < len(seasons_to_process) - 1:
                     await manager.send_enhanced_progress_update(
                         self.user_id, 
                         show_title,
                         "season_it_all",
-                        f"⏳ Attente de 3 secondes avant de traiter la saison suivante...", 
+                        f"⏳ Waiting 3 seconds before processing next season...", 
                         completed_progress + 1,
-                        current_step="Attente",
+                        current_step="Wait",
                         details={"poster_url": poster_url}
                     )
                     await asyncio.sleep(3)
                 
             except Exception as e:
-                logger.error(f"Erreur lors du traitement de la saison {season_num} : {e}")
+                logger.error(f"Error processing season {season_num}: {e}")
                 await manager.send_enhanced_progress_update(
                     self.user_id, 
                     show_title,
                     "season_it_all",
-                    f"❌ Échec du traitement de la saison {season_num} : {str(e)}", 
+                    f"❌ Season {season_num} failed: {str(e)}", 
                     base_progress + 5,
                     "error",
-                    current_step=f"Saison {season_num} Échec",
+                    current_step=f"Season {season_num} Failed",
                     details={"poster_url": poster_url, "season_number": season_num, "error": str(e)}
                 )
                 results.append({
@@ -698,7 +649,7 @@ class SeasonItService:
                     "error": str(e)
                 })
 
-        # Analyse finale et rapport
+        # Final analysis and reporting
         successful_seasons = [r for r in results if r.get("status") == "success"]
         failed_seasons = [r for r in results if r.get("status") == "error"]
         
@@ -706,22 +657,22 @@ class SeasonItService:
             self.user_id, 
             show_title,
             "season_it_all",
-            f"📊 Traitement terminé : {len(successful_seasons)} réussies, {len(failed_seasons)} échouées", 
+            f"📊 Processing complete: {len(successful_seasons)} successful, {len(failed_seasons)} failed", 
             95,
-            current_step="Traitement Terminé",
+            current_step="Processing Complete",
             details={"poster_url": poster_url, "successful_count": len(successful_seasons), "failed_count": len(failed_seasons)}
         )
         
-        # Message de fin
+        # Final completion message
         if failed_seasons:
             await manager.send_enhanced_progress_update(
                 self.user_id, 
                 show_title,
                 "season_it_all",
-                f"⚠️ Season It terminé avec des résultats mitigés pour '{show_title}' : {len(successful_seasons)}/{len(results)} saisons réussies", 
+                f"⚠️ Season It completed with mixed results for '{show_title}': {len(successful_seasons)}/{len(results)} seasons successful", 
                 100, 
                 "warning",
-                current_step="Terminé",
+                current_step="Complete",
                 details={"poster_url": poster_url, "successful_count": len(successful_seasons), "failed_count": len(failed_seasons)}
             )
         else:
@@ -729,10 +680,10 @@ class SeasonItService:
                 self.user_id, 
                 show_title,
                 "season_it_all",
-                f"🎉 Season It terminé avec succès pour les {len(successful_seasons)} saisons de '{show_title}' !", 
+                f"🎉 Season It completed successfully for all {len(successful_seasons)} seasons of '{show_title}'!", 
                 100, 
                 "success",
-                current_step="Terminé",
+                current_step="Complete",
                 details={"poster_url": poster_url, "successful_count": len(successful_seasons)}
             )
 
@@ -767,47 +718,47 @@ class SeasonItService:
             )
             
             if response.status_code != 200:
-                raise Exception(f"Échec de récupération des données de la série : {response.status_code}")
+                raise Exception(f"Failed to fetch series data: {response.status_code}")
             
             return response.json()
 
     async def process_bulk_season_it(self, show_items: List[Dict]) -> Dict[str, Any]:
-        """Traiter Season It pour plusieurs séries en utilisant le gestionnaire d’opérations groupées"""
+        """Process Season It for multiple shows using bulk operation manager"""
         operation_id = bulk_operation_manager.create_operation(
             user_id=self.user_id,
             operation_type="season_it_bulk",
             items=show_items,
             operation_func=self._process_bulk_item,
-            description=f"Opération Season It en lot pour {len(show_items)} séries"
+            description=f"Season It bulk operation for {len(show_items)} shows"
         )
         
         return await bulk_operation_manager.execute_operation(operation_id)
     
     async def _process_bulk_item(self, item: Dict, progress_callback: callable) -> Dict[str, Any]:
-        """Traiter un élément unique dans une opération groupée"""
+        """Process a single item in bulk operation"""
         show_id = item.get('id')
-        show_title = item.get('name', f"Série {show_id}")
-        season_number = item.get('season_number')  # None pour toutes les saisons
+        show_title = item.get('name', f"Show {show_id}")
+        season_number = item.get('season_number')  # None for all seasons
         
         try:
-            # Récupérer l’instance Sonarr
+            # Get Sonarr instance
             instance_id = item.get('instance_id')
             instance = self._get_sonarr_instance_by_id(instance_id) if instance_id else self._get_sonarr_instance(show_id)
             if not instance:
-                raise Exception("Aucune instance Sonarr trouvée pour cette série")
+                raise Exception("No Sonarr instance found for this show")
                 
             client = SonarrClient(instance.url, instance.api_key, instance.id)
             
-            # Récupérer les données de la série
+            # Get series data
             series_data = await self._get_series_data(client, show_id)
             show_title = series_data.get("title", show_title)
             poster_url = client._get_banner_url(series_data.get("images", []), client.instance_id)
             
-            await progress_callback(10, f"Démarrage de Season It pour {show_title}", poster_url)
+            await progress_callback(10, f"Starting Season It for {show_title}", poster_url)
             
-            await progress_callback(25, f"Traitement de {show_title}", poster_url)
+            await progress_callback(25, f"Processing {show_title}", poster_url)
             
-            # Créer une entrée dans le journal d’activité
+            # Create activity log
             activity = self._create_activity_log(instance.id, show_id, show_title, season_number)
             
             if season_number:
@@ -819,14 +770,14 @@ class SeasonItService:
                     client, show_id, show_title, series_data, progress_callback, poster_url
                 )
             
-            # Mettre à jour le journal d’activité en cas de succès
+            # Update activity log on success
             self._update_activity_log(
                 activity,
                 "success",
-                f"Season It terminé avec succès pour {show_title}" + (f" Saison {season_number}" if season_number else " (Toutes les saisons)")
+                f"Season It completed successfully for {show_title}" + (f" Season {season_number}" if season_number else " (All Seasons)")
             )
             
-            await progress_callback(100, f"Season It terminé pour {show_title}", poster_url)
+            await progress_callback(100, f"Completed Season It for {show_title}", poster_url)
             
             return {
                 'status': 'success',
@@ -835,66 +786,58 @@ class SeasonItService:
             }
             
         except Exception as e:
-            logger.error(f"Erreur lors du traitement de l’élément en lot {show_title} : {e}")
+            logger.error(f"Error processing bulk item {show_title}: {e}")
             if 'activity' in locals():
                 self._update_activity_log(
                     activity,
                     "error",
-                    f"Échec de Season It pour {show_title}",
+                    f"Season It failed for {show_title}",
                     str(e)
                 )
-            raise Exception(f"Échec du traitement de {show_title} : {str(e)}")
+            raise Exception(f"Failed to process {show_title}: {str(e)}")
     
     async def _process_single_season_with_callback(self, client: SonarrClient, show_id: int, 
                                                   season_number: int, show_title: str, 
                                                   progress_callback: callable, poster_url: str = None) -> Dict[str, Any]:
-        """Traiter une saison unique avec suivi de progression pour les opérations groupées"""
-        await progress_callback(25, f"Vérification des épisodes futurs dans {show_title} Saison {season_number}", poster_url)
+        """Process single season with progress callback for bulk operations"""
+        await progress_callback(25, f"Checking for future episodes in {show_title} Season {season_number}", poster_url)
         
-        # Vérifier d’abord la présence d’épisodes futurs
+        # Check for future episodes first
         future_check = await client.has_future_episodes(show_id, season_number)
         if season_number in future_check.get("seasons_incomplete", []):
-            await progress_callback(100, f"{show_title} Saison {season_number} contient des épisodes non diffusés - ignorée", poster_url)
-            return {"status": "incomplete_season", "message": "La saison contient des épisodes qui n’ont pas encore été diffusés"}
+            await progress_callback(100, f"{show_title} Season {season_number} has unaired episodes - skipping", poster_url)
+            return {"status": "incomplete_season", "message": "Season has episodes that haven't aired yet"}
         
-        await progress_callback(30, f"Vérification des épisodes manquants pour {show_title} Saison {season_number}", poster_url)
+        await progress_callback(30, f"Checking missing episodes for {show_title} Season {season_number}", poster_url)
         
         missing_data = await client.get_missing_episodes(show_id, season_number)
         seasons_with_missing = missing_data.get("seasons_with_missing", {})
         
         if season_number not in seasons_with_missing:
-            await progress_callback(100, f"{show_title} Saison {season_number} n’a pas d’épisodes manquants", poster_url)
-            return {"status": "no_missing_episodes", "message": "Aucun épisode manquant trouvé"}
+            await progress_callback(100, f"{show_title} Season {season_number} has no missing episodes", poster_url)
+            return {"status": "no_missing_episodes", "message": "No missing episodes found"}
         
         missing_count = len(seasons_with_missing[season_number])
         settings = self.db.query(UserSettings).filter(UserSettings.user_id == self.user_id).first()
         skip_season_pack_check = settings and settings.disable_season_pack_check
         
         if skip_season_pack_check:
-            await progress_callback(50, f"Vérification des packs de saison désactivée pour {show_title}, recherche classique en cours", poster_url)
+            await progress_callback(50, f"Season pack check disabled for {show_title}, proceeding with regular search", poster_url)
             if not (settings and settings.skip_episode_deletion):
-                await progress_callback(60, f"Suppression des épisodes individuels de {show_title}", poster_url)
+                await progress_callback(60, f"Deleting individual episodes from {show_title}", poster_url)
                 await client.delete_season_episodes(show_id, season_number)
         else:
-            await progress_callback(40, f"Vérification des packs de saison pour {show_title}", poster_url)
+            await progress_callback(40, f"Checking for season packs for {show_title}", poster_url)
             releases = await client._get_releases(show_id, season_number)
-
-            if not all(isinstance(r, dict) for r in releases):
-                logger.error(f"❌ Données inattendues dans releases: {[type(r).__name__ for r in releases]}")
-                releases = [r for r in releases if isinstance(r, dict)]
-
-            releases = self._filter_approved_releases(releases)
-            logger.info(f"{len(releases)} releases after approved filter")
-
             
             if not releases:
-                await progress_callback(60, f"Aucun pack de saison trouvé pour {show_title}, recherche classique en cours", poster_url)
+                await progress_callback(60, f"No season packs found for {show_title}, proceeding with regular search", poster_url)
             else:
                 if not (settings and settings.skip_episode_deletion):
-                    await progress_callback(70, f"Suppression des épisodes individuels de {show_title}", poster_url)
+                    await progress_callback(70, f"Deleting individual episodes from {show_title}", poster_url)
                     await client.delete_season_episodes(show_id, season_number)
         
-        await progress_callback(80, f"Lancement de la recherche de saison pour {show_title}", poster_url)
+        await progress_callback(80, f"Triggering season search for {show_title}", poster_url)
         command_id = await client.search_season_pack(show_id, season_number)
         
         return {
@@ -908,29 +851,29 @@ class SeasonItService:
     async def _process_all_seasons_with_callback(self, client: SonarrClient, show_id: int, 
                                                show_title: str, series_data: Dict, 
                                                progress_callback: callable, poster_url: str = None) -> Dict[str, Any]:
-        """Traiter toutes les saisons avec suivi de progression pour les opérations groupées"""
-        await progress_callback(25, f"Vérification des épisodes futurs", poster_url)
+        """Process all seasons with progress callback for bulk operations"""
+        await progress_callback(25, f"Checking for future episodes", poster_url)
         
-        # Vérifier d’abord la présence d’épisodes futurs
+        # Check for future episodes first
         future_check = await client.has_future_episodes(show_id)
         complete_seasons = set(future_check.get("seasons_complete", []))
         
-        await progress_callback(30, f"Vérification des épisodes manquants dans toutes les saisons", poster_url)
+        await progress_callback(30, f"Checking missing episodes in all seasons", poster_url)
         
         missing_data = await client.get_missing_episodes(show_id)
         seasons_with_missing = missing_data.get("seasons_with_missing", {})
         
         if not seasons_with_missing:
-            await progress_callback(100, f"Aucun épisode manquant trouvé", poster_url)
-            return {"status": "no_missing_episodes", "message": "Aucun épisode trouvé"}
+            await progress_callback(100, f"No missing episodes found", poster_url)
+            return {"status": "no_missing_episodes", "message": "No missing episodes found"}
         
         seasons = series_data.get("seasons", [])
         monitored_seasons = [s for s in seasons if s.get("monitored", False) and s.get("seasonNumber", 0) > 0]
-        # Filtrer uniquement les saisons avec des épisodes manquants ET complètes (pas d’épisodes futurs)
+        # Filter out seasons with missing episodes AND seasons that have future episodes
         seasons_to_process = [s for s in monitored_seasons if s["seasonNumber"] in seasons_with_missing and s["seasonNumber"] in complete_seasons]
         
         if not seasons_to_process:
-            await progress_callback(100, f"Aucune saison complète avec épisodes manquants à traiter", poster_url)
+            await progress_callback(100, f"No complete seasons with missing episodes to process", poster_url)
             return {"status": "no_seasons_to_process"}
         
         results = []
@@ -940,7 +883,7 @@ class SeasonItService:
             season_num = season["seasonNumber"]
             base_progress = 40 + (i * 50 // total_seasons)
             
-            await progress_callback(base_progress, f"Traitement de la saison {season_num} ({i+1}/{total_seasons})", poster_url)
+            await progress_callback(base_progress, f"Processing Season {season_num} ({i+1}/{total_seasons})", poster_url)
             
             try:
                 result = await self._process_single_season_with_callback(
@@ -954,7 +897,7 @@ class SeasonItService:
                     await asyncio.sleep(3)
                     
             except Exception as e:
-                logger.error(f"Erreur lors du traitement de la saison {season_num} : {e}")
+                logger.error(f"Error processing season {season_num}: {e}")
                 results.append({
                     "status": "error",
                     "season": season_num,
@@ -972,292 +915,279 @@ class SeasonItService:
         }
 
     async def search_season_packs_interactive(self, show_id: int, season_number: int, instance_id: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Rechercher des packs de saison et retourner les résultats formatés pour sélection interactive"""
+        """Search for season packs and return formatted results for interactive selection"""
         import asyncio
         
         try:
-            # Récupérer les données de la série
+            # Get series data first
             instance = self._get_sonarr_instance_by_id(instance_id) if instance_id else self._get_sonarr_instance(show_id)
             if not instance:
-                raise Exception("Aucune instance Sonarr trouvée pour cette série")
+                raise Exception("No Sonarr instance found for this show")
 
             client = SonarrClient(instance.url, instance.api_key, instance.id)
             series_data = await self._get_series_data(client, show_id)
-            show_title = series_data.get("title", "Série inconnue")
+            show_title = series_data.get("title", "Unknown Show")
             poster_url = client._get_banner_url(series_data.get("images", []), client.instance_id)
 
-            # Vérifier si l’opération a été annulée
+            # Check for cancellation
             if asyncio.current_task().cancelled():
-                logger.info(f"🚫 Recherche annulée pour {show_title} Saison {season_number}")
-                # Envoyer une notification d’annulation
+                logger.info(f"🚫 Search cancelled for {show_title} Season {season_number}")
+                # Send cancellation notification
                 await manager.send_personal_message({
                     "type": "clear_progress",
                     "operation_type": "interactive_search",
-                    "message": "🚫 Opération de recherche annulée par l’utilisateur"
+                    "message": "🚫 Search operation cancelled by user"
                 }, self.user_id)
                 raise asyncio.CancelledError()
 
-            # Notifier le démarrage de la recherche
+            # Send search start notification
             await manager.send_enhanced_progress_update(
                 self.user_id,
                 show_title,
                 "interactive_search",
-                f"🔍 Recherche des Releases pour la saison {season_number}...",
+                f"🔍 Searching for Season {season_number} releases...",
                 20,
-                current_step="Recherche",
+                current_step="Search",
                 details={"poster_url": poster_url, "season_number": season_number}
             )
 
-            # Rechercher les Releases (opération lente)
+            # Search for releases (this is the slow operation)
             releases = await client._get_releases(show_id, season_number)
-
-            if not all(isinstance(r, dict) for r in releases):
-                logger.error(f"❌ Données inattendues dans releases: {[type(r).__name__ for r in releases]}")
-                releases = [r for r in releases if isinstance(r, dict)]
-
-            releases = self._filter_approved_releases(releases)
-            logger.debug(f"Types après filtre : {[type(r).__name__ for r in releases]}")
-            # Vérifier si annulation après appel API
+            
+            # Check for cancellation after the slow API call
             if asyncio.current_task().cancelled():
-                logger.info(f"🚫 Recherche annulée pour {show_title} Saison {season_number} après appel API")
+                logger.info(f"🚫 Search cancelled for {show_title} Season {season_number} after API call")
+                # Send cancellation notification
                 await manager.send_personal_message({
                     "type": "clear_progress",
                     "operation_type": "interactive_search",
-                    "message": "🚫 Opération de recherche annulée par l’utilisateur"
+                    "message": "🚫 Search operation cancelled by user"
                 }, self.user_id)
                 raise asyncio.CancelledError()
             
-            # Notifier les résultats trouvés
+            # Send results found notification
             await manager.send_enhanced_progress_update(
                 self.user_id,
                 show_title,
                 "interactive_search",
-                f"📊 {len(releases)} packs de saison trouvés",
+                f"📊 Found {len(releases)} season pack releases",
                 70,
-                current_step="Analyse des résultats",
+                current_step="Process Results",
                 details={"poster_url": poster_url, "season_number": season_number, "releases_found": len(releases)}
             )
 
-            # Formater les résultats pour l’interface
+            # Format releases for frontend
             formatted_releases = []
-            logger.info(f"Formatage de {len(releases)} résultats pour l’UI")
+            logger.info(f"Formatting {len(releases)} releases for UI")
             for i, release in enumerate(releases):
-
-                if not isinstance(release, dict):
-                    logger.error(f"❌ Release inattendu à l'index {i}: type={type(release).__name__}, valeur={release}")
-                    continue  # on saute cet élément
-
-                if i == 0:  # Log du premier résultat pour analyse
-                    logger.info(f"Clés disponibles du premier résultat : {list(release.keys())}")
-                    logger.info(f"Score de format personnalisé du premier résultat : {release.get('customFormatScore', 'NOT_FOUND')}")
-                    logger.info(f"IndexerId du premier résultat : {release.get('indexerId', 'NOT_FOUND')}")
-                try:
-                    formatted_release = self._format_release_for_ui(release)
-                except Exception:
-                    logger.exception(f"💥 Crash pendant _format_release_for_ui à l'index {i} (type={type(release).__name__})")
-                    continue
-
-
-                logger.info(
-                    f"Résultat formaté {i+1} : "
-                    f"quality_score={formatted_release.get('quality_score', 'NOT_FOUND')}, "
-                    f"indexer_id={formatted_release.get('indexer_id', 'NOT_FOUND')}"
-                )
-                 
+                if i == 0:  # Log first release structure
+                    logger.info(f"Sample release keys: {list(release.keys())}")
+                    logger.info(f"First release customFormatScore: {release.get('customFormatScore', 'NOT_FOUND')}")
+                    logger.info(f"First release indexerId: {release.get('indexerId', 'NOT_FOUND')}")
+                formatted_release = self._format_release_for_ui(release)
+                logger.info(f"Formatted release {i+1}: quality_score={formatted_release.get('quality_score', 'NOT_FOUND')}, indexer_id={formatted_release.get('indexer_id', 'NOT_FOUND')}")
                 formatted_releases.append(formatted_release)
 
-            # Trier par qualité et seeders
+            # Sort releases by quality and seeders
             formatted_releases.sort(key=lambda x: (-x["release_weight"], -x["seeders"]))
 
-            # Notifier fin de recherche
+            # Send completion notification
             await manager.send_enhanced_progress_update(
                 self.user_id,
                 show_title,
                 "interactive_search",
-                f"✅ Recherche interactive terminée - {len(formatted_releases)} résultats prêts à être sélectionnés",
+                f"✅ Interactive search completed - {len(formatted_releases)} releases ready for selection",
                 100,
                 "success",
-                current_step="Terminé",
+                current_step="Complete",
                 details={"poster_url": poster_url, "season_number": season_number, "releases_found": len(formatted_releases)}
             )
 
             return formatted_releases
 
         except Exception as e:
-            logger.error(f"Erreur dans la recherche interactive : {e}")
+            logger.error(f"Error in interactive search: {e}")
             await manager.send_enhanced_progress_update(
                 self.user_id,
-                show_title if 'show_title' in locals() else "Série inconnue",
+                show_title if 'show_title' in locals() else "Unknown Show",
                 "interactive_search",
-                f"❌ Échec de la recherche : {str(e)}",
+                f"❌ Search failed: {str(e)}",
                 100,
                 "error",
-                current_step="Erreur",
+                current_step="Error",
                 details={"error": str(e)}
             )
             raise
 
     async def download_specific_release(self, release_guid: str, show_id: int, season_number: int, instance_id: Optional[int] = None, indexer_id: Optional[int] = None) -> Dict[str, Any]:
-        """Télécharger une sortie spécifique via son GUID"""
+        """Download a specific release by GUID"""
         activity = None
         try:
-            # Récupérer les données de la série
+            # Get series data first
             instance = self._get_sonarr_instance_by_id(instance_id) if instance_id else self._get_sonarr_instance(show_id)
             if not instance:
-                raise Exception("Aucune instance Sonarr trouvée pour cette série")
+                raise Exception("No Sonarr instance found for this show")
 
             client = SonarrClient(instance.url, instance.api_key, instance.id)
             series_data = await self._get_series_data(client, show_id)
-            show_title = series_data.get("title", "Série inconnue")
+            show_title = series_data.get("title", "Unknown Show")
             poster_url = client._get_banner_url(series_data.get("images", []), client.instance_id)
 
-            # Créer un log d’activité
+            # Create activity log
             activity = self._create_activity_log(instance.id, show_id, show_title, season_number)
 
-            # Notifier le début du téléchargement
+            # Send download start notification
             await manager.send_enhanced_progress_update(
                 self.user_id,
                 show_title,
                 "manual_download",
-                f"🚀 Lancement du téléchargement manuel pour la saison {season_number}...",
+                f"🚀 Starting manual download for Season {season_number}...",
                 10,
-                current_step="Initialisation",
+                current_step="Initialize",
                 details={"poster_url": poster_url, "season_number": season_number}
             )
 
-            # Vérifier les paramètres utilisateur
+            # Check user settings
             settings = self.db.query(UserSettings).filter(UserSettings.user_id == self.user_id).first()
             skip_deletion = settings and settings.skip_episode_deletion
 
             if not skip_deletion:
-                # Supprimer les épisodes existants
+                # Delete existing episodes
                 await manager.send_enhanced_progress_update(
                     self.user_id,
                     show_title,
                     "manual_download",
-                    f"🗑️ Suppression des épisodes existants de la saison {season_number}...",
+                    f"🗑️ Deleting existing episodes from Season {season_number}...",
                     30,
-                    current_step="Suppression des épisodes",
+                    current_step="Delete Episodes",
                     details={"poster_url": poster_url, "season_number": season_number}
                 )
                 
                 await client.delete_season_episodes(show_id, season_number)
 
-            # Télécharger la sortie spécifique
+            # Download the specific release
             await manager.send_enhanced_progress_update(
                 self.user_id,
                 show_title,
                 "manual_download",
-                f"📥 Téléchargement de la sortie sélectionnée...",
+                f"📥 Downloading selected release...",
                 60,
-                current_step="Téléchargement",
+                current_step="Download",
                 details={"poster_url": poster_url, "season_number": season_number}
             )
 
-            # Utiliser l’API de téléchargement direct de Sonarr
+            # Use Sonarr's download API with the provided indexer_id
             download_result = await client.download_release_direct(release_guid, indexer_id)
 
-            # Notification de fin
+            # Complete notification
             await manager.send_enhanced_progress_update(
                 self.user_id,
                 show_title,
                 "manual_download",
-                f"✅ Téléchargement lancé avec succès pour la saison {season_number}",
+                f"✅ Download initiated successfully for Season {season_number}",
                 100,
                 "success",
-                current_step="Terminé",
+                current_step="Complete",
                 details={"poster_url": poster_url, "season_number": season_number}
             )
 
-            # Mettre à jour le log d’activité
+            # Update activity log
             self._update_activity_log(
                 activity,
                 "success",
-                f"Téléchargement manuel terminé pour {show_title} saison {season_number}"
+                f"Manual download completed for {show_title} Season {season_number}"
             )
 
             return {
                 "status": "success",
                 "show": show_title,
                 "season": season_number,
-                "message": "Téléchargement lancé avec succès"
+                "message": "Download initiated successfully"
             }
 
         except Exception as e:
-            logger.error(f"Erreur lors du téléchargement de la sortie : {e}")
+            logger.error(f"Error downloading release: {e}")
             
-            # Mise à jour du log en cas d’erreur
+            # Update activity log on error
             if activity:
                 self._update_activity_log(
                     activity,
                     "error",
-                    f"Échec du téléchargement manuel pour {activity.show_title}",
+                    f"Manual download failed for {activity.show_title}",
                     str(e)
                 )
 
             await manager.send_enhanced_progress_update(
                 self.user_id,
-                show_title if 'show_title' in locals() else "Série inconnue",
+                show_title if 'show_title' in locals() else "Unknown Show",
                 "manual_download",
-                f"❌ Échec du téléchargement : {str(e)}",
+                f"❌ Download failed: {str(e)}",
                 100,
                 "error",
-                current_step="Erreur",
+                current_step="Error",
                 details={"error": str(e)}
             )
             raise
 
     def _format_release_for_ui(self, release: Dict[str, Any]) -> Dict[str, Any]:
-        """Formater une sortie pour l’affichage dans l’interface"""
-        # Fonction utilitaire pour formater la taille
+        """Format a release for frontend display"""
+        # Helper function to format file size
         def format_size(size_bytes):
             if size_bytes >= 1024**3:
-                return f"{size_bytes / (1024**3):.1f} Go"
+                return f"{size_bytes / (1024**3):.1f} GB"
             elif size_bytes >= 1024**2:
-                return f"{size_bytes / (1024**2):.1f} Mo"
+                return f"{size_bytes / (1024**2):.1f} MB"
             elif size_bytes >= 1024:
-                return f"{size_bytes / 1024:.1f} Ko"
+                return f"{size_bytes / 1024:.1f} KB"
             else:
-                return f"{size_bytes} o"
+                return f"{size_bytes} B"
 
-        # Fonction utilitaire pour formater l’âge
+        # Helper function to format age
         def format_age(age_hours):
             if age_hours < 1:
-                return "< 1 heure"
+                return "< 1 hour"
             elif age_hours < 24:
-                return f"{int(age_hours)} heures"
+                return f"{int(age_hours)} hours"
             elif age_hours < 24 * 7:
-                return f"{int(age_hours / 24)} jours"
+                return f"{int(age_hours / 24)} days"
             elif age_hours < 24 * 30:
-                return f"{int(age_hours / (24 * 7))} semaines"
+                return f"{int(age_hours / (24 * 7))} weeks"
             elif age_hours < 24 * 365:
-                return f"{int(age_hours / (24 * 30))} mois"
+                return f"{int(age_hours / (24 * 30))} months"
             else:
-                # Conversion en années et mois
+                # Convert to years and months
                 total_months = int(age_hours / (24 * 30))
                 years = total_months // 12
                 months = total_months % 12
                 if months == 0:
-                    return f"{years} ans"
+                    return f"{years} years"
                 else:
-                    return f"{years} ans {months} mois"
+                    return f"{years} years {months} months"
 
-        # Extraction des infos de qualité
+        # Extract quality information
         quality = release.get("quality", {})
         
+        # Sonarr release structure typically has:
+        # quality: { quality: { id: 6, name: "WEBDL-1080p" } }
+        # And quality score should be at the top level as "qualityScore" or "score"
+        
         if "quality" in quality:
+            # Nested structure (most common)
             quality_info = quality.get("quality", {})
-            quality_name = quality_info.get("name", "Inconnue")
+            quality_name = quality_info.get("name", "Unknown")
         else:
-            quality_name = quality.get("name", "Inconnue")
+            # Direct structure (fallback)
+            quality_name = quality.get("name", "Unknown")
         
-        # Score de qualité basé sur le customFormatScore de l’API Sonarr
+        # Quality score extraction using customFormatScore from Sonarr API
+        # This includes both positive and negative scores (negative = rejected/poor quality)
         quality_score = release.get("customFormatScore", 0)
-        logger.info(f"Release: {release.get('title', 'Inconnue')[:50]}... - customFormatScore: {quality_score}")
+        logger.info(f"Release: {release.get('title', 'Unknown')[:50]}... - customFormatScore: {quality_score}")
         
-        # Calcul du poids de la release pour le tri
+        # Calculate release weight for sorting (higher = better)
         release_weight = quality_score
         
+        # Bonus for proper/repack
         if release.get("proper", False):
             release_weight += 50
         if "repack" in release.get("title", "").lower():
@@ -1265,20 +1195,19 @@ class SeasonItService:
 
         return {
             "guid": release.get("guid", ""),
-            "title": release.get("title", "Inconnue"),
+            "title": release.get("title", "Unknown"),
             "size": release.get("size", 0),
             "size_formatted": format_size(release.get("size", 0)),
             "seeders": release.get("seeders", 0),
             "leechers": release.get("leechers", 0),
             "age": release.get("age", 0),
-            "age_formatted": format_age(release.get("ageHours", 0)),
+            "age_formatted": format_age(release.get("ageHours", 0)),  # Use ageHours directly
             "quality": quality_name,
             "quality_score": quality_score,
-            "indexer": release.get("indexer", "Inconnu"),
-            "indexer_id": release.get("indexerId", 0),
+            "indexer": release.get("indexer", "Unknown"),
+            "indexer_id": release.get("indexerId", 0),  # Store indexerId for download
             "approved": release.get("approved", True),
             "indexer_flags": release.get("indexerFlags", []),
-            "rejections": release.get("rejections", []),
             "release_weight": release_weight
         }
 

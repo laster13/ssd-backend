@@ -100,7 +100,6 @@ async def websocket_secure(websocket: WebSocket, user_id: int, db: Session = Dep
 
         while True:
             data = await websocket.receive_text()
-            logger.debug(f"WS message reçu: {data}")
 
     except WebSocketDisconnect:
         manager.disconnect(websocket, user_id)
@@ -1080,6 +1079,24 @@ async def create_system_activity(
         logger.error(f"💥 Erreur création system activity : {e}\n{traceback.format_exc()}")
         db.rollback()
         raise HTTPException(status_code=500, detail="Erreur création activité système")
+
+# -------------------------------------------------------------------
+# 🧠 Bouton suppression db pour la categorie non remplacés
+# -------------------------------------------------------------------
+@router.delete("/system-activities/{activity_id}")
+async def delete_activity(
+    activity_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    activity = db.query(SystemActivity).filter(SystemActivity.id == activity_id).first()
+    if not activity:
+        raise HTTPException(status_code=404, detail="Activity not found")
+
+    db.delete(activity)
+    db.commit()
+
+    return {"message": "Activity deleted", "id": activity_id}
 
 
 # -------------------------------------------------------------------

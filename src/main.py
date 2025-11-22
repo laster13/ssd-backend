@@ -85,12 +85,12 @@ LEVEL_STYLES = {
     "WARNING": {"color": "<fg #FFD700>", "icon": ICON_MAP["WARNING"]},
     "ERROR": {"color": "<fg #FF6B6B>", "icon": ICON_MAP["ERROR"]},
     "CRITICAL": {"color": "<fg #FF0000><bold>", "icon": ICON_MAP["CRITICAL"]},
-    "SEASONARR": {"color": "<fg #FECACA>", "icon": ICON_MAP["SEASONARR"]},
+    "SEASONARR": {"color": "<fg #5DAEFF>", "icon": ICON_MAP["SEASONARR"]},
     "WATCHER": {"color": "<fg #A1C4FD>", "icon": ICON_MAP["WATCHER"]},
     "SYSTEM": {"color": "<fg #FF9800>", "icon": ICON_MAP["SYSTEM"]},
     "CONTAINER": {"color": "<fg #00CED1>", "icon": ICON_MAP["CONTAINER"]},
     "SSD": {"color": "<fg #9370DB>", "icon": ICON_MAP["SSD"]},
-    "WEBSOCKET": {"color": "<fg #FF4500>", "icon": ICON_MAP["WEBSOCKET"]},
+    "WEBSOCKET": {"color": "<fg #5DAEFF>", "icon": ICON_MAP["WEBSOCKET"]},
     "API": {"color": "<fg #00BFFF>", "icon": ICON_MAP["API"]},  
     "DEFAULT": {"color": "<fg #A9A9A9>", "icon": ICON_MAP["DEFAULT"]}
 }

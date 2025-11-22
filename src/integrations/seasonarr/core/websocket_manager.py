@@ -135,7 +135,6 @@ class ConnectionManager:
         # Check rate limiting for non-system messages
         if not bypass_rate_limit and message.get("type") not in ["ping", "auth_status"]:
             if self._is_rate_limited(user_id):
-                logger.warning(f"Rate limit exceeded for user {user_id}, dropping message: {message.get('type', 'unknown')}")
                 return
         
         if user_id in self.active_connections:

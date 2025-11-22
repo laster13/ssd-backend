@@ -230,7 +230,7 @@ async def edit_symlink(
     payload: dict = Body(
         ...,
         example={
-            "old_path": "/home/maman/Medias/movies/It Happens (2024)/It Happens (2024).mkv",
+            "old_path": "/home/ubuntu/Medias/movies/It Happens (2024)/It Happens (2024).mkv",
             "new_folder": "It Happens (2024) {imdb-tt1234567}",
             "new_file": "It Happens (2024) {imdb-tt1234567}",
             "dry_run": True,
@@ -245,7 +245,7 @@ async def edit_symlink(
 
     Exemple JSON attendu :
     {
-        "old_path": "/home/maman/Medias/movies/Old Name (2024)/Old Name (2024).mkv",
+        "old_path": "/home/ubuntu/Medias/movies/Old Name (2024)/Old Name (2024).mkv",
         "new_folder": "New Name (2024) {imdb-tt1234567}",
         "new_file": "New Name (2024) {imdb-tt1234567}",
         "dry_run": true
@@ -317,7 +317,7 @@ async def sync_radarr(
     payload: dict = Body(
         ...,
         example={
-            "path": "/home/maman/Medias/movies/Underworld (2003) {imdb-tt0320691}/Underworld (2003) {imdb-tt0320691}.mkv",
+            "path": "/home/ubuntu/Medias/movies/Underworld (2003) {imdb-tt0320691}/Underworld (2003) {imdb-tt0320691}.mkv",
             "dry_run": True
         },
     )
@@ -371,7 +371,7 @@ async def sync_radarr(
 
         radarr_id = movie["id"]
         movie_title = movie.get("title", "Inconnu")
-        quality_profile_id = movie.get("qualityProfileId", 7)
+        quality_profile_id = movie.get("qualityProfileId")
 
         # 🧠 Sauvegarde du profil dans le cache global
         cache_key = imdb_id or f"tmdb-{tmdb_id}" or movie_title
@@ -444,7 +444,7 @@ async def reimport_radarr(
     payload: dict = Body(
         ...,
         example={
-            "path": "/home/maman/Medias/movies/My Everything (2024)/My Everything (2024).mkv",
+            "path": "/home/ubuntu/Medias/movies/My Everything (2024)/My Everything (2024).mkv",
             "dry_run": True,
         },
     )
@@ -526,9 +526,40 @@ async def reimport_radarr(
         # ----------------------------------------
         cache_key = imdb_id or f"tmdb-{tmdb_id}" or title_term
         cache_entry = RADARR_CACHE.get(cache_key)
-        cached_profile = cache_entry.get("profile_id", 7) if cache_entry else 7
+        cached_profile = cache_entry.get("profile_id") if cache_entry else None
+
 
         logger.info(f"🧠 Profil qualité utilisé : {cached_profile}")
+
+        # 🧠 Fallback : aucun profil trouvé → détecter profil des films du même rootfolder
+        if cached_profile is None:
+            logger.info("🔍 Aucun profil trouvé dans le cache — recherche d’un profil existant...")
+
+            all_movies = requests.get(
+                f"{radarr.base_url}/movie",
+                headers=radarr.headers
+            ).json()
+
+            # Trouver d’autres films dans le même dossier racine
+            same_root_profiles = []
+            for mv in all_movies:
+                mv_path = mv.get("path")
+                if mv_path and mv_path != path and path.startswith(os.path.dirname(mv_path)):
+                    pid = mv.get("qualityProfileId")
+                    if pid:
+                        same_root_profiles.append(pid)
+
+            if same_root_profiles:
+                # On prend le profil dominante
+                cached_profile = max(set(same_root_profiles), key=same_root_profiles.count)
+                logger.success(
+                    f"🎯 Profil détecté automatiquement depuis la bibliothèque : {cached_profile}"
+                )
+            else:
+                logger.warning(
+                    "⚠️ Aucun autre film trouvé pour inférer un profil. Radarr utilisera son profil interne."
+                )
+
 
         # ----------------------------------------
         # 4️⃣ Nettoyage doublons / exclusions
@@ -595,7 +626,6 @@ async def reimport_radarr(
         payload_add = {
             "tmdbId": tmdb_id,
             "qualityProfileId": cached_profile,
-            "rootFolderPath": "/home/maman/Medias/movies",
             "monitored": True,
             "path": path,
             "addOptions": {"searchForMovie": False},
@@ -646,7 +676,7 @@ async def fix_imdb_single(
     payload: dict = Body(
         ...,
         example={
-            "path": "/home/maman/Medias/movies/Cash (2023)/Cash (2023).mkv",
+            "path": "/home/ubuntu/Medias/movies/Cash (2023)/Cash (2023).mkv",
             "dry_run": True,
             "imdb_id": "tt2737050",
         },
@@ -654,7 +684,7 @@ async def fix_imdb_single(
 ):
     """
     🎯 Corrige le nom d’un film individuel (CACHE RADARR UNIQUEMENT) :
-      - Utilise uniquement /home/maman/.cache/radarr_cache.json comme source
+      - Utilise uniquement /home/ubuntu/.cache/radarr_cache.json comme source
       - Matche sur :
           * Titre du dossier (Titre (Année))
           * title ET originalTitle du cache
@@ -727,7 +757,8 @@ async def fix_imdb_single(
 
         # -------- 1️⃣ Lecture du cache Radarr JSON --------
 
-        cache_path = Path("/home/maman/.cache/radarr_cache.json")
+        cache_path: Path = Path.home() / ".cache" / "radarr_cache.json"
+
         if cache_path.exists():
             try:
                 with cache_path.open("r", encoding="utf-8") as f:

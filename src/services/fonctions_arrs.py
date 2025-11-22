@@ -3,7 +3,7 @@ import json
 import aiohttp
 import re
 import asyncio
-from typing import Optional
+from typing import Optional , Dict, List
 from pathlib import Path
 from fastapi import HTTPException
 from loguru import logger
@@ -602,4 +602,3 @@ class SonarrService:
         except requests.exceptions.RequestException as e:
             logger.error(f"🌐 Erreur lookup TMDb {tmdb_id} : {e}", exc_info=True)
             return None
-

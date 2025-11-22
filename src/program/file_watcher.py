@@ -761,38 +761,7 @@ def start_symlink_watcher():
         symlink_store.extend(symlinks_data)
         logger.success(f"✔️ Scan initial terminé — {len(symlinks_data)} symlinks chargés")
 
-        try:
-            import docker
-            from datetime import datetime, timezone
-
-            client = docker.from_env()
-
-            container = client.containers.get("decypharr")
-            state = container.attrs["State"]
-            status = state.get("Status", "").lower()
-            started_at = state.get("StartedAt")
-
-            start_time = None
-            if started_at and started_at not in ("", None):
-                start_time = datetime.strptime(
-                    started_at.split(".")[0],
-                    "%Y-%m-%dT%H:%M:%S"
-                ).replace(tzinfo=timezone.utc)
-
-            # 1️⃣ Si pas running → on attend
-            if status != "running":
-                logger.warning(f"⏸️ Symlink watcher en pause : Decypharr status = {status}")
-                time.sleep(60)
-
-            # 2️⃣ Si uptime < 120 sec → on attend aussi
-            if start_time:
-                uptime = (datetime.now(timezone.utc) - start_time).total_seconds()
-                if uptime < 120:
-                    logger.info(f"⏳ Decypharr actif depuis {int(uptime)}s — report du scan initial...")
-                    time.sleep(120 - int(uptime))
-
-        except Exception as e:
-            logger.warning(f"⚠️ Impossible de vérifier l’état du conteneur Decypharr : {e}")
+        wait_for_decypharr_containers(min_uptime_seconds=120)
 
         # 🧹 Process orphelins initial (scan + suppression)
         run_orphans_process()
@@ -830,6 +799,84 @@ def start_symlink_watcher():
             obs.join()
         logger.warning("✅ Watchers arrêtés proprement")
 
+def wait_for_decypharr_containers(min_uptime_seconds=120):
+    """
+    Attend que TOUS les conteneurs dont le nom commence par 'decypharr'
+    soient démarrés ET aient un uptime suffisant.
+    Ajoute une attente minimale pour éviter les boucles rapides.
+    """
+    import docker
+    from datetime import datetime, timezone
+    import time
+
+    client = docker.from_env()
+
+    while True:
+        try:
+            # Sélectionne tous les conteneurs dont le nom commence par "decypharr"
+            containers = [
+                c for c in client.containers.list(all=True)
+                if any(n.startswith("decypharr") for n in c.name.split("/"))
+            ]
+
+            if not containers:
+                logger.warning("⚠️ Aucun conteneur dont le nom commence par 'decypharr' trouvé.")
+                return
+
+            all_ready = True
+            wait_times = []
+
+            now = datetime.now(timezone.utc)
+
+            for c in containers:
+                state = c.attrs["State"]
+                status = state.get("Status", "").lower()
+                started_at = state.get("StartedAt")
+
+                # 1️⃣ Si le conteneur n'est pas running, on attend
+                if status != "running":
+                    all_ready = False
+                    logger.info(f"⏳ {c.name} pas encore running (status={status}) — attente 30s")
+                    wait_times.append(30)
+                    continue
+
+                # 2️⃣ Vérification du temps de démarrage
+                if started_at and started_at not in ("", None):
+                    start_time = datetime.strptime(
+                        started_at.split(".")[0],
+                        "%Y-%m-%dT%H:%M:%S"
+                    ).replace(tzinfo=timezone.utc)
+
+                    uptime = (now - start_time).total_seconds()
+
+                    if uptime < min_uptime_seconds:
+                        all_ready = False
+
+                        remaining = min_uptime_seconds - uptime
+                        remaining = max(1, int(remaining))  # ⬅️ Fix anti-attente-0s
+
+                        logger.info(
+                            f"⏳ {c.name} uptime {int(uptime)}s < {min_uptime_seconds}s "
+                            f"— attente {remaining}s"
+                        )
+
+                        wait_times.append(remaining)
+                        continue
+
+            # 3️⃣ Tous prêts → on sort
+            if all_ready:
+                logger.success("🚀 Tous les conteneurs 'decypharr*' sont prêts.")
+                return
+
+            # 4️⃣ Attend le max du temps nécessaire
+            sleep_time = max(wait_times or [30])
+            sleep_time = max(1, int(sleep_time))  # ⬅️ sécurité
+
+            time.sleep(sleep_time)
+
+        except Exception as e:
+            logger.warning(f"⚠️ Erreur durant la vérification des conteneurs Decypharr : {e}")
+            time.sleep(30)
 
 def run_orphans_process():
     """
@@ -1234,46 +1281,8 @@ def start_light_broken_symlink_monitor(interval_minutes=5):
 
     while True:
         try:
-            # 🧩 Vérifie l’état du conteneur Decypharr avant chaque cycle
-            try:
-                container = client.containers.get("decypharr")
-                state = container.attrs["State"]
-                status = state.get("Status", "").lower()
-                started_at = state.get("StartedAt")
-
-                start_time = None
-                if started_at and started_at not in ("", None):
-                    start_time = datetime.strptime(started_at.split(".")[0], "%Y-%m-%dT%H:%M:%S").replace(
-                        tzinfo=timezone.utc
-                    )
-
-                if status != "running":
-                    logger.warning(f"⏸️ Monitor léger en pause : Decypharr status = {status}")
-                    time.sleep(60)
-                    continue
-
-                if start_time:
-                    uptime = (datetime.now(timezone.utc) - start_time).total_seconds()
-                    if uptime < 120:
-                        logger.info(f"⏳ Decypharr actif depuis {int(uptime)}s — report du monitor léger...")
-                        time.sleep(60)
-                        continue
-
-                last_started_at = getattr(start_light_broken_symlink_monitor, "_last_started_at", None)
-                current_started_at = started_at
-
-                if last_started_at and current_started_at and current_started_at != last_started_at:
-                    logger.warning("♻️ Redémarrage de Decypharr détecté — mise en pause du monitor léger.")
-                    setattr(start_light_broken_symlink_monitor, "_last_started_at", current_started_at)
-                    time.sleep(120)
-                    continue
-
-                setattr(start_light_broken_symlink_monitor, "_last_started_at", current_started_at)
-
-            except Exception as e:
-                logger.warning(f"⚠️ Impossible de vérifier l’état du conteneur Decypharr : {e}")
-                time.sleep(30)
-                continue
+            # 🔒 Protection : attendre que tous les conteneurs decypharr* soient prêts
+            wait_for_decypharr_containers(min_uptime_seconds=120)
 
             # --- Routine principale du monitor ---
             broken_now, repaired_now = [], []

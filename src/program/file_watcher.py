@@ -764,7 +764,10 @@ def start_symlink_watcher():
         wait_for_decypharr_containers(min_uptime_seconds=120)
 
         # 🧹 Process orphelins initial (scan + suppression)
-        run_orphans_process()
+        if getattr(config_manager.config, "alldebrid_instances", []):
+            run_orphans_process()
+        else:
+            logger.info("🧩 Aucune Instance Alldebrid dans config.json → Aucun scan orphelins exécuté.")
 
         # --- 5️⃣ Fin du scan initial ---
         sse_manager.publish_event("symlink_update", {
@@ -780,7 +783,7 @@ def start_symlink_watcher():
         logger.info("🔔 Signal envoyé : scan initial terminé (monitor léger autorisé à démarrer)")
 
         # 🚀 Lancement explicite du monitor léger
-        threading.Thread(target=start_light_broken_symlink_monitor, args=(5,), daemon=True).start()
+        threading.Thread(target=start_light_broken_symlink_monitor, daemon=True).start()
         logger.info("🧩 Monitor léger démarré après le scan initial.")
 
         # --- 6️⃣ Boucle passive (veille) ---
@@ -865,7 +868,6 @@ def wait_for_decypharr_containers(min_uptime_seconds=120):
 
             # 3️⃣ Tous prêts → on sort
             if all_ready:
-                logger.success("🚀 Tous les conteneurs 'decypharr*' sont prêts.")
                 return
 
             # 4️⃣ Attend le max du temps nécessaire
@@ -1076,6 +1078,10 @@ def start_periodic_orphans_task(interval_hours: float = 24.0):
     -⚠️ Attends un premier intervalle avant le premier run pour éviter
       un double appel au démarrage (start_symlink_watcher appelle déjà run_orphans_process()).
     """
+    if not getattr(config_manager.config, "alldebrid_instances", []):
+        logger.info("🧩 Tâche orphelins ignorée : aucune instance Alldebrid configurée.")
+        return
+
     def loop():
         logger.info(
             f"🧹 Tâche périodique orphelins démarrée "
@@ -1250,7 +1256,7 @@ def start_replacement_cleanup_task(interval_hours: int = 6, expiry_hours: int = 
 
     threading.Thread(target=cleanup_loop, daemon=True).start()
 
-def start_light_broken_symlink_monitor(interval_minutes=5):
+def start_light_broken_symlink_monitor():
     """
     🔍 Monitor léger des symlinks brisés.
     Vérifie régulièrement les symlinks déjà connus (symlink_store)
@@ -1477,7 +1483,7 @@ def start_light_broken_symlink_monitor(interval_minutes=5):
         except Exception as e:
             logger.error(f"💥 Erreur pendant la validation de cohérence (base ↔ store) : {e}")
 
-        time.sleep(interval_minutes * 60)
+        time.sleep(6 * 3600)
 
 def start_all_watchers():
     from integrations.seasonarr.db.database import init_db
@@ -1490,7 +1496,5 @@ def start_all_watchers():
     threading.Thread(target=start_yaml_watcher, daemon=True).start()
     threading.Thread(target=start_symlink_watcher, daemon=True).start()
     start_discord_flusher()
-    start_replacement_cleanup_task(interval_hours=0.0167, expiry_hours=12)
+    start_replacement_cleanup_task(interval_hours=0.25, expiry_hours=12)
     start_periodic_orphans_task(interval_hours=24.0)
-
-

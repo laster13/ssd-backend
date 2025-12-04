@@ -12,7 +12,7 @@ from ..db.database import get_db
 from ..db.models import User
 
 COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN", None)
-COOKIE_SECURE = os.getenv("COOKIE_SECURE", "False").lower() in ("true", "1")
+COOKIE_SECURE = True
 
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
 ALGORITHM = "HS256"

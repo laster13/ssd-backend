@@ -85,8 +85,25 @@ def run_backup(subfolder):
     dest_dir.mkdir(parents=True, exist_ok=True)
     archive_path = dest_dir / f"{subfolder}_{timestamp}.tar.gz"
 
+    # Création de l'archive
     shutil.make_archive(str(archive_path).replace(".tar.gz", ""), 'gztar', str(source))
     logger.success(f"Backup de {subfolder} créée → {archive_path}")
+
+    # 🔁 Rotation : ne garder que les 3 dernières sauvegardes
+    # On trie par date de modification (plus sûr que le nom du fichier)
+    archives = sorted(
+        dest_dir.glob("*.tar.gz"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True  # plus récentes d'abord
+    )
+
+    # À partir de la 4e, on supprime
+    for old_archive in archives[3:]:
+        try:
+            old_archive.unlink()
+            logger.info(f"🧹 Ancienne sauvegarde supprimée : {old_archive}")
+        except Exception as e:
+            logger.error(f"Erreur lors de la suppression de {old_archive} : {e}")
 
 def schedule_all():
     scheduler.remove_all_jobs()

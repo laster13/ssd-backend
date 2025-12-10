@@ -12,6 +12,7 @@ from routers.secure.orphans import router as orphans_router
 from routers.secure.alldebrid import router as alldebrid_router
 from routers.secure.update import router as update_router
 from routers.secure.rename import router as rename_router
+from routers.secure.rename_series import router as rename_series_router
 
 # ➕ Seasonarr (intégré)
 from integrations.seasonarr.api.routers import (
@@ -42,6 +43,7 @@ app_router.include_router(orphans_router)
 app_router.include_router(alldebrid_router)
 app_router.include_router(update_router)
 app_router.include_router(rename_router)
+app_router.include_router(rename_series_router)
 
 # ➕ Routes Seasonarr (HTTP) sous /api/v1/seasonarr/...
 app_router.include_router(seasonarr_router)

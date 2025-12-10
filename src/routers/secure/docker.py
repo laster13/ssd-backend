@@ -105,8 +105,23 @@ def run_backup(name):
     dest_dir.mkdir(parents=True, exist_ok=True)
     archive_path = dest_dir / f"{name}_{timestamp}.tar.gz"
 
-    shutil.make_archive(str(archive_path).replace(".tar.gz", ""), 'gztar', str(source))
+    # Création de l'archive
+    shutil.make_archive(str(archive_path).replace(".tar.gz", ""), "gztar", str(source))
     logger.success(f"Sauvegarde créée pour {name} → {archive_path}")
+
+    # 🔁 Rotation : ne garder que les 3 dernières sauvegardes
+    archives = sorted(
+        dest_dir.glob("*.tar.gz"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,  # plus récentes d'abord
+    )
+
+    for old_archive in archives[3:]:
+        try:
+            old_archive.unlink()
+            logger.info(f"🧹 Ancienne sauvegarde Docker supprimée : {old_archive}")
+        except Exception as e:
+            logger.error(f"Erreur lors de la suppression de {old_archive} : {e}")
 
 
 # ⏰ Programmer toutes les sauvegardes planifiées

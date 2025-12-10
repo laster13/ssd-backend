@@ -1228,19 +1228,34 @@ def list_duplicates(folder: str = Query(None)):
     # ⚡ On applique d’abord le filtrage par dossier si fourni
     results = symlink_store
     if folder:
+        # tu peux améliorer en utilisant filter_items_by_folder si tu veux :
+        # results = filter_items_by_folder(results, folder)
         results = [s for s in results if folder in s["symlink"]]
 
     # ⚡ Ensuite on construit la map des doublons
-    target_map = {}
+    target_map: dict[str, list[dict]] = {}
     for item in results:
         target = item["target"]
         if item.get("ref_count", 0) > 1:
             target_map.setdefault(target, []).append(item)
 
-    duplicates = []
+    duplicates: list[dict] = []
     for items in target_map.values():
         if len(items) > 1:
             duplicates.extend(items)
+
+    # 🕒 Enrichir les doublons avec created_at (sans toucher au scan global)
+    from datetime import datetime
+    import os
+
+    for item in duplicates:
+        if not item.get("created_at"):
+            try:
+                stat = os.lstat(item["symlink"])
+                item["created_at"] = datetime.fromtimestamp(stat.st_mtime).isoformat()
+            except Exception:
+                # en cas d'erreur (symlink disparu, permission, etc.)
+                item["created_at"] = None
 
     return {
         "total": len(duplicates),

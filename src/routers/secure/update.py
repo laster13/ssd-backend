@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Request, Depends
+from fastapi import APIRouter, Depends
 from loguru import logger
 import asyncio
 import json
@@ -11,11 +11,14 @@ from src.integrations.seasonarr.db.models import Notification
 from src.integrations.seasonarr.db.database import get_db
 from packaging import version  # ✅ pour compare_versions
 from src.integrations.seasonarr.db.database import SessionLocal
-import sqlite3
-from pathlib import Path
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from zoneinfo import ZoneInfo
 
 
 router = APIRouter(prefix="/update", tags=["update"])
+scheduler = AsyncIOScheduler(timezone=ZoneInfo("Europe/Paris"))
+
 
 FRONTEND_VERSION_URL = "https://raw.githubusercontent.com/laster13/ssd-frontend/main/version.json"
 BACKEND_VERSION_URL = "https://raw.githubusercontent.com/laster13/ssd-backend/main/version.json"
@@ -144,17 +147,13 @@ async def get_versions():
         logger.error(f"💥 Erreur lors de la récupération des versions : {e}")
         return {"backend": "0.0.0", "frontend": "0.0.0"}
 
-# ==========================================================
-# 🔎 4. Vérifier si une mise à jour backend ou frontend est disponible
-# ==========================================================
-
-@router.get("/check")
-async def check_updates(db: Session = Depends(get_db)):
+def perform_update_check(db: Session):
     """
     Vérifie s’il existe une nouvelle version du backend et du frontend.
     Compare les fichiers version.json locaux et distants,
     et enregistre une notification persistante si une mise à jour est disponible.
     Supprime les notifications obsolètes si tout est à jour.
+    Retourne un dict avec le résultat.
     """
     try:
         # =====================================================
@@ -267,6 +266,58 @@ async def check_updates(db: Session = Depends(get_db)):
             "message": "❌ Erreur pendant la vérification des mises à jour.",
         }
 
+
+def scheduled_check_updates():
+    """
+    Job périodique appelé par APScheduler.
+    Il ouvre une session DB, appelle perform_update_check,
+    et peut envoyer des events SSE si une mise à jour est dispo.
+    """
+    db = SessionLocal()
+    try:
+        result = perform_update_check(db)
+
+        # Si une mise à jour est dispo, on pousse des SSE
+        if result.get("update_available"):
+            backend = result.get("backend", {}) or {}
+            frontend = result.get("frontend", {}) or {}
+
+            if backend.get("has_update"):
+                sse_manager.publish_event(
+                    "update_available_backend",
+                    {
+                        "message": result.get("message", ""),
+                        "version": backend.get("remote"),
+                    },
+                )
+
+            if frontend.get("has_update"):
+                sse_manager.publish_event(
+                    "update_available_frontend",
+                    {
+                        "message": result.get("message", ""),
+                        "version": frontend.get("remote"),
+                    },
+                )
+
+    except Exception as e:
+        logger.error(f"💥 Erreur dans scheduled_check_updates : {e}")
+    finally:
+        db.close()
+
+
+# ==========================================================
+#    4. Vérifier si une mise à jour backend ou frontend est disponible
+# ==========================================================
+
+@router.get("/check")
+async def check_updates(db: Session = Depends(get_db)):
+    """
+    Endpoint HTTP qui utilise la logique de perform_update_check.
+    Toujours utilisable par ton frontend comme avant.
+    """
+    return perform_update_check(db)
+
 # ==========================================================
 # 🧱 5. Persistance des notifications de mise à jour
 # ==========================================================
@@ -368,3 +419,20 @@ def get_persistent_update_notification(db: Session = Depends(get_db)):
         "message": notif.message,
         "version": notif.extra_data.get("version") if notif.extra_data else None,
     }
+
+@router.on_event("startup")
+def start_update_scheduler():
+    """
+    Démarre le scheduler qui vérifie les mises à jour régulièrement.
+    Ici : toutes les 6 heures à minute 0.
+    """
+    scheduler.add_job(
+        scheduled_check_updates,
+        CronTrigger(minute="*/10"),
+        id="check_updates",
+        replace_existing=True,
+    )
+
+    if not scheduler.running:
+        scheduler.start()
+        logger.info("⏰ Scheduler de vérification de mises à jour démarré")

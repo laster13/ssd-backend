@@ -11,7 +11,6 @@ import unicodedata
 import re
 import os
 from src.services.medias_movies import MediasMovies
-from src.services.medias_series import MediasSeries
 from src.services.fonctions_arrs import TMDbService
 from program.settings.manager import config_manager
 from src.services.fonctions_arrs import RadarrService

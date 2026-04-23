@@ -7,9 +7,8 @@ from program.utils import generate_api_key, get_version
 
 
 # ═══════════════════════════════════════════════════════════
-# 🔁 Observable base
+# Observable base
 # ═══════════════════════════════════════════════════════════
-
 class Observable(BaseModel):
     """Base pour notifier les observateurs (UI ou autres) lors d’un changement."""
     _notify_observers: Callable = None
@@ -25,9 +24,8 @@ class Observable(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════
-# 🎬 Services et utilisateurs
+# Services et utilisateurs
 # ═══════════════════════════════════════════════════════════
-
 class PlexModel(Observable):
     token: str = ""
     login: str = ""
@@ -64,9 +62,8 @@ class CloudflareModel(Observable):
 
 
 # ═══════════════════════════════════════════════════════════
-# ⚙️ Configuration générale de l’application
+#⚙️ Configuration générale de l’application
 # ═══════════════════════════════════════════════════════════
-
 class DossierModel(BaseModel):
     on_item_type: List[str] = []
     authentification: Dict[str, str] = Field(default_factory=dict)
@@ -81,6 +78,7 @@ class ApplicationModel(Observable):
 class AppModel(Observable):
     version: str = get_version()
     api_key: str = ""
+    auth_enabled: bool = True
     firstRun: bool = True
     debug: bool = True
     log: bool = True
@@ -99,21 +97,20 @@ class AppModel(Observable):
 
 
 # ═══════════════════════════════════════════════════════════
-# 📁 Gestion des symlinks
+# Gestion des symlinks
 # ═══════════════════════════════════════════════════════════
-
 class LinkDir(BaseModel):
     path: str
     manager: str  # "sonarr" ou "radarr"
 
 
 # ═══════════════════════════════════════════════════════════
-# 🧩 Configuration des instances AllDebrid
+# Configuration des instances AllDebrid
 # ═══════════════════════════════════════════════════════════
-
 class AllDebridInstance(BaseModel):
     """
     Représente une instance AllDebrid complète.
+
     Chaque instance peut avoir son propre chemin de cache Decypharr,
     défini manuellement par l'utilisateur via le frontend.
     """
@@ -125,13 +122,14 @@ class AllDebridInstance(BaseModel):
     priority: int = 1
     enabled: bool = True
 
+
 class OrphanManagerConfig(BaseModel):
     auto_delete: bool = False
+
 
 # ═══════════════════════════════════════════════════════════
 # ⚙️ Configuration principale (config.json)
 # ═══════════════════════════════════════════════════════════
-
 class SymlinkConfig(BaseModel):
     links_dirs: List[LinkDir] = Field(default_factory=list)
     mount_dirs: List[str] = Field(default_factory=list)
@@ -142,10 +140,10 @@ class SymlinkConfig(BaseModel):
     discord_webhook_url: Optional[str] = None
     tmdb_api_key: Optional[str] = None
 
-# ═══════════════════════════════════════════════════════════
-# 🧹 Résultat du scan des orphelins
-# ═══════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════
+# Résultat du scan des orphelins
+# ═══════════════════════════════════════════════════════════
 class OrphanScanStats(BaseModel):
     sources: int
     symlinks: int

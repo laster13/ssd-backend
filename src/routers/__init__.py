@@ -2,6 +2,7 @@ from fastapi import Request
 from fastapi.routing import APIRouter
 
 from program.settings.manager import settings_manager
+
 from routers.secure.default import router as default_router
 from routers.secure.settings import router as settings_router
 from routers.secure.script import router as script_router
@@ -13,6 +14,7 @@ from routers.secure.alldebrid import router as alldebrid_router
 from routers.secure.update import router as update_router
 from routers.secure.rename import router as rename_router
 from routers.secure.rename_series import router as rename_series_router
+from routers.secure.auth_control import router as auth_control_router
 
 # ➕ Seasonarr (intégré)
 from integrations.seasonarr.api.routers import (
@@ -22,8 +24,11 @@ from integrations.seasonarr.api.routers import (
 
 from routers.models.shared import RootResponse
 
+
 API_VERSION = "v1"
+
 app_router = APIRouter(prefix=f"/api/{API_VERSION}")
+
 
 @app_router.get("/", operation_id="root")
 async def root(_: Request) -> RootResponse:
@@ -31,6 +36,7 @@ async def root(_: Request) -> RootResponse:
         "message": "SSD is running!",
         "version": settings_manager.settings.version,
     }
+
 
 # Routes existantes
 app_router.include_router(default_router)
@@ -44,6 +50,7 @@ app_router.include_router(alldebrid_router)
 app_router.include_router(update_router)
 app_router.include_router(rename_router)
 app_router.include_router(rename_series_router)
+app_router.include_router(auth_control_router)
 
 # ➕ Routes Seasonarr (HTTP) sous /api/v1/seasonarr/...
 app_router.include_router(seasonarr_router)

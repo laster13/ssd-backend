@@ -1,7 +1,6 @@
 from typing import Any, Dict, List, Callable, Optional
 from pydantic import BaseModel, Field
 from datetime import datetime
-from pathlib import Path
 
 from program.utils import generate_api_key, get_version
 
@@ -65,7 +64,7 @@ class CloudflareModel(Observable):
 #⚙️ Configuration générale de l’application
 # ═══════════════════════════════════════════════════════════
 class DossierModel(BaseModel):
-    on_item_type: List[str] = []
+    on_item_type: List[str] = Field(default_factory=list)
     authentification: Dict[str, str] = Field(default_factory=dict)
     domaine: Dict[str, Any] = Field(default_factory=dict)
 
@@ -85,7 +84,7 @@ class AppModel(Observable):
     utilisateur: UtilisateurModel = UtilisateurModel()
     cloudflare: CloudflareModel = CloudflareModel()
     dossiers: DossierModel = DossierModel()
-    applications: List[ApplicationModel] = []
+    applications: List[ApplicationModel] = Field(default_factory=list)
     plex: PlexModel = PlexModel()
     jellyfin: JellyfinModel = JellyfinModel()
     emby: EmbyModel = EmbyModel()
@@ -109,10 +108,13 @@ class LinkDir(BaseModel):
 # ═══════════════════════════════════════════════════════════
 class AllDebridInstance(BaseModel):
     """
-    Représente une instance AllDebrid complète.
+    Représente une instance AllDebrid.
 
-    Chaque instance peut avoir son propre chemin de cache Decypharr,
-    défini manuellement par l'utilisateur via le frontend.
+    Une instance correspond à un compte AllDebrid utilisable
+    pour :
+    - le scan des torrents présents dans le mount WebDAV
+    - la suppression via l’API AllDebrid
+    - le nettoyage éventuel du cache Decypharr associé
     """
     name: str
     api_key: str
@@ -133,8 +135,13 @@ class OrphanManagerConfig(BaseModel):
 class SymlinkConfig(BaseModel):
     links_dirs: List[LinkDir] = Field(default_factory=list)
     mount_dirs: List[str] = Field(default_factory=list)
+
+    # Toute la logique AllDebrid / WebDAV / suppression passe désormais par ces instances
     alldebrid_instances: List[AllDebridInstance] = Field(default_factory=list)
+
     orphan_manager: OrphanManagerConfig = OrphanManagerConfig()
+
+    # API externes
     radarr_api_key: Optional[str] = None
     sonarr_api_key: Optional[str] = None
     discord_webhook_url: Optional[str] = None
@@ -145,20 +152,27 @@ class SymlinkConfig(BaseModel):
 # Résultat du scan des orphelins
 # ═══════════════════════════════════════════════════════════
 class OrphanScanStats(BaseModel):
-    sources: int
-    symlinks: int
-    orphans: int
+    """Statistiques du scan."""
+    sources: int = Field(..., description="Nombre total de dossiers torrents trouvés sur le mount/WebDAV")
+    symlinks: int = Field(..., description="Nombre total de cibles de symlinks trouvées")
+    orphans: int = Field(..., description="Nombre total d’orphelins détectés")
 
 
 class OrphanActions(BaseModel):
-    auto_delete: bool
-    deletable: int
+    """Actions possibles selon la configuration."""
+    auto_delete: bool = Field(..., description="True si la suppression automatique est activée")
+    deletable: int = Field(..., description="Nombre d’éléments supprimables automatiquement")
 
 
 class OrphanScanResult(BaseModel):
+    """Résultat principal d’un scan orphelins."""
     scan_date: str = Field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
-    instance: str
-    mount_path: str
+    instance: str = Field(..., description="Nom de l’instance AllDebrid traitée")
+    mount_path: str = Field(..., description="Chemin du mount/WebDAV AllDebrid scanné")
+    duration_seconds: float = Field(..., description="Durée du scan en secondes")
     stats: OrphanScanStats
-    orphans: List[str] = Field(default_factory=list)
+    orphans: List[str] = Field(
+        default_factory=list,
+        description="Liste complète des dossiers ou fichiers orphelins détectés"
+    )
     actions: OrphanActions

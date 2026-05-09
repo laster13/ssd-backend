@@ -13,6 +13,7 @@ import os
 import httpx
 import docker
 import threading
+import uuid
 from sqlalchemy.orm import Session
 from integrations.seasonarr.db.database import get_db
 from integrations.seasonarr.core.auth import get_current_user
@@ -21,6 +22,8 @@ from integrations.seasonarr.services.season_it_service import SeasonItService
 from integrations.seasonarr.clients.sonarr_client import SonarrClient
 from integrations.seasonarr.db.models import SonarrInstance
 from integrations.seasonarr.db.models import UserSettings
+from integrations.seasonarr.db.database import SessionLocal
+from integrations.seasonarr.db.models import SystemActivity
 from datetime import datetime
 from loguru import logger
 from urllib.parse import unquote
@@ -109,6 +112,9 @@ async def get_symlinks_config():
     return config_manager.config
 
 watcher_thread = None
+broken_scan_thread = None
+broken_scan_lock = threading.Lock()
+broken_scan_running = False
 
 @router.post("/config", response_model=dict)
 async def set_symlinks_config(new_config: SymlinkConfig, background_tasks: BackgroundTasks):
@@ -245,6 +251,261 @@ def scan_symlinks_parallel(workers: int = 32, fast: bool = True, ultra_fast: boo
 # ⚡ Remplace l’ancien alias
 scan_symlinks = scan_symlinks_parallel
 
+
+def run_broken_detection_job():
+    """
+    Lance une détection complète des symlinks brisés en arrière-plan.
+
+    Version optimisée :
+    - snapshot local du store pour éviter les itérations concurrentes
+    - vérification parallèle des cibles
+    - très peu d'accès DB
+    - un seul commit DB
+    - recalcul ref_count en mémoire uniquement
+    - SSE de progression limité
+    - conserve la logique watcher / monitor léger
+    """
+    global symlink_store, broken_scan_running
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from collections import Counter
+    from pathlib import Path
+    import os
+    import uuid
+    import time
+
+    started_at = time.perf_counter()
+
+    try:
+        items = list(symlink_store or [])
+        total_items = len(items)
+
+        logger.info(f"🔍 [BROKEN-JOB] Début détection complète des symlinks brisés ({total_items} items)")
+
+        sse_manager.publish_event("symlink_update", {
+            "event": "broken_scan_started",
+            "action": "scan",
+            "message": f"Détection des symlinks brisés démarrée ({total_items} symlinks)",
+            "count": total_items,
+            "id": str(uuid.uuid4()),
+        })
+
+        if total_items == 0:
+            sse_manager.publish_event("symlink_update", {
+                "event": "broken_scan_completed",
+                "action": "scan",
+                "count": 0,
+                "broken_count": 0,
+                "newly_broken": 0,
+                "newly_repaired": 0,
+                "message": "Détection terminée : aucun symlink à analyser",
+                "id": str(uuid.uuid4()),
+            })
+            logger.info("✅ [BROKEN-JOB] Aucun symlink à analyser")
+            return
+
+        def check_one(item: dict):
+            symlink_str = item.get("symlink")
+            if not symlink_str:
+                return None
+
+            symlink_path = Path(symlink_str)
+
+            try:
+                if not symlink_path.exists() and not symlink_path.is_symlink():
+                    return {
+                        "item": item,
+                        "skip": True,
+                        "exists": False,
+                        "currently_broken": item.get("broken", False) or not item.get("target_exists", True),
+                    }
+            except Exception:
+                return {
+                    "item": item,
+                    "skip": True,
+                    "exists": False,
+                    "currently_broken": item.get("broken", False) or not item.get("target_exists", True),
+                }
+
+            exists = False
+
+            try:
+                if symlink_path.is_symlink():
+                    raw_target = os.readlink(symlink_path)
+                    if not os.path.isabs(raw_target):
+                        raw_target = os.path.join(str(symlink_path.parent), raw_target)
+                    exists = os.path.exists(raw_target)
+                else:
+                    exists = symlink_path.exists()
+            except Exception:
+                exists = False
+
+            currently_broken = item.get("broken", False) or not item.get("target_exists", True)
+
+            return {
+                "item": item,
+                "skip": False,
+                "exists": exists,
+                "currently_broken": currently_broken,
+            }
+
+        max_workers = min(64, max(8, (os.cpu_count() or 8) * 4))
+        logger.info(f"🔎 [BROKEN-JOB] Vérification parallèle de {total_items} symlink(s) avec {max_workers} worker(s)")
+
+        checked = 0
+        progress_step = 2000
+
+        broken_paths = set()
+        repaired_paths = set()
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(check_one, item) for item in items]
+
+            for future in as_completed(futures):
+                result = future.result()
+                if not result:
+                    continue
+
+                item = result["item"]
+                path_str = item["symlink"]
+
+                if not result["skip"]:
+                    exists = result["exists"]
+                    currently_broken = result["currently_broken"]
+
+                    if not exists and not currently_broken:
+                        broken_paths.add(path_str)
+                    elif exists and currently_broken:
+                        repaired_paths.add(path_str)
+
+                checked += 1
+
+                if checked % progress_step == 0 or checked == total_items:
+                    sse_manager.publish_event("symlink_update", {
+                        "event": "broken_scan_progress",
+                        "action": "scan",
+                        "checked": checked,
+                        "total": total_items,
+                        "message": f"Détection en cours : {checked}/{total_items}",
+                        "id": str(uuid.uuid4()),
+                    })
+
+        db = SessionLocal()
+        newly_broken = 0
+        newly_repaired = 0
+
+        try:
+            broken_db_rows = db.query(SystemActivity).filter(
+                SystemActivity.action == "broken"
+            ).all()
+
+            broken_db_by_path = {row.path: row for row in broken_db_rows}
+            broken_db_paths = set(broken_db_by_path.keys())
+
+            for path_str in broken_paths:
+                item = next((x for x in items if x.get("symlink") == path_str), None)
+                if not item:
+                    continue
+
+                if path_str not in broken_db_paths:
+                    db.add(SystemActivity(
+                        event="symlink_broken_manual",
+                        action="broken",
+                        path=path_str,
+                        manager=item.get("manager", "unknown"),
+                        message=f"Symlink brisé détecté manuellement : {path_str}",
+                        extra={"target": item.get("target")},
+                    ))
+
+            if repaired_paths:
+                db.query(SystemActivity).filter(
+                    SystemActivity.action == "broken",
+                    SystemActivity.path.in_(list(repaired_paths))
+                ).delete(synchronize_session=False)
+
+            db.commit()
+
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+        store_index = {item["symlink"]: item for item in symlink_store if item.get("symlink")}
+
+        for path_str in broken_paths:
+            x = store_index.get(path_str)
+            if x:
+                if not x.get("broken", False) or x.get("target_exists", True):
+                    newly_broken += 1
+                x["broken"] = True
+                x["target_exists"] = False
+                x["ref_count"] = 0
+
+        for path_str in repaired_paths:
+            x = store_index.get(path_str)
+            if x:
+                if x.get("broken", False) or not x.get("target_exists", True):
+                    newly_repaired += 1
+                x["broken"] = False
+                x["target_exists"] = True
+
+        target_counts = Counter(
+            item["target"]
+            for item in symlink_store
+            if item.get("target_exists", True) and item.get("target")
+        )
+
+        for item in symlink_store:
+            if item.get("target_exists", True):
+                item["ref_count"] = target_counts.get(item.get("target"), 0)
+            else:
+                item["ref_count"] = 0
+
+        total_broken = sum(
+            1 for item in symlink_store
+            if item.get("broken", False) or not item.get("target_exists", True)
+        )
+
+        duration = round(time.perf_counter() - started_at, 1)
+
+        sse_manager.publish_event("symlink_update", {
+            "event": "broken_scan_completed",
+            "action": "scan",
+            "count": len(symlink_store),
+            "broken_count": total_broken,
+            "newly_broken": newly_broken,
+            "newly_repaired": newly_repaired,
+            "duration": duration,
+            "message": (
+                f"Détection terminée : {newly_broken} nouveaux brisés, "
+                f"{newly_repaired} réparés, {total_broken} brisés au total "
+                f"({duration}s)"
+            ),
+            "id": str(uuid.uuid4()),
+        })
+
+        logger.success(
+            f"✅ [BROKEN-JOB] Terminé en {duration}s — "
+            f"{newly_broken} nouveaux brisés, "
+            f"{newly_repaired} réparés, "
+            f"{total_broken} brisés au total"
+        )
+
+    except Exception as e:
+        logger.error(f"💥 Erreur run_broken_detection_job: {e}", exc_info=True)
+
+        sse_manager.publish_event("symlink_update", {
+            "event": "broken_scan_failed",
+            "action": "scan",
+            "message": f"Échec détection symlinks brisés : {str(e)}",
+            "id": str(uuid.uuid4()),
+        })
+
+    finally:
+        with broken_scan_lock:
+            broken_scan_running = False
+
 # ---------------
 # Liste symlinks
 # --------------
@@ -299,7 +560,10 @@ def list_symlinks(
                 if parent.exists() and is_missing_imdb(parent.name):
                     imdb_missing += 1
 
-        all_broken = sum(1 for i in symlink_store or [] if not i.get("target_exists", True))
+        all_broken = sum(
+            1 for i in symlink_store or []
+            if i.get("broken", False) or not i.get("target_exists", True)
+        )
 
         # 📂 Filtre par dossier racine
         if folder:
@@ -326,7 +590,10 @@ def list_symlinks(
 
         # ⚠️ Filtre orphelins (cible absente)
         if orphans:
-            items = [i for i in items if not i.get("target_exists", True)]
+            items = [
+                i for i in items
+                if i.get("broken", False) or not i.get("target_exists", True)
+            ]
 
         # 🎬 Mode rename (dossiers sans IMDb valide)
         if rename:
@@ -373,7 +640,10 @@ def list_symlinks(
             "page": page,
             "limit": limit,
             "data": paginated,
-            "orphaned": sum(1 for i in items if not i.get("target_exists", True)),
+            "orphaned": sum(
+                1 for i in items
+                if i.get("broken", False) or not i.get("target_exists", True)
+            ),
             "unique_targets": len(set(i["target"] for i in items if i.get("target_exists", True))),
             "imdb_missing": imdb_missing,  # ✅ cohérent en snake_case
             "all_broken": all_broken,
@@ -392,6 +662,7 @@ def list_symlinks(
             "imdb_missing": 0,
         }
 
+
 # -----
 # Scan
 # -----
@@ -399,29 +670,92 @@ def list_symlinks(
 async def trigger_scan():
     global symlink_store
     try:
-        logger.info("🚀 [SCAN] Début du scan symlinks (parallèle + cache disque)")
+        logger.info("🚀 [SCAN] Début du scan symlinks rapide")
 
-        # ⚡ Lancement du scan en threadpool (évite de bloquer l'event loop FastAPI)
-        scanned = await run_in_threadpool(scan_symlinks_parallel, 8)  # 8 workers par défaut
+        # Snapshot de l'état courant pour préserver les symlinks déjà marqués brisés
+        previous_state = {
+            item["symlink"]: {
+                "broken": item.get("broken", False),
+                "target_exists": item.get("target_exists", True),
+                "ref_count": item.get("ref_count", 0),
+            }
+            for item in (symlink_store or [])
+        }
 
-        # ✅ IMPORTANT : modifier la liste en place pour conserver la référence partagée
+        # Scan rapide identique à la logique du watcher au démarrage
+        scanned = await run_in_threadpool(
+            partial(scan_symlinks_parallel, workers=8, fast=True, ultra_fast=True)
+        )
+
+        # Réinjecte l'état "broken" déjà connu pour ne pas le perdre après un scan rapide
+        restored_broken = 0
+        for item in scanned:
+            prev = previous_state.get(item["symlink"])
+            if prev and (prev.get("broken", False) or not prev.get("target_exists", True)):
+                item["broken"] = True
+                item["target_exists"] = False
+                item["ref_count"] = 0
+                restored_broken += 1
+
         symlink_store.clear()
         symlink_store.extend(scanned)
 
         payload = {
             "event": "scan_completed",
+            "action": "scan",
             "count": len(symlink_store),
+            "restored_broken": restored_broken,
         }
         sse_manager.publish_event("symlink_update", payload)
 
         return {
-            "message": "Scan terminé",
+            "message": "Scan rapide terminé",
             "count": len(symlink_store),
+            "restored_broken": restored_broken,
             "data": symlink_store,
         }
     except Exception as e:
         logger.error(f"💥 Erreur scan: {e!r}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/scan-broken")
+async def trigger_broken_scan():
+    global broken_scan_thread, broken_scan_running
+
+    try:
+        with broken_scan_lock:
+            if broken_scan_running:
+                return {
+                    "message": "Un scan des symlinks brisés est déjà en cours",
+                    "running": True,
+                }
+
+            broken_scan_running = True
+
+        broken_scan_thread = threading.Thread(
+            target=run_broken_detection_job,
+            daemon=True
+        )
+        broken_scan_thread.start()
+
+        return {
+            "message": "Détection des symlinks brisés lancée",
+            "running": True,
+        }
+
+    except Exception as e:
+        with broken_scan_lock:
+            broken_scan_running = False
+
+        logger.error(f"💥 Erreur trigger_broken_scan: {e!r}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/scan-broken/status")
+async def get_broken_scan_status():
+    return {
+        "running": broken_scan_running,
+    }
 
 # ---
 # SSE

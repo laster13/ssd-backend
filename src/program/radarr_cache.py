@@ -19,7 +19,7 @@ _radarr_idx_lock = threading.Lock()
 
 # --- Paramètres cache disque ---
 _CACHE_FILE = Path.home() / ".cache" / "radarr_cache.json"
-_INDEX_TTL_SEC = 3600  # 1h
+_INDEX_TTL_SEC = 86400  # 24h
 _last_index_build = 0.0
 
 

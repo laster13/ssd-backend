@@ -22,6 +22,7 @@ from .json_manager import update_json_files
 from integrations.seasonarr.db.database import SessionLocal
 from integrations.seasonarr.db.models import SystemActivity
 from program.utils.discord_notifier import send_discord_summary, send_discord_message
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from program.radarr_cache import (
     _radarr_index,
     _radarr_catalog,
@@ -30,7 +31,6 @@ from program.radarr_cache import (
     _build_radarr_index,
     enrich_from_radarr_index,
 )
-
 
 USER = os.getenv("USER") or os.getlogin()
 YAML_PATH = f"/home/{USER}/.ansible/inventories/group_vars/all.yml"
@@ -763,11 +763,11 @@ def start_symlink_watcher():
 
         wait_for_decypharr_containers(min_uptime_seconds=120)
 
-        # 🧹 Process orphelins initial (scan + suppression)
-        if getattr(config_manager.config, "alldebrid_instances", []):
+        # 🧹 Process orphelins initial Decypharr
+        if is_decypharr_orphans_enabled():
             run_orphans_process()
         else:
-            logger.info("🧩 Aucune Instance Alldebrid dans config.json → Aucun scan orphelins exécuté.")
+            logger.info("🧩 Scan orphelins Decypharr désactivé par configuration.")
 
         # --- 5️⃣ Fin du scan initial ---
         sse_manager.publish_event("symlink_update", {
@@ -880,164 +880,541 @@ def wait_for_decypharr_containers(min_uptime_seconds=120):
             logger.warning(f"⚠️ Erreur durant la vérification des conteneurs Decypharr : {e}")
             time.sleep(30)
 
-def run_orphans_process():
-    """
-    Lance un cycle complet de gestion des orphelins AllDebrid :
-    - scan des fichiers non rattachés à un symlink
-    - enregistrement dans la DB + buffer Discord + SSE
-    - suppression via delete_all_orphans_job
-    """
-    from routers.secure.orphans import scan_instance, delete_all_orphans_job
+# ─────────────────────────────────────────────────────────────
+# Decypharr orphan helpers
+# ─────────────────────────────────────────────────────────────
 
-    # 🧹 Scan orphelins
+def get_decypharr_config_value(key: str, default=None):
+    return getattr(config_manager.config, key, default)
+
+
+def get_decypharr_torrents_path() -> str:
+    """
+    Récupère le chemin torrents depuis la première instance AllDebrid active.
+    """
+    instances = getattr(config_manager.config, "alldebrid_instances", []) or []
+
+    enabled_instances = [
+        inst for inst in instances
+        if getattr(inst, "enabled", True)
+        and getattr(inst, "api_key", None)
+        and getattr(inst, "mount_path", None)
+    ]
+
+    if not enabled_instances:
+        raise RuntimeError(
+            "Configuration manquante : aucune instance AllDebrid active avec mount_path"
+        )
+
+    # priorité la plus faible = plus prioritaire
+    enabled_instances.sort(key=lambda inst: getattr(inst, "priority", 9999))
+
+    mount_path = str(getattr(enabled_instances[0], "mount_path")).rstrip("/")
+
+    return mount_path
+
+def get_decypharr_rate_limit() -> float:
+    """
+    Retourne le rate_limit de la première instance active.
+    """
+    instances = getattr(config_manager.config, "alldebrid_instances", []) or []
+
+    enabled_instances = [
+        inst for inst in instances
+        if getattr(inst, "enabled", True) and getattr(inst, "api_key", None)
+    ]
+
+    if not enabled_instances:
+        return 0.2
+
+    enabled_instances.sort(key=lambda inst: getattr(inst, "priority", 9999))
+
     try:
-        instances = getattr(config_manager.config, "alldebrid_instances", [])
-        if instances:
-            logger.info("🧹 Lancement du scan des fichiers Alldebrid non rattachés à un symlink...")
-            orphan_count = 0
-            for inst in instances:
-                if getattr(inst, "enabled", True):
-                    result = asyncio.run(scan_instance(inst))
-                    orphans = result.get("orphans", []) if isinstance(result, dict) else []
-                    logger.debug(f"🔍 Résultat scan_instance({inst.name}) → {len(orphans)} orphelins trouvés")
-                    orphan_count += len(orphans)
+        return float(getattr(enabled_instances[0], "rate_limit", 0.2) or 0.2)
+    except Exception:
+        return 0.2
 
-            if orphan_count > 0:
-                logger.success(f"✅ Scan orphelins terminé ({orphan_count} fichiers détectés)")
+def is_decypharr_orphans_enabled() -> bool:
+    """
+    Le scan n'est actif que s'il existe au moins une instance AllDebrid
+    active avec api_key + mount_path.
+    """
+    instances = getattr(config_manager.config, "alldebrid_instances", []) or []
 
-                # 📦 Nettoyage ancien buffer avant ajout
-                with buffer_lock:
-                    symlink_events_buffer[:] = [
-                        ev for ev in symlink_events_buffer if ev.get("action") != "orphan"
-                    ]
-                    symlink_events_buffer.append({
-                        "action": "orphan",
-                        "path": "Scan orphelins",
-                        "manager": "alldebrid",
-                        "when": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                        "count": orphan_count
-                    })
+    enabled_instances = [
+        inst for inst in instances
+        if getattr(inst, "enabled", True)
+        and getattr(inst, "api_key", None)
+        and getattr(inst, "mount_path", None)
+    ]
 
-                # 📡 SSE + DB (détection orphelins)
-                for inst in instances:
-                    try:
-                        db = SessionLocal()
-                        db.add(SystemActivity(
-                            event="orphan_detected",
-                            action="orphan",
-                            path=f"Instance {inst.name}",
-                            manager="alldebrid",
-                            message=f"{orphan_count} fichiers orphelins détectés sur {inst.name}"
-                        ))
-                        db.commit()
-                        db.close()
-                    except Exception as e:
-                        logger.error(f"💥 Erreur DB orphelins : {e}")
-            else:
-                logger.info("🧩 Aucun fichier orphelin trouvé — pas de message Discord ni DB.")
+    return len(enabled_instances) > 0
+
+def collect_symlink_targets_from_store_and_disk() -> set[Path]:
+    """
+    Récupère les cibles des symlinks.
+
+    Priorité :
+    1. symlink_store déjà rempli par scan_symlinks()
+    2. fallback disque seulement si symlink_store est vide
+
+    Important :
+    - ne fait pas de resolve() sur 18k liens, pour éviter les lenteurs WebDAV/mount distant
+    """
+    targets: set[Path] = set()
+
+    # 1. Depuis symlink_store
+    try:
+        from routers.secure.symlinks import symlink_store
+
+        for item in list(symlink_store):
+            target = item.get("target")
+            if not target:
+                continue
+
+            targets.add(Path(os.path.normpath(str(target))))
+
+        if targets:
+            logger.info(f"🔗 Cibles symlinks récupérées depuis symlink_store : {len(targets)}")
+            return targets
 
     except Exception as e:
-        logger.error(f"💥 Erreur durant le scan orphelins : {e}")
+        logger.debug(f"⚠️ Impossible de lire symlink_store : {e}")
 
-    # 🧪 Suppression orphelins
+    # 2. Fallback disque uniquement si store vide
+    logger.warning("⚠️ symlink_store vide, fallback scan disque des links_dirs...")
+
     try:
+        links_dirs = getattr(config_manager.config, "links_dirs", [])
+
+        for ld in links_dirs:
+            root = Path(ld.path)
+
+            if not root.exists():
+                logger.warning(f"⚠️ links_dir introuvable pendant scan orphelins : {root}")
+                continue
+
+            for item in root.rglob("*"):
+                try:
+                    if not item.is_symlink():
+                        continue
+
+                    raw_target = os.readlink(item)
+
+                    if os.path.isabs(raw_target):
+                        target_path = Path(raw_target)
+                    else:
+                        target_path = item.parent / raw_target
+
+                    targets.add(Path(os.path.normpath(str(target_path))))
+
+                except FileNotFoundError:
+                    continue
+                except Exception:
+                    continue
+
+    except Exception as e:
+        logger.error(f"💥 Erreur collecte cibles symlinks : {e}", exc_info=True)
+
+    return targets
+
+def list_torrent_names_from_webdav() -> set[str]:
+    """
+    Liste les dossiers réellement présents dans le WebDAV.
+    Exemple :
+        /mnt/alldebrid/__all__
+    """
+    root = Path(get_decypharr_torrents_path())
+
+    if not root.exists():
+        logger.warning(f"⚠️ Dossier torrents WebDAV introuvable : {root}")
+        return set()
+
+    names: set[str] = set()
+
+    try:
+        for item in root.iterdir():
+            try:
+                if item.is_dir():
+                    names.add(item.name)
+            except Exception:
+                continue
+    except Exception as e:
+        logger.error(f"💥 Impossible de lister le WebDAV {root} : {e}", exc_info=True)
+
+    return names
+
+
+def scan_decypharr_orphans() -> dict:
+    """
+    Scan optimisé et sécurisé des dossiers WebDAV non rattachés à un symlink.
+
+    Source principale :
+        decypharr_torrents_path, par exemple /mnt/alldebrid/__all__
+    """
+    torrents_path = get_decypharr_torrents_path().rstrip("/")
+    torrents_path_prefix = torrents_path + "/"
+
+    torrent_names = list_torrent_names_from_webdav()
+    symlink_targets = collect_symlink_targets_from_store_and_disk()
+
+    logger.info(f"📁 Dossiers torrents lus depuis WebDAV : {len(torrent_names)}")
+    logger.info(f"🔗 Cibles symlinks collectées : {len(symlink_targets)}")
+    logger.info(f"📁 Dossier torrents utilisé : {torrents_path}")
+
+    used_torrent_names: set[str] = set()
+
+    for target in symlink_targets:
+        try:
+            target_str = os.path.normpath(str(target))
+
+            if not target_str.startswith(torrents_path_prefix):
+                continue
+
+            relative = target_str[len(torrents_path_prefix):]
+            torrent_folder_name = relative.split("/", 1)[0]
+
+            if torrent_folder_name in torrent_names:
+                used_torrent_names.add(torrent_folder_name)
+
+        except Exception:
+            continue
+
+    orphan_names = sorted(torrent_names - used_torrent_names, key=str.lower)
+
+    orphans = [
+        {
+            "name": name,
+            "path": str(Path(torrents_path) / name),
+        }
+        for name in orphan_names
+    ]
+
+    logger.info(
+        f"🧩 Résultat scan WebDAV : "
+        f"{len(used_torrent_names)} dossier(s) utilisé(s), "
+        f"{len(orphans)} orphelin(s)"
+    )
+
+    if len(torrent_names) > 0 and len(symlink_targets) > 0 and len(used_torrent_names) == 0:
+        logger.error("🚨 Aucun symlink ne correspond au mount_path configuré.")
+        logger.error("🚨 Le chemin configuré est probablement incorrect.")
+        logger.error(f"🚨 mount_path actuel : {torrents_path}")
+
+        sample_targets = list(symlink_targets)[:20]
+        logger.error("🚨 Exemples de cibles symlinks trouvées :")
+        for sample in sample_targets:
+            logger.error(f"   ↳ {sample}")
+
+        logger.error("🚨 Scan annulé par sécurité : aucun orphelin ne sera supprimé.")
+
+        return {
+            "orphans": [],
+            "count": 0,
+            "total_torrents": len(torrent_names),
+            "total_symlink_targets": len(symlink_targets),
+            "used_torrents": [],
+            "torrents_path": torrents_path,
+            "symlink_targets": [str(p) for p in symlink_targets],
+            "source": "webdav",
+            "safety_abort": True,
+        }
+
+    return {
+        "orphans": orphans,
+        "count": len(orphans),
+        "total_torrents": len(torrent_names),
+        "total_symlink_targets": len(symlink_targets),
+        "used_torrents": sorted(used_torrent_names, key=str.lower),
+        "torrents_path": torrents_path,
+        "symlink_targets": [str(p) for p in symlink_targets],
+        "source": "webdav",
+        "safety_abort": False,
+    }
+
+
+def populate_orphans_store_from_decypharr_scan(scan_result: dict) -> list[str]:
+    """
+    Remplit routers.secure.orphans.orphans_store pour delete_all_orphans_job().
+
+    Version compatible 1 ou plusieurs comptes AllDebrid :
+    - utilise config_manager.config.alldebrid_instances
+    - crée une entrée orphans_store par compte activé
+    - fonctionne aussi avec un seul compte
+    """
+    from routers.secure.orphans import orphans_store
+
+    detected_orphans = scan_result.get("orphans", [])
+    mount_path = get_decypharr_torrents_path()
+
+    fake_orphan_files = [
+        str(Path(orphan["path"]) / ".seasonarr_orphan_marker")
+        for orphan in detected_orphans
+        if orphan.get("path")
+    ]
+
+    orphans_store.clear()
+
+    instances = getattr(config_manager.config, "alldebrid_instances", []) or []
+
+    enabled_instances = [
+        inst for inst in instances
+        if getattr(inst, "enabled", True)
+        and getattr(inst, "api_key", None)
+        and getattr(inst, "mount_path", None)
+    ]
+
+    if not enabled_instances:
+        raise RuntimeError(
+            "Aucune instance AllDebrid active avec api_key. "
+            "Ajoute au moins un compte dans 'alldebrid_instances'."
+        )
+
+    created_names: list[str] = []
+
+    for index, inst in enumerate(enabled_instances, start=1):
+        instance_name = getattr(inst, "name", None) or f"alldebrid_{index}"
+        api_key = str(getattr(inst, "api_key"))
+        rate_limit = float(getattr(inst, "rate_limit", get_decypharr_rate_limit()) or 0.2)
+
+        orphans_store[instance_name] = {
+            "orphans": fake_orphan_files,
+            "symlinks_list": scan_result.get("symlink_targets", []),
+            "api_key": api_key,
+            "mount_path": mount_path,
+            "cache_path": getattr(inst, "cache_path", "") or "",
+            "rate_limit": rate_limit,
+            "stats": {
+                "sources": scan_result.get("total_torrents", 0),
+                "symlinks": scan_result.get("total_symlink_targets", 0),
+                "orphans": len(fake_orphan_files),
+            },
+        }
+
+        created_names.append(instance_name)
+
+    logger.info(
+        f"🧩 orphans_store préparé pour {len(created_names)} compte(s) AllDebrid : "
+        f"{', '.join(created_names)} — {len(fake_orphan_files)} torrent(s) orphelin(s)"
+    )
+
+    return created_names
+
+
+def run_orphans_process():
+    """
+    Cycle complet :
+    - scan WebDAV ;
+    - détection des dossiers torrents sans symlink ;
+    - remplissage de orphans_store ;
+    - suppression via delete_all_orphans_job ;
+    - comparaison WebDAV avant/après.
+    """
+    from routers.secure.orphans import delete_all_orphans_job
+
+    if not is_decypharr_orphans_enabled():
+        logger.info("🧩 Scan orphelins Decypharr désactivé.")
+        return
+
+    detected_orphans: list[dict] = []
+    orphan_count = 0
+
+    try:
+        logger.info("🧹 Lancement du scan WebDAV : torrents non rattachés à un symlink...")
+
+        scan_result = scan_decypharr_orphans()
+
+        if scan_result.get("safety_abort"):
+            logger.error("🚨 Scan orphelins interrompu par sécurité. Aucune suppression ne sera lancée.")
+            return
+
+        detected_orphans = scan_result.get("orphans", [])
+        orphan_count = scan_result.get("count", len(detected_orphans))
+        total_torrents = scan_result.get("total_torrents", 0)
+        total_targets = scan_result.get("total_symlink_targets", 0)
+
+        logger.info(
+            f"🔍 Scan WebDAV terminé : "
+            f"{orphan_count} orphelin(s) / "
+            f"{total_torrents} dossier(s) / "
+            f"{total_targets} cible(s) symlink"
+        )
+
+        if orphan_count <= 0:
+            logger.info("🧩 Aucun torrent orphelin trouvé — aucune suppression lancée.")
+            return
+
+        orphan_names = [
+            orphan.get("name")
+            for orphan in detected_orphans
+            if orphan.get("name")
+        ]
+
+        logger.success(f"✅ {orphan_count} torrent(s) orphelin(s) détecté(s)")
+
+        for name in orphan_names[:30]:
+            logger.debug(f"🧩 Orphelin : {name}")
+
+        if orphan_count > 30:
+            logger.debug(f"… +{orphan_count - 30} autre(s) orphelin(s)")
+
+        populate_orphans_store_from_decypharr_scan(scan_result)
+
+        with buffer_lock:
+            symlink_events_buffer[:] = [
+                ev for ev in symlink_events_buffer
+                if ev.get("action") != "orphan"
+            ]
+
+            symlink_events_buffer.append({
+                "action": "orphan",
+                "path": "Scan orphelins WebDAV",
+                "manager": "alldebrid",
+                "when": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "count": orphan_count,
+                "orphans": orphan_names,
+            })
+
+        try:
+            sse_manager.publish_event("symlink_update", {
+                "event": "orphan_detected",
+                "action": "orphan",
+                "path": "Scan orphelins WebDAV",
+                "manager": "alldebrid",
+                "message": f"{orphan_count} torrent(s) orphelin(s) détecté(s)",
+                "count": orphan_count,
+                "orphans": orphan_names,
+            })
+        except Exception as e:
+            logger.error(f"💥 Erreur SSE orphan_detected : {e}")
+
+        try:
+            db = SessionLocal()
+            db.add(SystemActivity(
+                event="orphan_detected",
+                action="orphan",
+                path="Scan orphelins WebDAV",
+                manager="alldebrid",
+                message=f"{orphan_count} torrent(s) orphelin(s) détecté(s)",
+                extra={
+                    "count": orphan_count,
+                    "orphans": orphan_names,
+                    "torrents_path": get_decypharr_torrents_path(),
+                    "source": "webdav",
+                },
+            ))
+            db.commit()
+            db.close()
+        except Exception as e:
+            logger.error(f"💥 Erreur DB orphelins : {e}", exc_info=True)
+
+    except Exception as e:
+        logger.error(f"💥 Erreur durant le scan WebDAV orphelins : {e}", exc_info=True)
+        return
+
+    try:
+        auto_delete = getattr(config_manager.config.orphan_manager, "auto_delete", False)
+
+        if not auto_delete:
+            logger.info("🧪 orphan_manager.auto_delete=False → scan uniquement, aucune suppression lancée.")
+            return
+
         logger.info("🧪 Suppression des orphelins...")
 
-        # 🔎 Capture des logs du job pour reconstruire la liste des suppressions si le retour est incomplet
+        before_torrents = list_torrent_names_from_webdav()
+        logger.info(f"📦 Dossiers WebDAV avant suppression : {len(before_torrents)}")
+
         _captured_logs: list[str] = []
         _sink_id = logger.add(_captured_logs.append, format="{message}")
 
         try:
             result_delete = asyncio.run(delete_all_orphans_job(dry_run=False))
         finally:
-            logger.remove(_sink_id)
+            try:
+                logger.remove(_sink_id)
+            except Exception:
+                pass
 
         logger.success("✅ Suppression orphelins terminée")
 
-        deleted_names: list[str] = []
-        deleted_count: int = 0
+        after_torrents = list_torrent_names_from_webdav()
+        logger.info(f"📦 Dossiers WebDAV après suppression : {len(after_torrents)}")
 
-        # 1) Lecture directe du résultat si structuré
+        deleted_names: list[str] = sorted(before_torrents - after_torrents, key=str.lower)
+        deleted_count: int = len(deleted_names)
+
         if isinstance(result_delete, dict):
-            deleted_names = (
+            returned_deleted_names = (
                 result_delete.get("deleted_torrents")
                 or result_delete.get("deleted")
                 or result_delete.get("removed")
                 or []
             )
-            deleted_count = (
+
+            if isinstance(returned_deleted_names, str):
+                returned_deleted_names = [returned_deleted_names]
+
+            for name in returned_deleted_names:
+                if name and name not in deleted_names:
+                    deleted_names.append(name)
+
+            returned_deleted_count = (
                 result_delete.get("deleted_count")
                 or result_delete.get("count")
                 or 0
             )
 
-            # + extraction depuis éventuels logs/summary renvoyés
-            possible_logs = []
-            for k in ("logs", "output", "stdout", "messages", "details", "summary", "report", "message"):
-                v = result_delete.get(k)
-                if isinstance(v, list):
-                    possible_logs.extend(v)
-                elif isinstance(v, str) and v.strip():
-                    possible_logs.append(v)
+            if deleted_count == 0 and returned_deleted_count:
+                try:
+                    deleted_count = int(returned_deleted_count)
+                except Exception:
+                    pass
 
-            for line in possible_logs:
-                if not isinstance(line, str):
-                    continue
-                if "→ supprimé" in line or " deleted" in line.lower():
-                    name = line.split("]")[-1].split("→")[0].strip()
-                    if name and name not in deleted_names:
-                        deleted_names.append(name)
-
-        # 2) Fallback robuste : parse des logs réellement émis par le job
         for line in _captured_logs:
             try:
                 s = str(line)
             except Exception:
                 continue
+
             if "→ supprimé" in s or " deleted" in s.lower():
-                name = s.split("]")[-1].split("→")[0].strip()
+                name = s.split("]")[-1].split("→")[0].strip(" -:")
                 if name and name not in deleted_names:
                     deleted_names.append(name)
-            # récupère aussi un compteur implicite s'il n'est pas fourni
+
             if deleted_count == 0 and "Fin SUPPRESSION" in s and "supprimé(s)" in s:
-                # ex: "Fin SUPPRESSION → 2 supprimé(s), 0 introuvable(s), 0 erreur(s)"
                 try:
-                    part = s.split("Fin SUPPRESSION", 1)[-1]
-                    # garde uniquement la portion contenant "supprimé(s)"
-                    left = part.split("supprimé(s)")[0]
-                    # récupère le dernier entier avant "supprimé(s)"
                     import re
-                    m = re.search(r"(\d+)\s*$", left.strip(" →,:-"))
-                    if m:
-                        deleted_count = int(m.group(1))
+                    part = s.split("Fin SUPPRESSION", 1)[-1]
+                    left = part.split("supprimé(s)")[0]
+                    match = re.search(r"(\d+)\s*$", left.strip(" →,:-"))
+
+                    if match:
+                        deleted_count = int(match.group(1))
                     else:
-                        # autre format possible: "→ 2 supprimé(s), ..."
-                        m2 = re.search(r"→\s*(\d+)\s+supprimé", part)
-                        if m2:
-                            deleted_count = int(m2.group(1))
+                        match = re.search(r"→\s*(\d+)\s+supprimé", part)
+                        if match:
+                            deleted_count = int(match.group(1))
                 except Exception:
                     pass
 
-        # 3) Si on a un compteur mais pas de noms, crée un libellé générique
+        if deleted_names and deleted_count == 0:
+            deleted_count = len(deleted_names)
+
         if not deleted_names and deleted_count > 0:
             deleted_names = [f"{deleted_count} élément(s) supprimé(s)"]
 
-        # 4) Émissions si une suppression a été détectée (noms OU compteur)
         if deleted_names or deleted_count > 0:
             total = deleted_count or len(deleted_names)
 
-            # 📡 SSE vers frontend (toujours, webhook désolidarisé)
             sse_manager.publish_event("symlink_update", {
                 "event": "orphans_deleted",
                 "action": "deleted",
                 "path": "Suppression orphelins",
-                "message": f"{total} torrents supprimés",
+                "message": f"{total} torrent(s) supprimé(s)",
                 "count": total,
                 "deleted_torrents": deleted_names,
             })
-            logger.info("📡 Événement SSE 'orphans_deleted' envoyé au frontend avec la liste complète")
 
-            # 💾 DB
             try:
                 db = SessionLocal()
                 db.add(SystemActivity(
@@ -1045,26 +1422,32 @@ def run_orphans_process():
                     action="deleted",
                     path="Suppression orphelins",
                     manager="alldebrid",
-                    message=f"{total} torrents supprimés",
-                    extra={"deleted_torrents": deleted_names},
+                    message=f"{total} torrent(s) supprimé(s)",
+                    extra={
+                        "deleted_torrents": deleted_names,
+                        "count": total,
+                        "source": "webdav",
+                    },
                 ))
                 db.commit()
                 db.close()
-                logger.debug("💾 Activité DB enregistrée : suppression orphelins")
             except Exception as e:
-                logger.error(f"💥 Erreur DB suppression orphelins : {e}")
+                logger.error(f"💥 Erreur DB suppression orphelins : {e}", exc_info=True)
 
-            # 🔔 Discord optionnel (webhook désolidarisé)
             webhook = config_manager.config.discord_webhook_url
+
             if webhook:
                 sample = "\n".join(f"- {name}" for name in deleted_names)
+
                 asyncio.run(send_discord_message(
                     webhook_url=webhook,
                     title="🗑️ Suppressions AllDebrid",
                     description=sample,
-                    action="deleted"
+                    action="deleted",
                 ))
-                logger.info(f"📢 Notification Discord envoyée ({total} suppression(s)).")
+
+            logger.info(f"📢 Suppression orphelins traitée : {total} suppression(s).")
+
         else:
             logger.info("🧩 Aucun torrent supprimé — aucune activité créée ni message envoyé.")
 
@@ -1074,21 +1457,19 @@ def run_orphans_process():
 
 def start_periodic_orphans_task(interval_hours: float = 24.0):
     """
-    ...
-    -⚠️ Attends un premier intervalle avant le premier run pour éviter
-      un double appel au démarrage (start_symlink_watcher appelle déjà run_orphans_process()).
+    Tâche périodique Decypharr orphelins.
+    Attend un premier intervalle pour éviter un double run au démarrage.
     """
-    if not getattr(config_manager.config, "alldebrid_instances", []):
-        logger.info("🧩 Tâche orphelins ignorée : aucune instance Alldebrid configurée.")
+    if not is_decypharr_orphans_enabled():
+        logger.info("🧩 Tâche orphelins ignorée : aucune instance AllDebrid active configurée.")
         return
 
     def loop():
         logger.info(
-            f"🧹 Tâche périodique orphelins démarrée "
-            f"(premier run immédiat, puis toutes les {interval_hours}h)..."
+            f"🧹 Tâche périodique orphelins Decypharr démarrée "
+            f"(premier run dans {interval_hours}h, puis toutes les {interval_hours}h)..."
         )
 
-        # ⏳ On attend d'abord un intervalle complet pour ne pas doubler le run initial
         time.sleep(interval_hours * 3600)
 
         while True:
@@ -1100,8 +1481,6 @@ def start_periodic_orphans_task(interval_hours: float = 24.0):
             time.sleep(interval_hours * 3600)
 
     threading.Thread(target=loop, daemon=True).start()
-
-
 
 def start_replacement_cleanup_task(interval_hours: int = 6, expiry_hours: int = 12):
     """
@@ -1266,10 +1645,18 @@ def start_light_broken_symlink_monitor():
     ⚙️ Met à jour la base et envoie les événements SSE.
     🧠 Ne s'exécute pas si le conteneur 'decypharr' vient de démarrer (< 2 min).
     ♻️ Se met automatiquement en pause si Decypharr redémarre pendant l’exécution.
+    ⚡ Optimisé :
+       - vérification parallèle
+       - cache par dossier racine de cible sous mount_dirs
+       - évite 1 os.path.exists() par symlink quand plusieurs pointent dans le même dossier source
     """
     from routers.secure.symlinks import symlink_store
     import docker
-    from datetime import datetime, timezone
+    from datetime import datetime
+    from pathlib import Path
+    import os
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     client = docker.from_env()
 
@@ -1278,46 +1665,105 @@ def start_light_broken_symlink_monitor():
     initial_scan_done.wait()
     logger.success("🚀 Signal reçu : lancement de la surveillance des symlinks brisés.")
 
-    # symlinks déjà connus comme brisés (à ne pas re-notifier)
-    already_notified = {
-        s["symlink"]
-        for s in symlink_store
-        if not s.get("target_exists", True) or s.get("broken", False)
-    }
+    mount_dirs = [Path(d).resolve() for d in config_manager.config.mount_dirs]
+
+    def get_probe_path(target_str: str | None) -> str | None:
+        """
+        Réduit le coût des vérifications :
+        - si la cible est sous un mount_dir, on teste seulement le premier dossier sous ce mount
+        - sinon on teste la cible complète
+        """
+        if not target_str:
+            return None
+
+        try:
+            target_path = Path(target_str)
+        except Exception:
+            return None
+
+        for mount_dir in mount_dirs:
+            try:
+                rel = target_path.relative_to(mount_dir)
+                parts = rel.parts
+                if not parts:
+                    return str(mount_dir)
+                # On teste seulement le dossier racine du torrent / package sous le mount
+                return str(mount_dir / parts[0])
+            except ValueError:
+                continue
+
+        return str(target_path)
+
+    def check_probe_exists(probe_path: str) -> tuple[str, bool]:
+        try:
+            return probe_path, os.path.exists(probe_path)
+        except Exception:
+            return probe_path, False
 
     while True:
         try:
+            cycle_start = time.time()
+
             # 🔒 Protection : attendre que tous les conteneurs decypharr* soient prêts
             wait_for_decypharr_containers(min_uptime_seconds=120)
 
-            # --- Routine principale du monitor ---
             broken_now, repaired_now = [], []
             items = list(symlink_store)
 
-            for i in items:
-                symlink_path = Path(i["symlink"])
-                if not symlink_path.exists() and not symlink_path.is_symlink():
-                    # chemin invalide ET pas un lien → on ignore ce cas (store géré ailleurs)
-                    continue
+            # ✅ État courant des symlinks déjà considérés comme brisés
+            already_notified = {
+                str(s["symlink"])
+                for s in symlink_store
+                if s.get("broken", False) or not s.get("target_exists", True)
+            }
 
-                exists = False
-                try:
-                    if symlink_path.is_symlink():
-                        target = os.readlink(symlink_path)
-                        if not os.path.isabs(target):
-                            target = os.path.join(symlink_path.parent, target)
-                        exists = os.path.exists(target)
-                    else:
-                        exists = symlink_path.exists()
-                except Exception:
-                    exists = False
+            # 1) Construire la map symlink -> probe_path
+            symlink_to_probe: dict[str, str | None] = {}
+            unique_probes: set[str] = set()
 
-                if not exists and str(symlink_path) not in already_notified:
-                    already_notified.add(str(symlink_path))
-                    broken_now.append(i)
-                elif exists and str(symlink_path) in already_notified:
-                    already_notified.remove(str(symlink_path))
-                    repaired_now.append(i)
+            for item in items:
+                symlink_path = str(item["symlink"])
+                target = item.get("target")
+                probe = get_probe_path(target)
+                symlink_to_probe[symlink_path] = probe
+                if probe:
+                    unique_probes.add(probe)
+
+            logger.info(
+                f"🔎 Monitor léger: {len(items)} symlink(s), "
+                f"{len(unique_probes)} probe(s) uniques à vérifier"
+            )
+
+            # 2) Vérification parallèle des probes uniques
+            probe_exists_map: dict[str, bool] = {}
+            max_workers = min(64, max(8, (os.cpu_count() or 8) * 4))
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(check_probe_exists, probe) for probe in unique_probes]
+
+                for future in as_completed(futures):
+                    probe_path, exists = future.result()
+                    probe_exists_map[probe_path] = exists
+
+            # 3) Décision broken / repaired à partir du cache
+            for item in items:
+                symlink_path = str(item["symlink"])
+                probe = symlink_to_probe.get(symlink_path)
+
+                # Si pas de probe, on reste prudent : on tente le fallback sur la cible complète
+                if not probe:
+                    target = item.get("target")
+                    try:
+                        exists = os.path.exists(target) if target else False
+                    except Exception:
+                        exists = False
+                else:
+                    exists = probe_exists_map.get(probe, False)
+
+                if not exists and symlink_path not in already_notified:
+                    broken_now.append(item)
+                elif exists and symlink_path in already_notified:
+                    repaired_now.append(item)
 
             # === 🔴 Nouveaux symlinks brisés ===
             if broken_now:
@@ -1325,11 +1771,11 @@ def start_light_broken_symlink_monitor():
                 added_db = 0
 
                 for s in broken_now:
-                    # Évite doublon DB
                     exists_db = db.query(SystemActivity).filter(
                         SystemActivity.path == s["symlink"],
                         SystemActivity.action == "broken"
                     ).first()
+
                     if exists_db:
                         logger.debug(f"↩️ Symlink déjà marqué brisé (DB), ignoré : {s['symlink']}")
                         continue
@@ -1347,7 +1793,6 @@ def start_light_broken_symlink_monitor():
                 db.commit()
                 db.close()
 
-                # ✅ Met à jour le store (flag broken) même si l’item existe déjà
                 updated_store = 0
                 for s in broken_now:
                     found = False
@@ -1359,6 +1804,7 @@ def start_light_broken_symlink_monitor():
                             found = True
                             updated_store += 1
                             break
+
                     if not found:
                         symlink_store.append({
                             "symlink": s["symlink"],
@@ -1384,15 +1830,16 @@ def start_light_broken_symlink_monitor():
             # === 🟢 Symlinks réparés ===
             if repaired_now:
                 db = SessionLocal()
+
                 for s in repaired_now:
                     db.query(SystemActivity).filter(
                         SystemActivity.path == s["symlink"],
                         SystemActivity.action == "broken"
                     ).delete()
+
                 db.commit()
                 db.close()
 
-                # ✅ Met à jour le store : plus brisé
                 fixed = 0
                 for s in repaired_now:
                     for x in symlink_store:
@@ -1436,18 +1883,21 @@ def start_light_broken_symlink_monitor():
             db = SessionLocal()
             cleaned_count = 0
 
-            # Entrées 'broken' en base
             broken_db_entries = db.query(SystemActivity).filter(
                 SystemActivity.action == "broken"
             ).all()
 
-            # Index des chemins brisés dans le store (basé sur le flag 'broken')
-            broken_in_store = {str(s["symlink"]) for s in symlink_store if s.get("broken", False)}
+            broken_in_store = {
+                str(s["symlink"])
+                for s in symlink_store
+                if s.get("broken", False) or not s.get("target_exists", True)
+            }
 
             for entry in broken_db_entries:
                 if entry.path not in broken_in_store:
-                    # 🧹 Si la base contient 'broken' mais le store ne l'a pas en 'broken=True'
-                    logger.info(f"🧹 Nettoyage cohérence base : {entry.path} n'est plus marqué brisé (suppression DB).")
+                    logger.info(
+                        f"🧹 Nettoyage cohérence base : {entry.path} n'est plus marqué brisé (suppression DB)."
+                    )
                     db.delete(entry)
                     cleaned_count += 1
 
@@ -1465,8 +1915,10 @@ def start_light_broken_symlink_monitor():
             else:
                 logger.debug("✅ Base déjà cohérente avec le store.")
 
-            # 🔄 Recalcul du compteur global
-            total_broken = sum(1 for s in symlink_store if s.get("broken", False))
+            total_broken = sum(
+                1 for s in symlink_store
+                if s.get("broken", False) or not s.get("target_exists", True)
+            )
             total_ok = len(symlink_store) - total_broken
 
             sse_manager.publish_event("symlink_update", {
@@ -1482,6 +1934,9 @@ def start_light_broken_symlink_monitor():
 
         except Exception as e:
             logger.error(f"💥 Erreur pendant la validation de cohérence (base ↔ store) : {e}")
+
+        cycle_duration = round(time.time() - cycle_start, 1)
+        logger.info(f"⏱️ Monitor léger terminé en {cycle_duration}s — prochain cycle dans 6h")
 
         time.sleep(6 * 3600)
 

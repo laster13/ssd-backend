@@ -2,8 +2,8 @@ import json
 import os
 from pathlib import Path
 from loguru import logger
-from pydantic import ValidationError, Field
-from program.settings.models import AppModel, Observable, SymlinkConfig, LinkDir
+from pydantic import ValidationError
+from program.settings.models import AppModel, Observable, SymlinkConfig
 from program.utils import data_dir_path
 
 
@@ -15,9 +15,7 @@ class SettingsManager:
         self.filename = "settings.json"
         self.settings_file = data_dir_path / self.filename
 
-        # ✅ Crée le dossier parent au démarrage si nécessaire
         self.settings_file.parent.mkdir(parents=True, exist_ok=True)
-
         Observable.set_notify_observers(self.notify_observers)
 
         if not self.settings_file.exists():
@@ -84,7 +82,6 @@ class SettingsManager:
 
     def save(self):
         """Save settings to file, using Pydantic model for JSON serialization."""
-        # ✅ Assure la création du dossier parent
         self.settings_file.parent.mkdir(parents=True, exist_ok=True)
 
         with open(self.settings_file, "w", encoding="utf-8") as file:
@@ -103,21 +100,19 @@ def format_validation_error(e: ValidationError) -> str:
 
 settings_manager = SettingsManager()
 
+
 class ConfigManager:
-    """Gère la configuration principale (config.json) sans générer de valeurs par défaut complexes."""
+    """Gère la configuration principale (config.json)."""
 
     def __init__(self):
         self.config_file = data_dir_path / "config.json"
         self.config: SymlinkConfig | None = None
 
-        # ✅ Crée le dossier parent si nécessaire
         self.config_file.parent.mkdir(parents=True, exist_ok=True)
 
-        # 🟢 Si le fichier existe, on le charge
         if self.config_file.exists():
             self.load()
         else:
-            # 🧩 Sinon, on crée une config vide et on la sauvegarde
             self.config = SymlinkConfig.model_validate(
                 {
                     "links_dirs": [],
@@ -196,5 +191,4 @@ class ConfigManager:
         )
 
 
-# Initialisation globale
 config_manager = ConfigManager()

@@ -139,13 +139,29 @@ async def set_symlinks_config(new_config: SymlinkConfig, background_tasks: Backg
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-def scan_symlinks_parallel(workers: int = 32, fast: bool = True, ultra_fast: bool = True):
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from datetime import datetime
+import os
+import time
+
+def scan_symlinks_parallel(
+    workers: int = 4,
+    fast: bool = True,
+    ultra_fast: bool = True,
+    batch_size: int = 128,
+):
     """
-    ⚡ Scan des symlinks ultra-rapide.
-    - `fast=True`  → désactive Path.exists()
-    - `ultra_fast=True` → saute aussi lstat() (scan instantané)
-    - `workers` → nombre de threads (par défaut 32)
+    Scan des symlinks avec mémoire bornée.
+
+    - fast=True       : saute la vérification d'existence de la cible
+    - ultra_fast=True : saute aussi le lstat()
+    - workers         : nombre de threads
+    - batch_size      : nombre maximum de tâches gardées en mémoire à la fois
     """
+    started_at = time.perf_counter()
+
     config = config_manager.config
     links_dirs = [(Path(ld.path).resolve(), ld.manager) for ld in config.links_dirs]
     mount_dirs = [Path(d).resolve() for d in config.mount_dirs]
@@ -155,11 +171,16 @@ def scan_symlinks_parallel(workers: int = 32, fast: bool = True, ultra_fast: boo
             raise RuntimeError(f"Dossier introuvable : {d}")
 
     symlinks_list = []
-    tasks = []
+
+    dirs_scanned = 0
+    dirs_skipped = 0
+    symlinks_found = 0
+    symlinks_failed = 0
 
     def process_symlink(symlink_path: str, root: Path, manager: str):
+        nonlocal symlinks_failed
+
         try:
-            # Lecture rapide du lien symbolique
             try:
                 target_raw = os.readlink(symlink_path)
                 target_path = Path(target_raw)
@@ -168,7 +189,6 @@ def scan_symlinks_parallel(workers: int = 32, fast: bool = True, ultra_fast: boo
             except Exception:
                 target_path = Path(symlink_path).resolve(strict=False)
 
-            # 🔗 Adaptation mount_dir
             full_target = str(target_path)
             for mount_dir in mount_dirs:
                 try:
@@ -178,14 +198,12 @@ def scan_symlinks_parallel(workers: int = 32, fast: bool = True, ultra_fast: boo
                 except ValueError:
                     continue
 
-            # Lecture stat (désactivée si ultra_fast)
             if not ultra_fast:
                 stat = os.lstat(symlink_path)
                 created_at = datetime.fromtimestamp(stat.st_mtime).isoformat()
             else:
                 created_at = None
 
-            # Vérification existence cible (très lente)
             if fast or ultra_fast:
                 target_exists = True
             else:
@@ -201,7 +219,6 @@ def scan_symlinks_parallel(workers: int = 32, fast: bool = True, ultra_fast: boo
                 "created_at": created_at,
             }
 
-            # 🎬 Enrichissement Radarr uniquement si manager = radarr
             if manager == "radarr":
                 extra = enrich_from_radarr_index(Path(symlink_path))
                 if extra:
@@ -210,45 +227,75 @@ def scan_symlinks_parallel(workers: int = 32, fast: bool = True, ultra_fast: boo
             return item
 
         except Exception as e:
-            logger.debug(f"⚠️ Erreur symlink {symlink_path}: {e!r}")
+            symlinks_failed += 1
+            logger.warning(f"⚠️ Erreur symlink ignoré pendant scan : {symlink_path} | {e!r}")
             return None
 
     def walk_dir(root: Path, manager: str):
-        stack = [root]
+        nonlocal dirs_scanned, dirs_skipped, symlinks_found
+
+        stack = [str(root)]
         while stack:
             current = stack.pop()
+            dirs_scanned += 1
+
             try:
                 with os.scandir(current) as it:
                     for entry in it:
-                        if entry.is_symlink():
-                            yield entry.path, root, manager
-                        elif entry.is_dir(follow_symlinks=False):
-                            stack.append(Path(entry.path))
-            except (PermissionError, FileNotFoundError):
+                        try:
+                            if entry.is_symlink():
+                                symlinks_found += 1
+                                yield entry.path, root, manager
+                            elif entry.is_dir(follow_symlinks=False):
+                                stack.append(entry.path)
+                        except (PermissionError, FileNotFoundError) as e:
+                            logger.warning(f"⚠️ Entrée ignorée pendant scan : {entry.path} | {e}")
+                            continue
+            except (PermissionError, FileNotFoundError) as e:
+                dirs_skipped += 1
+                logger.warning(f"⚠️ Dossier ignoré pendant scan : {current} | {e}")
                 continue
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
+        pending = set()
+
+        def flush_pending():
+            for future in as_completed(list(pending)):
+                pending.remove(future)
+                result = future.result()
+                if result:
+                    symlinks_list.append(result)
+
         for root, manager in links_dirs:
+            logger.info(f"📂 Scan racine {manager}: {root}")
             for symlink_path, r, m in walk_dir(root, manager):
-                tasks.append(executor.submit(process_symlink, symlink_path, r, m))
+                pending.add(executor.submit(process_symlink, symlink_path, r, m))
 
-        for future in as_completed(tasks):
-            result = future.result()
-            if result:
-                symlinks_list.append(result)
+                if len(pending) >= batch_size:
+                    flush_pending()
 
-    # ✅ Calcul des ref_count (rapide)
+        if pending:
+            flush_pending()
+
     target_counts = Counter(item["target"] for item in symlinks_list if item["target_exists"])
     for item in symlinks_list:
         item["ref_count"] = target_counts.get(item["target"], 0) if item["target_exists"] else 0
 
+    elapsed = time.perf_counter() - started_at
+
     logger.success(
-        f"{len(symlinks_list)} symlinks scannés "
-        f"(workers={workers}, fast={fast}, ultra_fast={ultra_fast})"
+        f"✅ {len(symlinks_list)} symlinks scannés "
+        f"(workers={workers}, fast={fast}, ultra_fast={ultra_fast}, batch_size={batch_size}) "
+        f"| durée={elapsed:.2f}s "
+        f"| dossiers_scannés={dirs_scanned} "
+        f"| dossiers_ignorés={dirs_skipped} "
+        f"| symlinks_trouvés={symlinks_found} "
+        f"| symlinks_ignorés={symlinks_failed}"
     )
+
     return symlinks_list
 
-# ⚡ Remplace l’ancien alias
+
 scan_symlinks = scan_symlinks_parallel
 
 
@@ -256,14 +303,14 @@ def run_broken_detection_job():
     """
     Lance une détection complète des symlinks brisés en arrière-plan.
 
-    Version optimisée :
-    - snapshot local du store pour éviter les itérations concurrentes
+    Version corrigée :
+    - snapshot local du store
     - vérification parallèle des cibles
-    - très peu d'accès DB
-    - un seul commit DB
-    - recalcul ref_count en mémoire uniquement
-    - SSE de progression limité
-    - conserve la logique watcher / monitor léger
+    - auto-repair Radarr/Sonarr
+    - suppression des symlinks auto-réparés du symlink_store
+    - nettoyage des entrées SystemActivity(action="broken")
+    - recalcul ref_count propre
+    - SSE cohérent
     """
     global symlink_store, broken_scan_running
 
@@ -273,6 +320,9 @@ def run_broken_detection_job():
     import os
     import uuid
     import time
+    import gc
+    import ctypes
+    import asyncio
 
     started_at = time.perf_counter()
 
@@ -298,6 +348,7 @@ def run_broken_detection_job():
                 "broken_count": 0,
                 "newly_broken": 0,
                 "newly_repaired": 0,
+                "auto_repaired": 0,
                 "message": "Détection terminée : aucun symlink à analyser",
                 "id": str(uuid.uuid4()),
             })
@@ -349,46 +400,151 @@ def run_broken_detection_job():
                 "currently_broken": currently_broken,
             }
 
-        max_workers = min(64, max(8, (os.cpu_count() or 8) * 4))
-        logger.info(f"🔎 [BROKEN-JOB] Vérification parallèle de {total_items} symlink(s) avec {max_workers} worker(s)")
-
+        max_workers = 8
+        batch_size = 256
         checked = 0
         progress_step = 2000
 
         broken_paths = set()
         repaired_paths = set()
+        auto_repaired_paths = set()
+
+        logger.info(
+            f"🔎 [BROKEN-JOB] Vérification parallèle de {total_items} symlink(s) "
+            f"avec {max_workers} worker(s) et batch_size={batch_size}"
+        )
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(check_one, item) for item in items]
+            pending = set()
 
-            for future in as_completed(futures):
-                result = future.result()
-                if not result:
+            def flush_pending():
+                nonlocal checked
+
+                for future in as_completed(list(pending)):
+                    pending.remove(future)
+
+                    result = future.result()
+                    if not result:
+                        continue
+
+                    item = result["item"]
+                    path_str = item.get("symlink")
+
+                    if not path_str:
+                        continue
+
+                    if not result["skip"]:
+                        exists = result["exists"]
+                        currently_broken = result["currently_broken"]
+
+                        if not exists and not currently_broken:
+                            broken_paths.add(path_str)
+                        elif exists and currently_broken:
+                            repaired_paths.add(path_str)
+
+                    checked += 1
+
+                    if checked % progress_step == 0 or checked == total_items:
+                        sse_manager.publish_event("symlink_update", {
+                            "event": "broken_scan_progress",
+                            "action": "scan",
+                            "checked": checked,
+                            "total": total_items,
+                            "message": f"Détection en cours : {checked}/{total_items}",
+                            "id": str(uuid.uuid4()),
+                        })
+
+            for item in items:
+                pending.add(executor.submit(check_one, item))
+
+                if len(pending) >= batch_size:
+                    flush_pending()
+
+            if pending:
+                flush_pending()
+
+        auto_repair_enabled = getattr(
+            config_manager.config,
+            "auto_repair_broken_symlinks",
+            False,
+        )
+
+        if auto_repair_enabled and broken_paths:
+            logger.info(f"🛠️ Auto-repair activé pendant scan-broken : {len(broken_paths)} symlink(s) à traiter")
+
+            items_by_path = {
+                x.get("symlink"): x
+                for x in items
+                if x.get("symlink")
+            }
+
+            for path_str in list(broken_paths):
+                item = items_by_path.get(path_str)
+                if not item:
                     continue
 
-                item = result["item"]
-                path_str = item["symlink"]
+                manager = item.get("manager")
+                symlink_path = Path(path_str)
 
-                if not result["skip"]:
-                    exists = result["exists"]
-                    currently_broken = result["currently_broken"]
+                try:
+                    if manager == "radarr":
+                        radarr = RadarrService()
 
-                    if not exists and not currently_broken:
-                        broken_paths.add(path_str)
-                    elif exists and currently_broken:
-                        repaired_paths.add(path_str)
+                        result = asyncio.run(
+                            auto_repair_radarr_symlink(
+                                symlink_path=symlink_path,
+                                radarr=radarr,
+                            )
+                        )
 
-                checked += 1
+                        logger.info(f"✅ Auto-repair Radarr scan-broken : {result}")
 
-                if checked % progress_step == 0 or checked == total_items:
-                    sse_manager.publish_event("symlink_update", {
-                        "event": "broken_scan_progress",
-                        "action": "scan",
-                        "checked": checked,
-                        "total": total_items,
-                        "message": f"Détection en cours : {checked}/{total_items}",
-                        "id": str(uuid.uuid4()),
-                    })
+                        if result.get("success") and result.get("deleted"):
+                            auto_repaired_paths.add(path_str)
+
+                    elif manager == "sonarr":
+                        db_auto = SessionLocal()
+                        try:
+                            result = asyncio.run(
+                                auto_repair_sonarr_symlink(
+                                    symlink_path=symlink_path,
+                                    db=db_auto,
+                                )
+                            )
+                        finally:
+                            db_auto.close()
+
+                        logger.info(f"✅ Auto-repair Sonarr scan-broken : {result}")
+
+                        if result.get("success") and result.get("deleted"):
+                            auto_repaired_paths.add(path_str)
+
+                    else:
+                        logger.warning(
+                            f"⚠️ Auto-repair ignoré : manager inconnu pour {path_str} "
+                            f"| manager={manager}"
+                        )
+
+                except Exception as e:
+                    logger.error(f"❌ Auto-repair scan-broken échoué pour {path_str}: {e}", exc_info=True)
+
+            if auto_repaired_paths:
+                broken_paths -= auto_repaired_paths
+                repaired_paths |= auto_repaired_paths
+
+                # Un auto-repair supprime physiquement le symlink.
+                # Il faut donc aussi le retirer du cache mémoire.
+                symlink_store[:] = [
+                    item for item in symlink_store
+                    if item.get("symlink") not in auto_repaired_paths
+                ]
+
+                logger.info(
+                    f"🧩 {len(auto_repaired_paths)} symlink(s) auto-réparés "
+                    f"et retirés du cache symlink_store"
+                )
+
+            del items_by_path
 
         db = SessionLocal()
         newly_broken = 0
@@ -402,8 +558,14 @@ def run_broken_detection_job():
             broken_db_by_path = {row.path: row for row in broken_db_rows}
             broken_db_paths = set(broken_db_by_path.keys())
 
+            items_by_path = {
+                x.get("symlink"): x
+                for x in items
+                if x.get("symlink")
+            }
+
             for path_str in broken_paths:
-                item = next((x for x in items if x.get("symlink") == path_str), None)
+                item = items_by_path.get(path_str)
                 if not item:
                     continue
 
@@ -417,10 +579,12 @@ def run_broken_detection_job():
                         extra={"target": item.get("target")},
                     ))
 
-            if repaired_paths:
+            paths_to_clear = repaired_paths | auto_repaired_paths
+
+            if paths_to_clear:
                 db.query(SystemActivity).filter(
                     SystemActivity.action == "broken",
-                    SystemActivity.path.in_(list(repaired_paths))
+                    SystemActivity.path.in_(list(paths_to_clear))
                 ).delete(synchronize_session=False)
 
             db.commit()
@@ -431,22 +595,34 @@ def run_broken_detection_job():
         finally:
             db.close()
 
-        store_index = {item["symlink"]: item for item in symlink_store if item.get("symlink")}
+        store_index = {
+            item["symlink"]: item
+            for item in symlink_store
+            if item.get("symlink")
+        }
 
         for path_str in broken_paths:
             x = store_index.get(path_str)
             if x:
                 if not x.get("broken", False) or x.get("target_exists", True):
                     newly_broken += 1
+
                 x["broken"] = True
                 x["target_exists"] = False
                 x["ref_count"] = 0
 
         for path_str in repaired_paths:
+            # Les auto-repair ont déjà été retirés du store,
+            # mais on les compte quand même comme réparés.
+            if path_str in auto_repaired_paths:
+                newly_repaired += 1
+                continue
+
             x = store_index.get(path_str)
             if x:
                 if x.get("broken", False) or not x.get("target_exists", True):
                     newly_repaired += 1
+
                 x["broken"] = False
                 x["target_exists"] = True
 
@@ -476,10 +652,13 @@ def run_broken_detection_job():
             "broken_count": total_broken,
             "newly_broken": newly_broken,
             "newly_repaired": newly_repaired,
+            "auto_repaired": len(auto_repaired_paths),
             "duration": duration,
             "message": (
                 f"Détection terminée : {newly_broken} nouveaux brisés, "
-                f"{newly_repaired} réparés, {total_broken} brisés au total "
+                f"{newly_repaired} réparés, "
+                f"{len(auto_repaired_paths)} auto-réparés, "
+                f"{total_broken} brisés au total "
                 f"({duration}s)"
             ),
             "id": str(uuid.uuid4()),
@@ -489,8 +668,27 @@ def run_broken_detection_job():
             f"✅ [BROKEN-JOB] Terminé en {duration}s — "
             f"{newly_broken} nouveaux brisés, "
             f"{newly_repaired} réparés, "
+            f"{len(auto_repaired_paths)} auto-réparés, "
             f"{total_broken} brisés au total"
         )
+
+        del items
+        del broken_paths
+        del repaired_paths
+        del auto_repaired_paths
+        del store_index
+
+        try:
+            del items_by_path
+        except Exception:
+            pass
+
+        gc.collect()
+
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
 
     except Exception as e:
         logger.error(f"💥 Erreur run_broken_detection_job: {e}", exc_info=True)
@@ -520,7 +718,7 @@ def list_symlinks(
     orphans: Optional[bool] = False,
     folder: Optional[str] = None,
     all: bool = False,
-    rename: bool = False,   # ✅ flag "rename"
+    rename: bool = False,
 ):
     """
     Liste des symlinks filtrés / paginés.
@@ -542,39 +740,48 @@ def list_symlinks(
             "data": [],
             "orphaned": 0,
             "unique_targets": 0,
-            "duplicates": [],
             "imdb_missing": 0,
+            "all_broken": 0,
         }
 
     try:
-        # 📊 Calcul global du nombre de dossiers à renommer (avant filtres)
+        # 📊 Calcul global sur le snapshot local
         imdb_missing = 0
         seen_parents = set()
+
+        all_broken = sum(
+            1 for i in items
+            if i.get("broken", False) or not i.get("target_exists", True)
+        )
+
         for i in items:
             symlink_path = Path(i["symlink"])
             parent = symlink_path.parent
             if "shows" in symlink_path.parts:
                 parent = parent.parent
+
             if parent not in seen_parents:
                 seen_parents.add(parent)
                 if parent.exists() and is_missing_imdb(parent.name):
                     imdb_missing += 1
 
-        all_broken = sum(
-            1 for i in symlink_store or []
-            if i.get("broken", False) or not i.get("target_exists", True)
-        )
-
         # 📂 Filtre par dossier racine
         if folder:
             config = config_manager.config
-            base_paths = [Path(ld.path) for ld in config.links_dirs if Path(ld.path).name == folder]
+            base_paths = [
+                str(Path(ld.path).resolve())
+                for ld in config.links_dirs
+                if Path(ld.path).name == folder
+            ]
+
             if not base_paths:
                 logger.warning(f"⚠️ Racine inconnue: {folder}")
                 items = []
             else:
-                folder_strs = [str(bp.resolve()) for bp in base_paths]
-                items = [i for i in items if any(i["symlink"].startswith(fs) for fs in folder_strs)]
+                items = [
+                    i for i in items
+                    if any(i["symlink"].startswith(base) for base in base_paths)
+                ]
 
         # 🔍 Filtre recherche
         if search:
@@ -588,30 +795,34 @@ def list_symlinks(
                 or s_low == str(i.get("tmdbId", ""))
             ]
 
-        # ⚠️ Filtre orphelins (cible absente)
+        # ⚠️ Filtre orphelins
         if orphans:
             items = [
                 i for i in items
                 if i.get("broken", False) or not i.get("target_exists", True)
             ]
 
-        # 🎬 Mode rename (dossiers sans IMDb valide)
+        # 🎬 Mode rename
         if rename:
-            seen = set()
             filtered = []
+            seen = set()
+
             for i in items:
                 symlink_path = Path(i["symlink"])
                 parent = symlink_path.parent
                 if "shows" in symlink_path.parts:
                     parent = parent.parent
+
                 if parent not in seen:
                     seen.add(parent)
                     if parent.exists() and is_missing_imdb(parent.name):
                         filtered.append(i)
+
             items = filtered
 
         # ↕️ Tri
         reverse = order.lower() == "desc"
+
         if sort in {"symlink", "target", "ref_count", "created_at"}:
             try:
                 if sort == "created_at":
@@ -621,31 +832,39 @@ def list_symlinks(
                         reverse=reverse
                     )
                 else:
-                    items.sort(key=lambda x: x.get(sort), reverse=reverse)
+                    items.sort(
+                        key=lambda x: x.get(sort),
+                        reverse=reverse
+                    )
             except Exception as e:
                 logger.warning(f"⚠️ Tri impossible sur {sort} : {e}")
 
         total = len(items)
+        orphaned_count = sum(
+            1 for i in items
+            if i.get("broken", False) or not i.get("target_exists", True)
+        )
+        unique_targets = len({
+            i["target"] for i in items
+            if i.get("target_exists", True) and i.get("target")
+        })
 
         # 📑 Pagination
         if not all:
             start = (page - 1) * limit
             end = start + limit
-            paginated = items[start:end]
+            data = items[start:end]
         else:
-            paginated = items
+            data = items
 
         return {
             "total": total,
             "page": page,
             "limit": limit,
-            "data": paginated,
-            "orphaned": sum(
-                1 for i in items
-                if i.get("broken", False) or not i.get("target_exists", True)
-            ),
-            "unique_targets": len(set(i["target"] for i in items if i.get("target_exists", True))),
-            "imdb_missing": imdb_missing,  # ✅ cohérent en snake_case
+            "data": data,
+            "orphaned": orphaned_count,
+            "unique_targets": unique_targets,
+            "imdb_missing": imdb_missing,
             "all_broken": all_broken,
         }
 
@@ -658,10 +877,9 @@ def list_symlinks(
             "data": [],
             "orphaned": 0,
             "unique_targets": 0,
-            "duplicates": [],
             "imdb_missing": 0,
+            "all_broken": 0,
         }
-
 
 # -----
 # Scan
@@ -669,6 +887,9 @@ def list_symlinks(
 @router.post("/scan")
 async def trigger_scan():
     global symlink_store
+    import gc
+    import ctypes
+
     try:
         logger.info("🚀 [SCAN] Début du scan symlinks rapide")
 
@@ -700,6 +921,17 @@ async def trigger_scan():
         symlink_store.clear()
         symlink_store.extend(scanned)
 
+        # Libération explicite des temporaires volumineux
+        del scanned
+        del previous_state
+
+        gc.collect()
+
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+
         payload = {
             "event": "scan_completed",
             "action": "scan",
@@ -712,12 +944,11 @@ async def trigger_scan():
             "message": "Scan rapide terminé",
             "count": len(symlink_store),
             "restored_broken": restored_broken,
-            "data": symlink_store,
         }
+
     except Exception as e:
         logger.error(f"💥 Erreur scan: {e!r}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @router.post("/scan-broken")
 async def trigger_broken_scan():
@@ -884,9 +1115,77 @@ async def get_radarr_id(
         logger.error("💥 Erreur get-radarr-id pour {}: {}", movie_folder, e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+
 # -------------------------
 # Suppression (Radarr)
 # -------------------------
+
+async def auto_repair_radarr_symlink(
+    symlink_path: Path,
+    radarr: RadarrService,
+) -> dict:
+    try:
+        if not symlink_path.is_symlink():
+            return {
+                "success": False,
+                "reason": "not_a_symlink",
+                "path": str(symlink_path),
+            }
+
+        # suppression du symlink cassé
+        symlink_path.unlink(missing_ok=True)
+        logger.info(f"🗑️ Auto-repair Radarr: symlink supprimé : {symlink_path}")
+
+        # retrouver le film
+        raw_name = symlink_path.parent.name
+        cleaned = clean_movie_name(raw_name)
+        logger.debug(f"🎬 Auto-repair Radarr: brut='{raw_name}' → clean='{cleaned}'")
+
+        match = radarr.get_movie_by_clean_title(cleaned)
+        if not match:
+            logger.warning(f"❗ Auto-repair Radarr: aucun film trouvé pour {cleaned}")
+            return {
+                "success": True,
+                "deleted": True,
+                "relaunch": False,
+                "path": str(symlink_path),
+            }
+
+        movie_id = match["id"]
+
+        # relancer Radarr
+        radarr.refresh_movie(movie_id)
+        await asyncio.sleep(2)
+        radarr.search_missing_movie(movie_id)
+
+        # event SSE
+        payload = {
+            "event": "symlink_auto_repaired",
+            "path": str(symlink_path),
+            "movie": {
+                "id": movie_id,
+                "title": match.get("title", "Inconnu")
+            }
+        }
+        sse_manager.publish_event("symlink_update", payload)
+
+        return {
+            "success": True,
+            "deleted": True,
+            "relaunch": True,
+            "path": str(symlink_path),
+            "movie_id": movie_id,
+            "movie_title": match.get("title"),
+        }
+
+    except Exception as e:
+        logger.error(f"💥 Auto-repair Radarr échoué pour {symlink_path}: {e}", exc_info=True)
+        return {
+            "success": False,
+            "reason": str(e),
+            "path": str(symlink_path),
+        }
+
 @router.post("/delete_broken")
 async def delete_broken_symlinks(
     folder: Optional[str] = None,
@@ -1124,6 +1423,327 @@ async def delete_symlink(
 # --------------------------
 # (Sonarr) –> seasonarr
 # --------------------------
+
+async def auto_repair_sonarr_symlink(
+    symlink_path: Path,
+    db: Session,
+    user_id: int | None = None,
+) -> dict:
+    """
+    Auto-repair Sonarr cohérent avec /delete_broken_sonarr.
+
+    Logique :
+    - vérifie que le chemin est bien un symlink
+    - résout la série via le dossier parent
+    - détecte la saison depuis le dossier "Season xx" / "Saison xx" / "Sxx"
+    - supprime physiquement le symlink cassé
+    - active le mode SAFE
+    - refresh Sonarr
+    - lance SeasonIt sur la saison détectée
+    - publie un event SSE
+    """
+    try:
+        if not symlink_path.is_symlink():
+            return {
+                "success": False,
+                "deleted": False,
+                "relaunch": False,
+                "reason": "not_a_symlink",
+                "path": str(symlink_path),
+            }
+
+        logger.info(f"🔧 Auto-repair Sonarr déclenché pour : {symlink_path}")
+
+        # ------------------------------------------------------------------
+        # 1) Utilisateur
+        # ------------------------------------------------------------------
+        if user_id is not None:
+            default_user = db.query(User).filter(User.id == user_id).first()
+        else:
+            default_user = db.query(User).order_by(User.id.asc()).first()
+
+        if not default_user:
+            return {
+                "success": False,
+                "deleted": False,
+                "relaunch": False,
+                "reason": "default_user_not_found",
+                "path": str(symlink_path),
+            }
+
+        # ------------------------------------------------------------------
+        # 2) Instance Sonarr
+        # ------------------------------------------------------------------
+        FIXED_INSTANCE_ID = 1
+
+        instance: SonarrInstance = db.query(SonarrInstance).get(FIXED_INSTANCE_ID)
+        if not instance:
+            return {
+                "success": False,
+                "deleted": False,
+                "relaunch": False,
+                "reason": "sonarr_instance_not_found",
+                "path": str(symlink_path),
+            }
+
+        # ------------------------------------------------------------------
+        # 3) Services
+        # ------------------------------------------------------------------
+        service = SeasonItService(db, default_user.id)
+        local_resolver = SonarrService()
+
+        # ------------------------------------------------------------------
+        # 4) Résolution série / saison
+        # Structure attendue :
+        # /Medias/shows/Nom Série/Season 01/fichier.mkv
+        # /Medias/shows/Nom Série/Saison 01/fichier.mkv
+        # /Medias/shows/Nom Série/S01/fichier.mkv
+        # ------------------------------------------------------------------
+        season_dir = symlink_path.parent
+        series_dir = season_dir.parent
+        raw_series = series_dir.name
+
+        resolved = local_resolver.resolve_series(raw_series)
+
+        # Même si la série est introuvable, on supprime le symlink cassé.
+        if not resolved:
+            symlink_path.unlink(missing_ok=True)
+
+            logger.warning(
+                f"⚠️ Auto-repair Sonarr : symlink supprimé mais série introuvable : "
+                f"{raw_series} | path={symlink_path}"
+            )
+
+            payload = {
+                "event": "sonarr_symlink_auto_repaired",
+                "path": str(symlink_path),
+                "series": None,
+                "season": None,
+                "result": {
+                    "resolved": False,
+                    "deleted": True,
+                    "relaunch": False,
+                    "reason": f"series_not_found:{raw_series}",
+                },
+                "id": str(uuid.uuid4()),
+            }
+            sse_manager.publish_event("symlink_update", payload)
+
+            return {
+                "success": True,
+                "deleted": True,
+                "relaunch": False,
+                "resolved": False,
+                "reason": f"series_not_found:{raw_series}",
+                "path": str(symlink_path),
+            }
+
+        series_id = resolved["id"]
+        title = resolved.get("title", raw_series)
+
+        # ------------------------------------------------------------------
+        # 5) Détection saison
+        # ------------------------------------------------------------------
+        season_number = None
+
+        season_regex = re.compile(
+            r"(?:saison|season)\s*0?(\d{1,2})",
+            re.IGNORECASE
+        )
+
+        match = season_regex.search(season_dir.name)
+        if match:
+            season_number = int(match.group(1))
+        else:
+            # Fallback : S01, S1, s01, s1
+            match = re.search(r"\b[Ss]0?(\d{1,2})\b", season_dir.name)
+            if match:
+                season_number = int(match.group(1))
+
+        if season_number is None:
+            symlink_path.unlink(missing_ok=True)
+
+            logger.warning(
+                f"⚠️ Auto-repair Sonarr : symlink supprimé mais saison introuvable : "
+                f"{season_dir.name} | path={symlink_path}"
+            )
+
+            payload = {
+                "event": "sonarr_symlink_auto_repaired",
+                "path": str(symlink_path),
+                "series": {
+                    "id": series_id,
+                    "title": title,
+                },
+                "season": None,
+                "result": {
+                    "resolved": True,
+                    "deleted": True,
+                    "relaunch": False,
+                    "reason": f"season_not_found:{season_dir.name}",
+                },
+                "id": str(uuid.uuid4()),
+            }
+            sse_manager.publish_event("symlink_update", payload)
+
+            return {
+                "success": True,
+                "deleted": True,
+                "relaunch": False,
+                "resolved": True,
+                "reason": f"season_not_found:{season_dir.name}",
+                "path": str(symlink_path),
+                "series_id": series_id,
+                "series_title": title,
+            }
+
+        # ------------------------------------------------------------------
+        # 6) Suppression physique du symlink
+        # ------------------------------------------------------------------
+        symlink_path.unlink(missing_ok=True)
+
+        logger.info(
+            f"🗑️ Auto-repair Sonarr : symlink supprimé : {symlink_path} "
+            f"| series_id={series_id}, season={season_number}"
+        )
+
+        # ------------------------------------------------------------------
+        # 7) Mode SAFE
+        # ------------------------------------------------------------------
+        try:
+            settings = db.query(UserSettings).filter(
+                UserSettings.user_id == default_user.id
+            ).first()
+
+            if settings:
+                settings.skip_episode_deletion = False
+                settings.disable_season_pack_check = False
+                db.commit()
+                db.refresh(settings)
+
+                logger.info(
+                    f"🛡️ Auto-repair Sonarr : mode SAFE activé "
+                    f"pour user={default_user.id}"
+                )
+
+        except Exception as e:
+            db.rollback()
+            logger.warning(
+                f"⚠️ Auto-repair Sonarr : impossible d'activer le mode SAFE : {e}",
+                exc_info=True,
+            )
+
+        # ------------------------------------------------------------------
+        # 8) Refresh Sonarr
+        # ------------------------------------------------------------------
+        try:
+            logger.info(f"🔄 Auto-repair Sonarr : refresh série ID={series_id}")
+            local_resolver.refresh_series(series_id)
+            await asyncio.sleep(3)
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Auto-repair Sonarr : refresh failed pour series_id={series_id}: {e}",
+                exc_info=True,
+            )
+
+        # ------------------------------------------------------------------
+        # 9) SeasonIt
+        # ------------------------------------------------------------------
+        seasonit_result = None
+
+        try:
+            logger.info(f"🎬 Auto-repair Sonarr : SeasonIt {title} S{season_number}")
+            seasonit_result = await service.process_season_it(
+                series_id,
+                season_number,
+                FIXED_INSTANCE_ID,
+            )
+
+        except Exception as e:
+            logger.error(
+                f"💥 Auto-repair Sonarr : SeasonIt failed pour "
+                f"{title} S{season_number}: {e}",
+                exc_info=True,
+            )
+
+            payload = {
+                "event": "sonarr_symlink_auto_repair_failed",
+                "path": str(symlink_path),
+                "series": {
+                    "id": series_id,
+                    "title": title,
+                },
+                "season": season_number,
+                "result": {
+                    "resolved": True,
+                    "deleted": True,
+                    "relaunch": False,
+                    "seasonit_error": str(e),
+                },
+                "id": str(uuid.uuid4()),
+            }
+            sse_manager.publish_event("symlink_update", payload)
+
+            return {
+                "success": True,
+                "deleted": True,
+                "relaunch": False,
+                "resolved": True,
+                "reason": f"seasonit_failed:{e}",
+                "path": str(symlink_path),
+                "series_id": series_id,
+                "series_title": title,
+                "season_number": season_number,
+            }
+
+        # ------------------------------------------------------------------
+        # 10) Event SSE succès
+        # ------------------------------------------------------------------
+        payload = {
+            "event": "sonarr_symlink_auto_repaired",
+            "path": str(symlink_path),
+            "series": {
+                "id": series_id,
+                "title": title,
+            },
+            "season": season_number,
+            "result": {
+                "resolved": True,
+                "deleted": True,
+                "relaunch": True,
+                "seasonit_result": seasonit_result,
+            },
+            "id": str(uuid.uuid4()),
+        }
+
+        sse_manager.publish_event("symlink_update", payload)
+
+        return {
+            "success": True,
+            "deleted": True,
+            "relaunch": True,
+            "resolved": True,
+            "path": str(symlink_path),
+            "series_id": series_id,
+            "series_title": title,
+            "season_number": season_number,
+            "user_id": default_user.id,
+            "result": seasonit_result,
+        }
+
+    except Exception as e:
+        logger.error(
+            f"💥 Auto-repair Sonarr échoué pour {symlink_path}: {e}",
+            exc_info=True,
+        )
+
+        return {
+            "success": False,
+            "deleted": False,
+            "relaunch": False,
+            "reason": str(e),
+            "path": str(symlink_path),
+        }
 
 @router.get("/get-sonarr-id/{symlink_path:path}")
 async def get_sonarr_series_id_only(

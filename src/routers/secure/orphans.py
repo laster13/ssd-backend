@@ -9,6 +9,7 @@ import subprocess
 import os
 import aiohttp
 import docker
+import re
 
 
 router = APIRouter(
@@ -348,23 +349,35 @@ async def get_stats():
 
 async def perform_deletion(instance: str, dry_run: bool = False):
     """
-    Supprime (ou simule la suppression) des orphelins AllDebrid.
+    Supprime ou simule la suppression des orphelins AllDebrid.
 
-    Version adaptée au mode WebDAV :
-    - le scan amont a déjà déterminé quels dossiers sont orphelins
-    - on ne rescane plus récursivement le contenu des torrents
-    - timeout HTTP explicite
-    - aucune suppression locale
-    - aucun nettoyage de cache Decypharr
+    Version securisee:
+    - utilise uniquement les orphelins deja detectes par le scan WebDAV
+    - ignore les noms trop generiques: Saison 2, Season 1, S02, sample, subs...
+    - recupere la liste des magnets AllDebrid une seule fois
+    - ne traite en suppression que les magnets retrouves de facon fiable
+    - ne log plus en WARNING les magnets absents de la liste AllDebrid
+    - refuse les matches vagues ou ambigus
+    - ne touche pas au cache Decypharr
     """
+    import re
+
     if not is_decypharr_running():
-        logger.warning(f"🛑 Suppression interrompue : Decypharr redémarre pendant la suppression {instance}.")
-        return {"instance": instance, "error": "Decypharr non opérationnel — suppression annulée."}
+        logger.warning(
+            f"[{instance}] Suppression interrompue: Decypharr non operationnel."
+        )
+        return {
+            "instance": instance,
+            "error": "Decypharr non operationnel - suppression annulee.",
+        }
 
     data = orphans_store.get(instance)
     if not data:
-        logger.error(f"<red>[{instance}] Instance introuvable dans orphans_store</red>")
-        return {"instance": instance, "error": "Instance non trouvée"}
+        logger.error(f"[{instance}] Instance introuvable dans orphans_store")
+        return {
+            "instance": instance,
+            "error": "Instance non trouvee",
+        }
 
     orphans = data.get("orphans", [])
     api_key = data.get("api_key")
@@ -372,96 +385,408 @@ async def perform_deletion(instance: str, dry_run: bool = False):
     rate_limit = float(data.get("rate_limit", 0.5))
 
     dry_label = "DRY-RUN" if dry_run else "SUPPRESSION"
-    logger.info(f"🧪 [{instance}] Démarrage {dry_label} en tâche de fond...")
+    logger.info(f"[{instance}] Demarrage {dry_label} en tache de fond...")
+
+    if not api_key:
+        logger.error(f"[{instance}] Cle API AllDebrid manquante.")
+        return {
+            "instance": instance,
+            "error": "Cle API AllDebrid manquante",
+        }
+
+    if not mount_path:
+        logger.error(f"[{instance}] mount_path manquant.")
+        return {
+            "instance": instance,
+            "error": "mount_path manquant",
+        }
 
     def extract_torrent(file_path: str) -> str | None:
+        """
+        Extrait le dossier torrent parent depuis un chemin orphelin.
+        Exemple:
+        /mount/Torrent.Name/file.mkv -> Torrent.Name
+        """
         try:
             rel_path = os.path.relpath(file_path, mount_path)
-            return rel_path.split(os.sep, 1)[0]
+            first_part = rel_path.split(os.sep, 1)[0]
+            first_part = first_part.strip()
+            return first_part or None
         except Exception:
             return None
 
-    all_torrents = sorted(set(filter(None, [extract_torrent(f) for f in orphans])))
-    torrents_to_delete = list(all_torrents)
+    def normalize_name(value: str) -> str:
+        """
+        Normalise un nom pour comparaison.
+        """
+        if not value:
+            return ""
 
-    logger.info(f"🧪 [{instance}] {len(torrents_to_delete)} torrent(s) à traiter après scan WebDAV")
+        value = value.lower().strip()
 
-    if not torrents_to_delete:
-        logger.info(f"<green>🧱[{instance}] Aucun torrent à supprimer.</green>")
+        replacements = {
+            "é": "e", "è": "e", "ê": "e", "ë": "e",
+            "à": "a", "â": "a", "ä": "a",
+            "î": "i", "ï": "i",
+            "ô": "o", "ö": "o",
+            "ù": "u", "û": "u", "ü": "u",
+            "ç": "c",
+        }
+
+        for src, dst in replacements.items():
+            value = value.replace(src, dst)
+
+        value = re.sub(
+            r"\.(mkv|mp4|avi|m4v|mov|ts)$",
+            "",
+            value,
+            flags=re.IGNORECASE,
+        )
+        value = value.replace("_", " ").replace(".", " ").replace("-", " ")
+        value = re.sub(r"\s+", " ", value).strip()
+
+        return value
+
+    def should_skip_torrent_name(name: str) -> bool:
+        """
+        Ignore les faux noms de torrents ou noms trop generiques.
+        Cela evite de traiter des dossiers comme:
+        - Saison 1
+        - Saison 2
+        - Season 1
+        - S01
+        - S02
+        - sample
+        - subtitles
+        """
+        if not name:
+            return True
+
+        clean = normalize_name(name)
+
+        if not clean:
+            return True
+
+        generic_patterns = [
+            r"^saison\s*\d+$",
+            r"^season\s*\d+$",
+            r"^s\d{1,2}$",
+            r"^sample$",
+            r"^samples$",
+            r"^subtitle$",
+            r"^subtitles$",
+            r"^subs$",
+            r"^bonus$",
+            r"^extras$",
+            r"^extra$",
+        ]
+
+        for pattern in generic_patterns:
+            if re.match(pattern, clean, flags=re.IGNORECASE):
+                return True
+
+        if len(clean) < 8:
+            return True
+
+        return False
+
+    def strong_prefix(a: str, b: str) -> bool:
+        """
+        Retourne True seulement si les noms sont vraiment proches des le debut.
+        Evite les matches dangereux.
+        """
+        if not a or not b:
+            return False
+
+        na = normalize_name(a)
+        nb = normalize_name(b)
+
+        if na == nb:
+            return True
+
+        shortest = min(len(na), len(nb))
+
+        if shortest < 12:
+            return False
+
+        prefix_len = 0
+
+        for ca, cb in zip(na, nb):
+            if ca == cb:
+                prefix_len += 1
+            else:
+                break
+
+        return prefix_len >= max(12, int(shortest * 0.7))
+
+    all_torrents = sorted(
+        set(
+            filter(
+                None,
+                [extract_torrent(f) for f in orphans],
+            )
+        )
+    )
+
+    skipped_generic = [
+        torrent
+        for torrent in all_torrents
+        if should_skip_torrent_name(torrent)
+    ]
+
+    candidate_torrents = [
+        torrent
+        for torrent in all_torrents
+        if not should_skip_torrent_name(torrent)
+    ]
+
+    if skipped_generic:
+        logger.info(
+            f"[{instance}] {len(skipped_generic)} torrent(s) ignore(s), nom trop generique: "
+            f"{skipped_generic[:10]}"
+        )
+
+    logger.info(
+        f"[{instance}] {len(candidate_torrents)} torrent(s) candidat(s) apres filtrage "
+        f"sur {len(all_torrents)} extrait(s) du scan WebDAV"
+    )
+
+    if not candidate_torrents:
+        logger.info(f"[{instance}] Aucun torrent candidat a traiter.")
         return {
             "instance": instance,
             "dry_run": dry_run,
             "deleted": 0,
             "not_found": 0,
+            "skipped": len(skipped_generic),
             "errors": 0,
             "deleted_torrents": [],
             "timestamp": datetime.utcnow().isoformat() + "Z",
         }
 
-    ok, nf, err = 0, 0, 0
-    actually_deleted = []
+    timeout = aiohttp.ClientTimeout(
+        total=30,
+        connect=10,
+        sock_read=30,
+    )
 
-    timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=30)
+    ok = 0
+    nf = 0
+    err = 0
+    actually_deleted = []
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         if not is_decypharr_running():
-            logger.warning(f"🛑 Suppression interrompue avant requête API : Decypharr redémarre.")
-            return {"instance": instance, "error": "Decypharr redémarré avant suppression AllDebrid."}
+            logger.warning(
+                f"[{instance}] Suppression interrompue avant requete API: Decypharr redemarre."
+            )
+            return {
+                "instance": instance,
+                "error": "Decypharr redemarre avant suppression AllDebrid.",
+            }
 
-        logger.info(f"🧪 [{instance}] Récupération de la liste des magnets AllDebrid...")
+        logger.info(f"[{instance}] Recuperation de la liste des magnets AllDebrid...")
 
         async with session.get(
             f"{ALLDEBRID_API_BASE}/magnet/status",
-            headers={"Authorization": f"Bearer {api_key}"}
+            headers={"Authorization": f"Bearer {api_key}"},
         ) as resp:
             try:
                 data_status = await resp.json()
             except Exception as e:
-                logger.error(f"<red>[{instance}] Erreur de décodage JSON sur magnet/status : {e}</red>")
-                return {"instance": instance, "error": "Réponse JSON invalide sur magnet/status"}
+                logger.error(
+                    f"[{instance}] Erreur de decodage JSON sur magnet/status: {e}"
+                )
+                return {
+                    "instance": instance,
+                    "error": "Reponse JSON invalide sur magnet/status",
+                }
 
             if data_status.get("status") != "success":
-                logger.error(f"<cyan>[{instance}] Erreur API magnet/status: {data_status}</cyan>")
-                return {"instance": instance, "error": "Erreur API magnet/status"}
+                logger.error(
+                    f"[{instance}] Erreur API magnet/status: {data_status}"
+                )
+                return {
+                    "instance": instance,
+                    "error": "Erreur API magnet/status",
+                }
 
             magnets = data_status.get("data", {}).get("magnets", [])
 
-        logger.info(f"🧪 [{instance}] {len(magnets)} magnet(s) récupéré(s) depuis AllDebrid")
+        logger.info(
+            f"[{instance}] {len(magnets)} magnet(s) recupere(s) depuis AllDebrid"
+        )
 
         def find_magnet_info(name: str) -> dict | None:
-            for m in magnets:
-                filename = m.get("filename") or ""
-                magnet_name = m.get("name") or ""
-                if filename == name or magnet_name == name:
-                    return {"id": str(m["id"]), "name": filename or magnet_name}
+            """
+            Matching securise:
+            1. match exact filename/name
+            2. match exact normalise
+            3. prefixe fort et unique seulement
 
-            for m in magnets:
-                filename = m.get("filename") or ""
-                magnet_name = m.get("name") or ""
-                if filename.startswith(name) or magnet_name.startswith(name):
-                    return {"id": str(m["id"]), "name": filename or magnet_name}
+            Si plusieurs matches existent, on refuse.
+            """
+            exact_candidates = []
+            normalized_candidates = []
+            strong_prefix_candidates = []
+
+            wanted_norm = normalize_name(name)
+
+            for magnet in magnets:
+                filename = (magnet.get("filename") or "").strip()
+                magnet_name = (magnet.get("name") or "").strip()
+
+                candidates = [
+                    candidate
+                    for candidate in [filename, magnet_name]
+                    if candidate
+                ]
+
+                if name in candidates:
+                    exact_candidates.append(
+                        {
+                            "id": str(magnet["id"]),
+                            "name": filename or magnet_name,
+                        }
+                    )
+                    continue
+
+                matched_normalized = False
+
+                for candidate in candidates:
+                    if normalize_name(candidate) == wanted_norm:
+                        normalized_candidates.append(
+                            {
+                                "id": str(magnet["id"]),
+                                "name": filename or magnet_name,
+                            }
+                        )
+                        matched_normalized = True
+                        break
+
+                if matched_normalized:
+                    continue
+
+                for candidate in candidates:
+                    if strong_prefix(name, candidate):
+                        strong_prefix_candidates.append(
+                            {
+                                "id": str(magnet["id"]),
+                                "name": filename or magnet_name,
+                            }
+                        )
+                        break
+
+            if len(exact_candidates) == 1:
+                return exact_candidates[0]
+
+            if len(exact_candidates) > 1:
+                logger.info(
+                    f"[{instance}] Match exact ambigu ignore pour '{name}': "
+                    f"{[x['name'] for x in exact_candidates[:5]]}"
+                )
+                return None
+
+            if len(normalized_candidates) == 1:
+                return normalized_candidates[0]
+
+            if len(normalized_candidates) > 1:
+                logger.info(
+                    f"[{instance}] Match normalise ambigu ignore pour '{name}': "
+                    f"{[x['name'] for x in normalized_candidates[:5]]}"
+                )
+                return None
+
+            if len(strong_prefix_candidates) == 1:
+                logger.info(
+                    f"[{instance}] Match prefixe fort retenu pour '{name}' -> "
+                    f"{strong_prefix_candidates[0]['name']}"
+                )
+                return strong_prefix_candidates[0]
+
+            if len(strong_prefix_candidates) > 1:
+                logger.info(
+                    f"[{instance}] Match prefixe ambigu ignore pour '{name}': "
+                    f"{[x['name'] for x in strong_prefix_candidates[:5]]}"
+                )
+                return None
 
             return None
 
-        for idx, torrent in enumerate(torrents_to_delete, start=1):
-            if not is_decypharr_running():
-                logger.warning(f"🛑 Suppression interrompue pendant le cycle AllDebrid ({instance}).")
-                return {"instance": instance, "error": "Decypharr redémarré en cours de suppression."}
+        matched_torrents = []
+        missing_torrents = []
 
-            logger.info(f"🧪 [{instance}] {idx}/{len(torrents_to_delete)} : {torrent}")
-
+        for torrent in candidate_torrents:
             info = find_magnet_info(torrent)
-            if not info:
-                nf += 1
-                logger.warning(f"<yellow>⚠️ [AllDebrid] {torrent} introuvable dans la liste des magnets</yellow>")
-                await asyncio.sleep(rate_limit)
-                continue
+
+            if info:
+                matched_torrents.append(
+                    {
+                        "torrent": torrent,
+                        "info": info,
+                    }
+                )
+            else:
+                missing_torrents.append(torrent)
+
+        nf = len(missing_torrents)
+
+        if missing_torrents:
+            logger.info(
+                f"[{instance}] {len(missing_torrents)} torrent(s) ignore(s), absent(s) de la liste AllDebrid. "
+                f"Exemples: {missing_torrents[:10]}"
+            )
+
+        logger.info(
+            f"[{instance}] {len(matched_torrents)} torrent(s) avec match fiable a traiter"
+        )
+
+        if not matched_torrents:
+            data["orphans"] = []
+            data.setdefault("stats", {})["orphans"] = 0
+            data["deleted_torrents"] = []
+            data["deleted_timestamp"] = datetime.utcnow().isoformat() + "Z"
+
+            logger.info(
+                f"[{instance}] Fin {dry_label}: 0 supprime(s), "
+                f"{nf} absent(s), {len(skipped_generic)} ignore(s), 0 erreur(s)"
+            )
+
+            return {
+                "instance": instance,
+                "dry_run": dry_run,
+                "deleted": 0,
+                "not_found": nf,
+                "skipped": len(skipped_generic),
+                "errors": 0,
+                "deleted_torrents": [],
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            }
+
+        for idx, item in enumerate(matched_torrents, start=1):
+            if not is_decypharr_running():
+                logger.warning(
+                    f"[{instance}] Suppression interrompue pendant le cycle AllDebrid."
+                )
+                return {
+                    "instance": instance,
+                    "error": "Decypharr redemarre en cours de suppression.",
+                }
+
+            torrent = item["torrent"]
+            info = item["info"]
 
             magnet_id = info["id"]
             magnet_name = info["name"]
 
+            logger.info(
+                f"[{instance}] {idx}/{len(matched_torrents)}: {torrent} -> {magnet_name}"
+            )
+
             if dry_run:
-                logger.info(f"<green>🧱 [AllDebrid] {magnet_name} - ID: {magnet_id} → simulé</green>")
+                logger.info(
+                    f"[AllDebrid] {magnet_name} - ID: {magnet_id} -> simule"
+                )
                 await asyncio.sleep(rate_limit)
                 continue
 
@@ -471,20 +796,38 @@ async def perform_deletion(instance: str, dry_run: bool = False):
                     headers={"Authorization": f"Bearer {api_key}"},
                     data={"id": magnet_id},
                 ) as del_resp:
-                    del_json = await del_resp.json()
+                    try:
+                        del_json = await del_resp.json()
+                    except Exception as e:
+                        err += 1
+                        logger.error(
+                            f"[{instance}] Reponse JSON invalide suppression AllDebrid "
+                            f"({magnet_name}): {e}"
+                        )
+                        await asyncio.sleep(rate_limit)
+                        continue
 
                     if del_json.get("status") == "success":
                         ok += 1
                         actually_deleted.append(magnet_name)
-                        logger.info(f"<cyan>   [AllDebrid] {magnet_name} - ID: {magnet_id} → supprimé</cyan>")
+                        logger.info(
+                            f"[AllDebrid] {magnet_name} - ID: {magnet_id} -> supprime"
+                        )
                     else:
                         err += 1
-                        msg = del_json.get("error", {}).get("message", "Erreur inconnue")
-                        logger.warning(f"<yellow>⚠️ [AllDebrid] Échec suppression {magnet_name} : {msg}</yellow>")
+                        msg = del_json.get("error", {}).get(
+                            "message",
+                            "Erreur inconnue",
+                        )
+                        logger.warning(
+                            f"[AllDebrid] Echec suppression {magnet_name}: {msg}"
+                        )
 
             except Exception as e:
-                logger.error(f"<red>[{instance}] ✗ Exception suppression AllDebrid ({magnet_name}): {e}</red>")
                 err += 1
+                logger.error(
+                    f"[{instance}] Exception suppression AllDebrid ({magnet_name}): {e}"
+                )
 
             await asyncio.sleep(rate_limit)
 
@@ -494,8 +837,9 @@ async def perform_deletion(instance: str, dry_run: bool = False):
     data["deleted_timestamp"] = datetime.utcnow().isoformat() + "Z"
 
     logger.info(
-        f"✅ [{instance}] Fin {dry_label} → "
-        f"{ok} supprimé(s), {nf} introuvable(s), {err} erreur(s)"
+        f"[{instance}] Fin {dry_label}: "
+        f"{ok} supprime(s), {nf} absent(s), "
+        f"{len(skipped_generic)} ignore(s), {err} erreur(s)"
     )
 
     return {
@@ -503,11 +847,11 @@ async def perform_deletion(instance: str, dry_run: bool = False):
         "dry_run": dry_run,
         "deleted": ok,
         "not_found": nf,
+        "skipped": len(skipped_generic),
         "errors": err,
         "deleted_torrents": actually_deleted,
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
-
 
 @router.delete("/all")
 async def delete_all_orphans(
@@ -582,109 +926,169 @@ async def delete_all_orphans_job(dry_run: bool = True):
 
     if not orphans_store:
         logger.info("ℹ️ Aucun orphelin trouvé pour suppression.")
-        return
+        return {
+            "logs": [],
+            "deleted_torrents": [],
+            "deleted_count": 0,
+            "not_found_count": 0,
+            "error_count": 0,
+            "instances": [],
+            "dry_run": dry_run,
+        }
 
     mode = "dry-run" if dry_run else "suppression"
-    logger.info(f"🚀 Lancement interne pour {len(orphans_store)} instances...")
+    logger.info(f"🚀 Lancement interne pour {len(orphans_store)} instance(s)...")
 
-    total_deleted, total_not_found, total_errors = 0, 0, 0
+    total_deleted = 0
+    total_not_found = 0
+    total_errors = 0
     per_instance = []
+    deleted_torrents = []
 
     buffer = io.StringIO()
-    handler_id = logger.add(buffer, level="INFO")
-
-    for instance in list(orphans_store.keys()):
-        try:
-            result = await perform_deletion(instance, dry_run=dry_run)
-            if not result:
-                continue
-
-            name = result.get("instance", instance)
-            if dry_run:
-                deleted = result.get("found_torrents", 0)
-                not_found = 0
-                errors = 0
-            else:
-                deleted = result.get("deleted", 0)
-                not_found = result.get("not_found", 0)
-                errors = result.get("errors", 0)
-
-            per_instance.append({
-                "name": name,
-                "deleted": deleted,
-                "not_found": not_found,
-                "errors": errors
-            })
-
-            total_deleted += deleted
-            total_not_found += not_found
-            total_errors += errors
-
-        except Exception as e:
-            logger.error(f"💥 Erreur suppression {instance}: {e}")
-
-    webhook = getattr(config_manager.config, "discord_webhook_url", None)
-    if not webhook:
-        logger.warning("⚠️ Aucun webhook Discord configuré pour le rapport de suppression.")
-        logger.remove(handler_id)
-        return
-
-    description = (
-        f"🧾 **{mode.upper()} AllDebrid terminé**\n\n"
-        f"✅ **{total_deleted} torrent(s) {'simulé(s)' if dry_run else 'supprimé(s)'}**\n"
-        f"⚠️ **{total_not_found} non trouvés**\n"
-        f"❌ **{total_errors} erreurs**\n\n"
-        f"🕒 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
-        f"📂 **Instances traitées :**"
-    )
-
-    for inst in per_instance[:10]:
-        description += f"\n• **{inst['name']}** → ✅ {inst['deleted']} | ⚠️ {inst['not_found']} | ❌ {inst['errors']}"
-    if len(per_instance) > 10:
-        description += f"\n… (+{len(per_instance) - 10} autres)"
-
-    async def _send():
-        try:
-            await send_discord_message(
-                webhook_url=webhook,
-                title="🧹 Rapport AllDebrid — Orphelins supprimés",
-                description=description,
-                color=0x3498DB if dry_run else 0x2ECC71,
-                module="Orphan Manager",
-                action="deleted" if not dry_run else "created",
-            )
-            logger.info("   Rapport Discord suppression enrichi envoyé.")
-        except Exception as e:
-            logger.error(f"💥 Erreur envoi Discord : {e}")
+    handler_id = logger.add(buffer, level="INFO", format="{message}")
 
     try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_send())
-    except RuntimeError:
-        asyncio.run(_send())
+        for instance in list(orphans_store.keys()):
+            try:
+                result = await perform_deletion(instance, dry_run=dry_run)
 
-    logger.remove(handler_id)
+                if not result:
+                    per_instance.append({
+                        "name": instance,
+                        "deleted": 0,
+                        "not_found": 0,
+                        "errors": 1,
+                        "status": "empty_result",
+                    })
+                    total_errors += 1
+                    continue
+
+                if result.get("error"):
+                    per_instance.append({
+                        "name": result.get("instance", instance),
+                        "deleted": 0,
+                        "not_found": 0,
+                        "errors": 1,
+                        "status": "error",
+                        "message": result.get("error"),
+                    })
+                    total_errors += 1
+                    logger.error(f"💥 Erreur suppression {instance}: {result.get('error')}")
+                    continue
+
+                name = result.get("instance", instance)
+                deleted = int(result.get("deleted", 0) or 0)
+                not_found = int(result.get("not_found", 0) or 0)
+                errors = int(result.get("errors", 0) or 0)
+                instance_deleted_torrents = result.get("deleted_torrents", []) or []
+
+                total_deleted += deleted
+                total_not_found += not_found
+                total_errors += errors
+
+                for torrent_name in instance_deleted_torrents:
+                    if torrent_name and torrent_name not in deleted_torrents:
+                        deleted_torrents.append(torrent_name)
+
+                per_instance.append({
+                    "name": name,
+                    "deleted": deleted,
+                    "not_found": not_found,
+                    "errors": errors,
+                    "status": "ok",
+                })
+
+            except Exception as e:
+                logger.error(f"💥 Erreur suppression {instance}: {e}", exc_info=True)
+                total_errors += 1
+                per_instance.append({
+                    "name": instance,
+                    "deleted": 0,
+                    "not_found": 0,
+                    "errors": 1,
+                    "status": "exception",
+                    "message": str(e),
+                })
+
+        webhook = getattr(config_manager.config, "discord_webhook_url", None)
+
+        if webhook:
+            description = (
+                f"🧾 **{mode.upper()} AllDebrid terminé**\n\n"
+                f"✅ **{total_deleted} torrent(s) {'simulé(s)' if dry_run else 'supprimé(s)'}**\n"
+                f"⚠️ **{total_not_found} introuvable(s)**\n"
+                f"❌ **{total_errors} erreur(s)**\n\n"
+                f"🕒 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+                f"📂 **Instances traitées :**"
+            )
+
+            for inst in per_instance[:10]:
+                line = (
+                    f"\n• **{inst['name']}** → "
+                    f"✅ {inst['deleted']} | ⚠️ {inst['not_found']} | ❌ {inst['errors']}"
+                )
+                if inst.get("status") not in ("ok", None):
+                    line += f" ({inst['status']})"
+                description += line
+
+            if len(per_instance) > 10:
+                description += f"\n… (+{len(per_instance) - 10} autres)"
+
+            if deleted_torrents:
+                preview = deleted_torrents[:15]
+                description += "\n\n🗑️ **Torrents supprimés :**"
+                for name in preview:
+                    description += f"\n- {name}"
+                if len(deleted_torrents) > 15:
+                    description += f"\n… (+{len(deleted_torrents) - 15} autres)"
+
+            async def _send():
+                try:
+                    await send_discord_message(
+                        webhook_url=webhook,
+                        title="🧹 Rapport AllDebrid — Orphelins",
+                        description=description,
+                        color=0x3498DB if dry_run else 0x2ECC71,
+                        module="Orphan Manager",
+                        action="deleted" if not dry_run else "created",
+                    )
+                    logger.info("📢 Rapport Discord suppression enrichi envoyé.")
+                except Exception as e:
+                    logger.error(f"💥 Erreur envoi Discord : {e}")
+
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(_send())
+            except RuntimeError:
+                asyncio.run(_send())
+        else:
+            logger.warning("⚠️ Aucun webhook Discord configuré pour le rapport de suppression.")
+
+    finally:
+        try:
+            logger.remove(handler_id)
+        except Exception:
+            pass
+
     buffer.seek(0)
-    log_lines = buffer.read().splitlines()
+    raw_logs = [line for line in buffer.read().splitlines() if line.strip()]
 
-    deleted_torrents = []
-    for line in log_lines:
-        if "→ supprimé" in line and "[AllDebrid]" in line:
-            name = line.split("[AllDebrid]")[-1].split("→")[0].strip(" -:")
-            if name and name not in deleted_torrents:
-                deleted_torrents.append(name)
+    summary_logs = [
+        f"[{inst['name']}] → {inst['deleted']} supprimé(s), {inst['not_found']} introuvable(s), {inst['errors']} erreur(s)"
+        for inst in per_instance
+    ]
 
     return {
-        "logs": [
-            f"[{inst['name']}] → {inst['deleted']} supprimé(s), {inst['not_found']} introuvable(s), {inst['errors']} erreur(s)"
-            for inst in per_instance
-        ],
+        "logs": summary_logs or raw_logs,
         "deleted_torrents": deleted_torrents,
         "deleted_count": total_deleted,
         "not_found_count": total_not_found,
         "error_count": total_errors,
+        "instances": per_instance,
+        "dry_run": dry_run,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
     }
-
 
 @router.get("/only")
 async def get_only_deleted_orphans():

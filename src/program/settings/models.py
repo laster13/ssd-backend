@@ -140,6 +140,7 @@ class SymlinkConfig(BaseModel):
     alldebrid_instances: List[AllDebridInstance] = Field(default_factory=list)
 
     orphan_manager: OrphanManagerConfig = OrphanManagerConfig()
+    auto_repair_broken_symlinks: bool = False
 
     # API externes
     radarr_api_key: Optional[str] = None

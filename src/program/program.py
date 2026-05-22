@@ -70,10 +70,10 @@ class Program(threading.Thread):
 
         self._schedule_functions()
         self.scheduler.start()
+        self.initialized = True
         super().start()
 
         logger.success("SSDv2 est bien lancé!")
-        self.initialized = True
 
     def _schedule_functions(self):
         """Schedule periodic maintenance tasks."""

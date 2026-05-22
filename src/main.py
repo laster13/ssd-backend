@@ -153,9 +153,9 @@ logger.add(
     format=custom_format,
     backtrace=True,
     diagnose=True,
-    enqueue=True
+    enqueue=False
 )
-logger.add("logs/app.log", rotation="7 days", compression="zip", enqueue=True, format=custom_format)
+logger.add("logs/app.log", rotation="7 days", compression="zip", enqueue=False, format=custom_format)
 
 
 # ===== INTERCEPT HANDLER =====

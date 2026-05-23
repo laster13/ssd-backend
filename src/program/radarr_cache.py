@@ -3,6 +3,7 @@ import json
 import threading
 from pathlib import Path
 from loguru import logger
+import re
 
 from program.utils.text_utils import normalize_name, clean_movie_name
 from src.services.fonctions_arrs import RadarrService
@@ -117,6 +118,11 @@ async def _build_radarr_index(force: bool = False) -> None:
             _add_index_alias(index, title, year, tmdb_id)
             _add_index_alias(index, original_title, year, tmdb_id)
 
+            # Index ultra-fiable par IMDb.
+            # Important pour les dossiers deja nommes avec {imdb-tt...}.
+            if imdb_id:
+                index[f"imdb:{str(imdb_id).lower()}"] = tmdb_id
+
             images = movie.get("images") or []
             poster = next(
                 (
@@ -190,25 +196,122 @@ async def _build_radarr_index(force: bool = False) -> None:
         logger.exception(f"Echec construction index Radarr: {e}")
 
 
-def enrich_from_radarr_index(symlink_path: Path) -> dict:
+def enrich_from_radarr_index(
+    symlink_path: Path,
+    allow_fallback: bool = True,
+) -> dict:
     """
     Enrichit un symlink avec les infos Radarr.
 
-    Si le film n'est pas deja dans l'index memoire,
-    on le cherche via Radarr et on le patch en memoire.
+    Priorite de matching :
+    1. IMDb tag dans le dossier : {imdb-tt...}
+    2. variantes de titre en cache memoire
+    3. fallback Radarr direct seulement si allow_fallback=True
+
+    allow_fallback=False:
+        utilise uniquement le cache memoire.
+        Important pendant le scan initial des symlinks.
     """
     raw_name = symlink_path.parent.name
-    cleaned = clean_movie_name(raw_name)
-    norm = normalize_name(cleaned)
+
+    def extract_imdb_id(value: str) -> str | None:
+        match = re.search(r"(tt\d+)", value or "", flags=re.IGNORECASE)
+        return match.group(1).lower() if match else None
+
+    def candidate_keys(name: str) -> list[str]:
+        keys = []
+
+        def add_key(value: str | None):
+            if not value:
+                return
+
+            norm_value = normalize_name(value)
+
+            if norm_value and norm_value not in keys:
+                keys.append(norm_value)
+
+        imdb_id = extract_imdb_id(name)
+
+        # 1. IMDb exact : le plus fiable.
+        if imdb_id:
+            keys.append(f"imdb:{imdb_id}")
+
+        # 2. Nom nettoye standard.
+        cleaned = clean_movie_name(name)
+        add_key(cleaned)
+
+        # 3. Nom brut normalise.
+        add_key(name)
+
+        # 4. Nom sans annee.
+        no_year = re.sub(
+            r"\(?\b(19|20)\d{2}\b\)?",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+        add_key(no_year)
+
+        # 5. Nom sans tokens release courants.
+        no_release_tokens = re.sub(
+            r"\b("
+            r"multi|french|truefrench|vostfr|subfrench|vo|vf|"
+            r"1080p|720p|2160p|4k|uhd|hdr|dv|"
+            r"bluray|blu-ray|web-dl|webdl|webrip|bdrip|hdrip|remux|"
+            r"x264|x265|h264|h265|hevc|aac|ddp|dts|atmos|"
+            r"proper|repack|extended|unrated|theatrical"
+            r")\b",
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        no_release_tokens = re.sub(r"\s+", " ", no_release_tokens).strip()
+        add_key(no_release_tokens)
+
+        # 6. Nom sans annee + sans tokens release.
+        no_year_no_release = re.sub(
+            r"\(?\b(19|20)\d{2}\b\)?",
+            "",
+            no_release_tokens,
+            flags=re.IGNORECASE,
+        ).strip()
+        add_key(no_year_no_release)
+
+        # 7. Si une annee existe, essaie aussi title+year.
+        year_match = re.search(r"\b(19|20)\d{2}\b", name)
+
+        if year_match:
+            year = year_match.group(0)
+
+            for base in (no_year, no_year_no_release):
+                base_norm = normalize_name(base)
+
+                if base_norm:
+                    key_with_year = f"{base_norm}{year}"
+
+                    if key_with_year not in keys:
+                        keys.append(key_with_year)
+
+        return keys
+
+    keys = candidate_keys(raw_name)
 
     with _radarr_idx_lock:
-        tmdb_id = _radarr_index.get(norm) or _radarr_index.get(f"{norm}")
+        tmdb_id = None
 
-    if tmdb_id:
-        movie = _radarr_catalog.get(str(tmdb_id))
+        for key in keys:
+            tmdb_id = _radarr_index.get(key)
 
-        if movie:
-            return _format_movie_metadata(movie)
+            if tmdb_id:
+                break
+
+        movie = _radarr_catalog.get(str(tmdb_id)) if tmdb_id else None
+
+    if movie:
+        return _format_movie_metadata(movie)
+
+    if not allow_fallback:
+        return {}
 
     try:
         radarr = RadarrService()
@@ -222,11 +325,18 @@ def enrich_from_radarr_index(symlink_path: Path) -> dict:
         if not tmdb_id:
             return {}
 
+        imdb_id = movie.get("imdbId")
+        cleaned = clean_movie_name(raw_name)
+        norm = normalize_name(cleaned)
+
         with _radarr_idx_lock:
             _radarr_index[norm] = tmdb_id
 
             if movie.get("year"):
                 _radarr_index[f"{norm}{movie['year']}"] = tmdb_id
+
+            if imdb_id:
+                _radarr_index[f"imdb:{str(imdb_id).lower()}"] = tmdb_id
 
             _radarr_catalog[str(tmdb_id)] = movie
 

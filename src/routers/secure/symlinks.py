@@ -220,7 +220,10 @@ def scan_symlinks_parallel(
             }
 
             if manager == "radarr":
-                extra = enrich_from_radarr_index(Path(symlink_path))
+                extra = enrich_from_radarr_index(
+                    Path(symlink_path),
+                    allow_fallback=False,
+                )
                 if extra:
                     item.update(extra)
 

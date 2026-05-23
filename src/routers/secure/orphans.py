@@ -355,9 +355,10 @@ async def perform_deletion(instance: str, dry_run: bool = False):
     - utilise uniquement les orphelins deja detectes par le scan WebDAV
     - ignore les noms trop generiques: Saison 2, Season 1, S02, sample, subs...
     - recupere la liste des magnets AllDebrid une seule fois
-    - ne traite en suppression que les magnets retrouves de facon fiable
-    - ne log plus en WARNING les magnets absents de la liste AllDebrid
+    - ne traite en suppression AllDebrid que les magnets retrouves de facon fiable
     - refuse les matches vagues ou ambigus
+    - nettoie aussi les dossiers WebDAV vides, meme s'ils sont generiques/absents/ambigus
+    - ne supprime jamais de fichiers localement, uniquement des dossiers vides dans mount_path
     - ne touche pas au cache Decypharr
     """
     import re
@@ -401,17 +402,31 @@ async def perform_deletion(instance: str, dry_run: bool = False):
             "error": "mount_path manquant",
         }
 
+    mount_path = os.path.normpath(str(mount_path))
+
     def extract_torrent(file_path: str) -> str | None:
         """
         Extrait le dossier torrent parent depuis un chemin orphelin.
         Exemple:
         /mount/Torrent.Name/file.mkv -> Torrent.Name
+        /mount/Torrent.Name -> Torrent.Name
         """
         try:
-            rel_path = os.path.relpath(file_path, mount_path)
+            file_path_norm = os.path.normpath(str(file_path))
+
+            # Si l'orphelin est deja le dossier torrent lui-meme.
+            if os.path.isdir(file_path_norm):
+                rel_path = os.path.relpath(file_path_norm, mount_path)
+            else:
+                rel_path = os.path.relpath(file_path_norm, mount_path)
+
             first_part = rel_path.split(os.sep, 1)[0]
             first_part = first_part.strip()
-            return first_part or None
+
+            if first_part in ("", ".", ".."):
+                return None
+
+            return first_part
         except Exception:
             return None
 
@@ -519,6 +534,166 @@ async def perform_deletion(instance: str, dry_run: bool = False):
 
         return prefix_len >= max(12, int(shortest * 0.7))
 
+    def is_inside_mount(path_value: str) -> bool:
+        """
+        Verifie qu'un chemin reste strictement dans mount_path.
+        Securite anti-suppression hors WebDAV.
+        """
+        try:
+            mount_real = os.path.realpath(mount_path)
+            path_real = os.path.realpath(path_value)
+
+            return path_real == mount_real or path_real.startswith(mount_real + os.sep)
+
+        except Exception:
+            return False
+
+    def get_torrent_folder_path(torrent_name: str) -> str | None:
+        """
+        Reconstruit le chemin absolu du dossier torrent dans le mount WebDAV.
+        """
+        if not torrent_name:
+            return None
+
+        folder_path = os.path.normpath(os.path.join(mount_path, torrent_name))
+
+        if not is_inside_mount(folder_path):
+            logger.warning(
+                f"[{instance}] Suppression dossier vide refusee hors mount_path: {folder_path}"
+            )
+            return None
+
+        if os.path.realpath(folder_path) == os.path.realpath(mount_path):
+            logger.warning(
+                f"[{instance}] Suppression dossier vide refusee: chemin egal au mount_path"
+            )
+            return None
+
+        return folder_path
+
+    def is_empty_tree(folder_path: str) -> bool:
+        """
+        Retourne True si le dossier ne contient aucun fichier.
+        Les sous-dossiers vides sont autorises.
+        """
+        if not folder_path or not os.path.isdir(folder_path):
+            return False
+
+        try:
+            for root, dirs, files in os.walk(folder_path):
+                if files:
+                    return False
+
+            return True
+
+        except Exception as e:
+            logger.debug(
+                f"[{instance}] Impossible de verifier si le dossier est vide "
+                f"{folder_path}: {e}"
+            )
+            return False
+
+    def remove_empty_tree(folder_path: str) -> bool:
+        """
+        Supprime recursivement uniquement des dossiers vides.
+        Ne supprime jamais de fichiers.
+        """
+        if not folder_path or not is_inside_mount(folder_path):
+            return False
+
+        if not os.path.isdir(folder_path):
+            return False
+
+        if not is_empty_tree(folder_path):
+            return False
+
+        try:
+            # Supprime les sous-dossiers vides du plus profond au parent.
+            for root, dirs, files in os.walk(folder_path, topdown=False):
+                for dirname in dirs:
+                    child = os.path.join(root, dirname)
+
+                    try:
+                        os.rmdir(child)
+                    except OSError:
+                        pass
+
+            os.rmdir(folder_path)
+            return True
+
+        except OSError as e:
+            logger.debug(
+                f"[{instance}] Dossier vide non supprime {folder_path}: {e}"
+            )
+            return False
+
+        except Exception as e:
+            logger.warning(
+                f"[{instance}] Erreur suppression dossier vide {folder_path}: {e}"
+            )
+            return False
+
+    def cleanup_empty_orphan_folders(torrent_names: list[str]) -> list[str]:
+        """
+        Supprime les dossiers WebDAV orphelins vides.
+        Cette suppression est independante du match AllDebrid.
+        """
+        removed = []
+
+        logger.info(
+            f"[{instance}] Verification dossiers WebDAV vides sur "
+            f"{len(torrent_names)} torrent(s) orphelin(s)"
+        )
+
+        for torrent_name in torrent_names:
+            folder_path = get_torrent_folder_path(torrent_name)
+
+            if not folder_path:
+                continue
+
+            if not os.path.exists(folder_path):
+                logger.debug(
+                    f"[{instance}] Dossier WebDAV deja absent: {folder_path}"
+                )
+                continue
+
+            if not os.path.isdir(folder_path):
+                logger.debug(
+                    f"[{instance}] Chemin orphelin non dossier: {folder_path}"
+                )
+                continue
+
+            if not is_empty_tree(folder_path):
+                logger.debug(
+                    f"[{instance}] Dossier WebDAV non vide ignore: {folder_path}"
+                )
+                continue
+
+            if dry_run:
+                logger.info(
+                    f"[{instance}] DRY-RUN dossier WebDAV vide supprimable: {folder_path}"
+                )
+                removed.append(torrent_name)
+                continue
+
+            if remove_empty_tree(folder_path):
+                logger.info(
+                    f"[{instance}] Dossier WebDAV vide supprime: {folder_path}"
+                )
+                removed.append(torrent_name)
+
+        if removed:
+            logger.info(
+                f"[{instance}] {len(removed)} dossier(s) WebDAV vide(s) "
+                f"{'simule(s)' if dry_run else 'supprime(s)'}: {removed[:10]}"
+            )
+        else:
+            logger.info(
+                f"[{instance}] Aucun dossier WebDAV vide supprimable trouve"
+            )
+
+        return removed
+
     all_torrents = sorted(
         set(
             filter(
@@ -527,6 +702,10 @@ async def perform_deletion(instance: str, dry_run: bool = False):
             )
         )
     )
+
+    # Nettoyage local des dossiers vides AVANT le filtrage/matching AllDebrid.
+    # Important: cela couvre les noms generiques et les matches absents/ambigus.
+    empty_folders_removed = cleanup_empty_orphan_folders(all_torrents)
 
     skipped_generic = [
         torrent
@@ -552,15 +731,24 @@ async def perform_deletion(instance: str, dry_run: bool = False):
     )
 
     if not candidate_torrents:
-        logger.info(f"[{instance}] Aucun torrent candidat a traiter.")
+        data["orphans"] = []
+        data.setdefault("stats", {})["orphans"] = 0
+        data["deleted_torrents"] = sorted(set(empty_folders_removed))
+        data["deleted_timestamp"] = datetime.utcnow().isoformat() + "Z"
+
+        logger.info(
+            f"[{instance}] Aucun torrent candidat a traiter. "
+            f"{len(empty_folders_removed)} dossier(s) vide(s) nettoye(s)."
+        )
+
         return {
             "instance": instance,
             "dry_run": dry_run,
-            "deleted": 0,
+            "deleted": len(empty_folders_removed),
             "not_found": 0,
             "skipped": len(skipped_generic),
             "errors": 0,
-            "deleted_torrents": [],
+            "deleted_torrents": sorted(set(empty_folders_removed)),
             "timestamp": datetime.utcnow().isoformat() + "Z",
         }
 
@@ -744,22 +932,24 @@ async def perform_deletion(instance: str, dry_run: bool = False):
         if not matched_torrents:
             data["orphans"] = []
             data.setdefault("stats", {})["orphans"] = 0
-            data["deleted_torrents"] = []
+            data["deleted_torrents"] = sorted(set(empty_folders_removed))
             data["deleted_timestamp"] = datetime.utcnow().isoformat() + "Z"
 
             logger.info(
-                f"[{instance}] Fin {dry_label}: 0 supprime(s), "
-                f"{nf} absent(s), {len(skipped_generic)} ignore(s), 0 erreur(s)"
+                f"[{instance}] Fin {dry_label}: "
+                f"{len(empty_folders_removed)} dossier(s) vide(s) supprime(s), "
+                f"0 magnet(s) supprime(s), {nf} absent(s), "
+                f"{len(skipped_generic)} ignore(s), 0 erreur(s)"
             )
 
             return {
                 "instance": instance,
                 "dry_run": dry_run,
-                "deleted": 0,
+                "deleted": len(empty_folders_removed),
                 "not_found": nf,
                 "skipped": len(skipped_generic),
                 "errors": 0,
-                "deleted_torrents": [],
+                "deleted_torrents": sorted(set(empty_folders_removed)),
                 "timestamp": datetime.utcnow().isoformat() + "Z",
             }
 
@@ -831,25 +1021,29 @@ async def perform_deletion(instance: str, dry_run: bool = False):
 
             await asyncio.sleep(rate_limit)
 
+    deleted_torrents_all = sorted(set(actually_deleted + empty_folders_removed))
+    deleted_total = ok + len(empty_folders_removed)
+
     data["orphans"] = []
     data.setdefault("stats", {})["orphans"] = 0
-    data["deleted_torrents"] = actually_deleted
+    data["deleted_torrents"] = deleted_torrents_all
     data["deleted_timestamp"] = datetime.utcnow().isoformat() + "Z"
 
     logger.info(
         f"[{instance}] Fin {dry_label}: "
-        f"{ok} supprime(s), {nf} absent(s), "
-        f"{len(skipped_generic)} ignore(s), {err} erreur(s)"
+        f"{ok} magnet(s) supprime(s), "
+        f"{len(empty_folders_removed)} dossier(s) vide(s) supprime(s), "
+        f"{nf} absent(s), {len(skipped_generic)} ignore(s), {err} erreur(s)"
     )
 
     return {
         "instance": instance,
         "dry_run": dry_run,
-        "deleted": ok,
+        "deleted": deleted_total,
         "not_found": nf,
         "skipped": len(skipped_generic),
         "errors": err,
-        "deleted_torrents": actually_deleted,
+        "deleted_torrents": deleted_torrents_all,
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }
 

@@ -23,13 +23,16 @@ class MediasSeries:
         self.tmdb_api_key = tmdb_api_key
         self.apply = apply
 
+        # Limite les appels simultanes vers TMDb / IMDb.
         self.semaphore = asyncio.Semaphore(max_workers)
 
+        # Pool HTTP volontairement limite pour eviter les rafales.
         self.http_limits = httpx.Limits(
             max_connections=5,
             max_keepalive_connections=2,
         )
 
+        # Cache memoire pendant un run.
         self.tmdb_cache = {}
 
     # ------------------------------------------------------------
@@ -48,8 +51,8 @@ class MediasSeries:
 
     @staticmethod
     def extract_imdb_id(text: str):
-        m = re.search(r"(tt\d+)", text)
-        return m.group(1) if m else None
+        match = re.search(r"(tt\d+)", text)
+        return match.group(1) if match else None
 
     # ------------------------------------------------------------
     # SAFE TMDB GET
@@ -67,13 +70,17 @@ class MediasSeries:
         - limits concurrency
         - adds a small pause between calls
         - handles HTTP 429 with Retry-After
-        - returns None instead of crashing the scan
+        - returns None instead of crashing the run
         """
         async with self.semaphore:
             await asyncio.sleep(0.35)
 
             try:
-                response = await client.get(url, params=params, timeout=timeout)
+                response = await client.get(
+                    url,
+                    params=params,
+                    timeout=timeout,
+                )
             except Exception as e:
                 logger.error(f"TMDb network fetch error: {e}")
                 return None
@@ -93,7 +100,11 @@ class MediasSeries:
                 await asyncio.sleep(wait_seconds)
 
                 try:
-                    response = await client.get(url, params=params, timeout=timeout)
+                    response = await client.get(
+                        url,
+                        params=params,
+                        timeout=timeout,
+                    )
                 except Exception as e:
                     logger.error(f"TMDb network retry error: {e}")
                     return None
@@ -287,6 +298,10 @@ class MediasSeries:
         client: httpx.AsyncClient,
         d: Path,
     ):
+        """
+        Traitement complet pour run()/renommage.
+        Cette fonction peut contacter TMDb/IMDb.
+        """
         raw = d.name
         clean = self.clean_name(raw)
 
@@ -298,6 +313,13 @@ class MediasSeries:
 
         clean = re.sub(r"\(\d{4}\)", "", clean).strip()
 
+        if not clean:
+            logger.error(f"[FINAL_FAIL] Empty cleaned title for: {raw}")
+            return {
+                "status": "not_found",
+                "folder": raw,
+            }
+
         imdb_id = self.extract_imdb_id(raw)
 
         if imdb_id:
@@ -307,6 +329,7 @@ class MediasSeries:
             return {
                 "status": "imdb_present",
                 "folder": raw,
+                "imdb": imdb_id,
             }
 
         tmdb = await self.tmdb_lookup(client, clean, year)
@@ -343,6 +366,10 @@ class MediasSeries:
     # ------------------------------------------------------------
 
     async def run(self):
+        """
+        Renommage reel ou dry-run.
+        Peut contacter TMDb/IMDb, donc garde le throttle anti-429.
+        """
         async with httpx.AsyncClient(
             limits=self.http_limits,
             timeout=15,
@@ -399,6 +426,10 @@ class MediasSeries:
     # ------------------------------------------------------------
 
     async def scan(self):
+        """
+        Scan rapide sans appel externe.
+        Ne contacte pas TMDb/IMDb.
+        """
         stats = {
             "total": 0,
             "deja_conforme": 0,
@@ -414,21 +445,17 @@ class MediasSeries:
             if key != "total"
         }
 
-        async with httpx.AsyncClient(
-            limits=self.http_limits,
-            timeout=10,
-        ) as client:
-            tasks = []
+        tasks = []
 
-            for d in self.base_dir.iterdir():
-                if d.is_dir():
-                    stats["total"] += 1
-                    tasks.append(self._scan_one(client, d))
+        for d in self.base_dir.iterdir():
+            if d.is_dir():
+                stats["total"] += 1
+                tasks.append(self._scan_one(d))
 
-            results = await asyncio.gather(
-                *tasks,
-                return_exceptions=True,
-            )
+        results = await asyncio.gather(
+            *tasks,
+            return_exceptions=True,
+        )
 
         for result in results:
             if isinstance(result, Exception):
@@ -469,12 +496,22 @@ class MediasSeries:
 
     async def _scan_one(
         self,
-        client: httpx.AsyncClient,
         d: Path,
     ):
+        """
+        Scan rapide sans appel externe.
+
+        Important:
+        - ne contacte pas TMDb
+        - ne contacte pas IMDb
+        - classe seulement le dossier selon son format actuel
+        - garde le scan rapide
+        """
         raw = d.name
         imdb_id = self.extract_imdb_id(raw)
 
+        # Format Plex strict:
+        # Titre (2024) {imdb-tt1234567}
         plex_pattern = r"^(.+?) \((\d{4})\) \{imdb-tt\d+\}$"
 
         if re.match(plex_pattern, raw):
@@ -484,6 +521,7 @@ class MediasSeries:
                 "imdb": imdb_id,
             }
 
+        # IMDb present mais format Plex non strict.
         if imdb_id:
             return {
                 "status": "non_conforme_plex",
@@ -491,6 +529,8 @@ class MediasSeries:
                 "imdb": imdb_id,
             }
 
+        # Pas d'IMDb: on ne resout pas via TMDb pendant le scan.
+        # La resolution TMDb doit se faire uniquement pendant run()/correction.
         clean = self.clean_name(raw)
         year_match = re.search(r"\((\d{4})\)", clean)
         year = year_match.group(1) if year_match else None
@@ -500,27 +540,14 @@ class MediasSeries:
             return {
                 "status": "inconnu_dans_sonarr",
                 "folder": raw,
-            }
-
-        tmdb = await self.tmdb_lookup(client, title, year)
-
-        if tmdb:
-            return {
-                "status": "imdb_manquant_ou_invalide",
-                "folder": raw,
-                "imdb": tmdb["imdb_id"],
-            }
-
-        imdb_fb = await self.imdb_fallback(client, title, year)
-
-        if imdb_fb:
-            return {
-                "status": "imdb_manquant_ou_invalide",
-                "folder": raw,
-                "imdb": imdb_fb["imdb_id"],
+                "title": None,
+                "year": year,
             }
 
         return {
-            "status": "inconnu_dans_sonarr",
+            "status": "imdb_manquant_ou_invalide",
             "folder": raw,
+            "title": title,
+            "year": year,
+            "imdb": None,
         }

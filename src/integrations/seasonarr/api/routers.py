@@ -917,27 +917,98 @@ async def get_system_activities(
     db: Session = Depends(get_db)
 ):
     """
-    🔎 Retourne les dernières activités système (symlinks créés/supprimés/remplacés),
-    avec possibilité de filtrer par type d'action :
-      - ?action=created
-      - ?action=deleted
-      - ?action=replaced  → renvoie aussi les entrées marquées replaced=True
+    Retourne les dernières activités système.
+
+    Important :
+    - action=created  -> uniquement les activités créées
+    - action=deleted  -> uniquement les activités supprimées
+    - action=broken   -> uniquement les symlinks cassés
+    - action=repaired -> uniquement les symlinks réparés
+    - action=replaced -> uniquement les vraies entrées action='replaced'
+
+    On ne mélange plus action='replaced' avec replaced=True, car replaced=True
+    sert surtout à marquer une ancienne suppression comme remplacée.
     """
     try:
+        # Sécurité simple pour éviter les limites abusives
+        limit = max(1, min(limit, 10000))
+
         query = db.query(SystemActivity)
 
-        # 🧩 Gestion du filtre "action"
         if action:
-            if action == "replaced":
-                query = query.filter(
-                    (SystemActivity.action == "replaced") |
-                    (SystemActivity.replaced == True)
+            normalized_action = action.strip().lower()
+
+            allowed_actions = {
+                "created",
+                "deleted",
+                "broken",
+                "repaired",
+                "replaced",
+            }
+
+            if normalized_action not in allowed_actions:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Action invalide. Valeurs autorisées: {', '.join(sorted(allowed_actions))}"
                 )
-            else:
-                query = query.filter(SystemActivity.action == action)
+
+            query = query.filter(SystemActivity.action == normalized_action)
 
         activities = (
             query.order_by(
+                func.coalesce(
+                    SystemActivity.updated_at,
+                    SystemActivity.created_at
+                ).desc()
+            )
+            .limit(limit)
+            .all()
+        )
+
+        return activities
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"💥 Erreur récupération system activities: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Erreur lecture des activités système"
+        )
+
+@router.get("/system-activities/unreplaced", response_model=List[SystemActivityResponse])
+async def get_unreplaced_system_activities(
+    limit: int = 1000,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Retourne tous les vrais symlinks supprimés non remplacés,
+    même s'ils sont anciens et hors du limit principal.
+
+    Exclut les événements AllDebrid/orphelins.
+    """
+    try:
+        limit = max(1, min(limit, 5000))
+
+        activities = (
+            db.query(SystemActivity)
+            .filter(
+                SystemActivity.action == "deleted",
+                SystemActivity.event.in_([
+                    "symlink_removed",
+                    "symlink_removed_manual",
+                    "sonarr_symlink_removed_manual",
+                    "symlink_removed_broken_bulk",
+                    "sonarr_symlink_removed_broken_bulk",
+                ]),
+                SystemActivity.path != "Suppression orphelins",
+                (
+                    (SystemActivity.replaced.is_(None)) |
+                    (SystemActivity.replaced == False)
+                ),
+            )
+            .order_by(
                 func.coalesce(SystemActivity.updated_at, SystemActivity.created_at).desc()
             )
             .limit(limit)
@@ -947,8 +1018,14 @@ async def get_system_activities(
         return activities
 
     except Exception as e:
-        logger.error(f"💥 Erreur récupération system activities: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Erreur lecture des activités système")
+        logger.error(
+            f"💥 Erreur récupération symlinks non remplacés: {e}",
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Erreur lecture des symlinks non remplacés",
+        )
 
 
 # -------------------------------------------------------------------
@@ -962,17 +1039,24 @@ async def create_system_activity(
     db: Session = Depends(get_db)
 ):
     """
-    Ajoute une activité système (symlink créé/supprimé)
-    et détecte automatiquement si une suppression a été remplacée.
-    Si un 'deleted' est marqué remplacé, on crée immédiatement une entrée 'replaced'.
+    Ajoute une activité système.
+
+    Important :
+    Cet endpoint ne détecte plus les remplacements automatiquement.
+
+    Pourquoi :
+    - la détection basée sur path LIKE "%basename%" était trop fragile ;
+    - elle pouvait créer de faux remplacements ;
+    - le watcher possède déjà une logique plus fiable pour les remplacements ;
+    - cet endpoint doit seulement enregistrer l'activité reçue.
     """
     try:
-        from datetime import datetime, timezone
+        now = datetime.utcnow()
 
-        now = datetime.now(timezone.utc)
-        logger.info(f"⚙️ Création system_activity : {activity.action} ({activity.path})")
+        logger.info(
+            f"⚙️ Création system_activity : {activity.action} ({activity.path})"
+        )
 
-        # 1️⃣ Création de l'entrée principale
         new_entry = SystemActivity(
             event=activity.event,
             action=activity.action,
@@ -984,101 +1068,26 @@ async def create_system_activity(
         )
 
         db.add(new_entry)
-
-        # ---------------------------------------------------------------------
-        # 2️⃣ Si c’est une création, chercher une suppression récente correspondante
-        # ---------------------------------------------------------------------
-        replaced_entry = None
-
-        if new_entry.action == "created" and new_entry.path:
-            basename_no_ext = os.path.splitext(os.path.basename(new_entry.path))[0]
-            logger.info(f"🔍 Recherche d'une suppression récente pour {basename_no_ext}")
-
-            recent_deleted = (
-                db.query(SystemActivity)
-                .filter(
-                    SystemActivity.action == "deleted",
-                    (SystemActivity.replaced.is_(None) | (SystemActivity.replaced == False)),
-                    SystemActivity.path.like(f"%{basename_no_ext}%"),
-                    SystemActivity.created_at > now - timedelta(hours=12),
-                )
-                .order_by(SystemActivity.created_at.desc())
-                .first()
-            )
-
-            logger.info(f"🔎 Suppression correspondante trouvée : {bool(recent_deleted)}")
-
-            if recent_deleted:
-                recent_deleted.replaced = True
-                recent_deleted.replaced_at = now
-                recent_deleted.updated_at = now
-
-                replaced_entry = SystemActivity(
-                    event="symlink_replacement",
-                    action="replaced",
-                    path=new_entry.path,
-                    manager=new_entry.manager or recent_deleted.manager or "système",
-                    message=f"Remplacement de {recent_deleted.path} par {new_entry.path}",
-                    created_at=now,
-                    updated_at=now,
-                    replaced=True,
-                    replaced_at=now,
-                )
-
-                db.add(replaced_entry)
-                logger.info(f"♻️ Replaced entry préparée : {replaced_entry.path}")
-
-        # ---------------------------------------------------------------------
-        # 3️⃣ Si c’est une suppression déjà remplacée → crée aussi 'replaced'
-        # ---------------------------------------------------------------------
-        elif new_entry.action == "deleted" and new_entry.replaced:
-            replaced_entry = SystemActivity(
-                event="symlink_replacement",
-                action="replaced",
-                path=new_entry.path,
-                manager=new_entry.manager or "système",
-                message=f"Symlink supprimé puis remplacé : {new_entry.path}",
-                created_at=now,
-                updated_at=now,
-                replaced=True,
-                replaced_at=new_entry.replaced_at or now,
-            )
-            db.add(replaced_entry)
-            logger.info(f"♻️ Replaced entry créée depuis suppression : {replaced_entry.path}")
-
-        # ---------------------------------------------------------------------
-        # 4️⃣ Commit global
-        # ---------------------------------------------------------------------
         db.commit()
         db.refresh(new_entry)
-        if replaced_entry:
-            db.refresh(replaced_entry)
 
-        logger.info(f"✅ System activity enregistrée : {new_entry.action} ({new_entry.path})")
-
-        # ---------------------------------------------------------------------
-        # 5️⃣ Envoi SSE (asynchrone, hors transaction)
-        # ---------------------------------------------------------------------
-        if replaced_entry and hasattr(request.app.state, "sse_manager"):
-            try:
-                await request.app.state.sse_manager.broadcast({
-                    "event": "symlink_replacement",
-                    "old_path": recent_deleted.path if 'recent_deleted' in locals() and recent_deleted else None,
-                    "new_path": new_entry.path,
-                    "replaced_at": now.isoformat(),
-                    "manager": new_entry.manager or "unknown",
-                })
-                logger.info("📡 SSE 'symlink_replacement' envoyé avec succès.")
-            except Exception as sse_err:
-                logger.warning(f"⚠️ Impossible d'envoyer SSE 'symlink_replacement' : {sse_err}")
+        logger.info(
+            f"✅ System activity enregistrée : {new_entry.action} ({new_entry.path})"
+        )
 
         return new_entry
 
     except Exception as e:
         import traceback
-        logger.error(f"💥 Erreur création system activity : {e}\n{traceback.format_exc()}")
+
+        logger.error(
+            f"💥 Erreur création system activity : {e}\n{traceback.format_exc()}"
+        )
         db.rollback()
-        raise HTTPException(status_code=500, detail="Erreur création activité système")
+        raise HTTPException(
+            status_code=500,
+            detail="Erreur création activité système"
+        )
 
 # -------------------------------------------------------------------
 # 🧠 Bouton suppression db pour la categorie non remplacés
@@ -1109,27 +1118,60 @@ async def cleanup_unreplaced_symlinks(
     db: Session = Depends(get_db)
 ):
     """
-    Marque comme non remplacés les symlinks supprimés qui n'ont pas été recréés après X heures.
+    Marque comme non remplacés les symlinks supprimés qui n'ont pas été remplacés
+    après un délai donné.
+
+    Cette fonction ne crée pas d'activité 'replaced'.
+    Elle sert uniquement à finaliser l'état des anciennes suppressions.
     """
-    cutoff = datetime.utcnow() - timedelta(hours=delay_hours)
+    try:
+        delay_hours = max(1, min(delay_hours, 168))
+        now = datetime.utcnow()
+        cutoff = now - timedelta(hours=delay_hours)
 
-    old_deleted = (
-        db.query(SystemActivity)
-        .filter(
-            SystemActivity.action == "deleted",
-            SystemActivity.replaced.is_(None),
-            SystemActivity.created_at < cutoff,
+        old_deleted = (
+            db.query(SystemActivity)
+            .filter(
+                SystemActivity.action == "deleted",
+                SystemActivity.created_at < cutoff,
+                (
+                    SystemActivity.replaced.is_(None)
+                    | (SystemActivity.replaced == False)
+                ),
+            )
+            .all()
         )
-        .all()
-    )
 
-    for entry in old_deleted:
-        entry.replaced = False
-        entry.updated_at = datetime.utcnow()  # ✅ maj du champ
+        updated_count = 0
 
-    db.commit()
-    logger.info(f"🕒 {len(old_deleted)} symlinks marqués comme non remplacés.")
-    return {"updated": len(old_deleted)}
+        for entry in old_deleted:
+            if entry.replaced is not False:
+                entry.replaced = False
+                entry.updated_at = now
+                updated_count += 1
+
+        db.commit()
+
+        logger.info(
+            f"🕒 {updated_count} symlinks supprimés marqués comme non remplacés."
+        )
+
+        return {
+            "updated": updated_count,
+            "checked": len(old_deleted),
+            "delay_hours": delay_hours,
+        }
+
+    except Exception as e:
+        db.rollback()
+        logger.error(
+            f"💥 Erreur cleanup_unreplaced_symlinks: {e}",
+            exc_info=True
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Erreur nettoyage des symlinks non remplacés"
+        )
 
 
 # -------------------------------------------------------------------

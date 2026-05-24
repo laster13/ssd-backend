@@ -664,9 +664,6 @@ async def perform_deletion(instance: str, dry_run: bool = False):
                 continue
 
             if not is_empty_tree(folder_path):
-                logger.debug(
-                    f"[{instance}] Dossier WebDAV non vide ignore: {folder_path}"
-                )
                 continue
 
             if dry_run:

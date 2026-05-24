@@ -119,6 +119,11 @@ class ConfigManager:
                     "mount_dirs": [],
                     "alldebrid_instances": [],
                     "orphan_manager": {"auto_delete": False},
+
+                    "auto_repair_broken_symlinks": False,
+                    "disable_season_pack_check": False,
+                    "skip_episode_deletion": False,
+
                     "radarr_api_key": None,
                     "sonarr_api_key": None,
                     "discord_webhook_url": None,
@@ -157,12 +162,49 @@ class ConfigManager:
         return checked_config
 
     def load(self):
-        """Charge la config depuis config.json et valide avec Pydantic."""
+        """Charge la config depuis config.json, ajoute les clés manquantes, puis valide avec Pydantic."""
         try:
             with self.config_file.open("r", encoding="utf-8") as f:
                 config_dict = json.load(f)
-                self.config = SymlinkConfig.model_validate(config_dict)
-                logger.info(f"📂 Config chargée depuis {self.config_file}")
+
+            changed = False
+
+            defaults = {
+                "links_dirs": [],
+                "mount_dirs": [],
+                "alldebrid_instances": [],
+                "orphan_manager": {"auto_delete": False},
+
+                "auto_repair_broken_symlinks": False,
+                "disable_season_pack_check": False,
+                "skip_episode_deletion": False,
+
+                "radarr_api_key": None,
+                "sonarr_api_key": None,
+                "discord_webhook_url": None,
+                "tmdb_api_key": None,
+            }
+
+            for key, value in defaults.items():
+                if key not in config_dict:
+                    config_dict[key] = value
+                    changed = True
+
+            if not isinstance(config_dict.get("orphan_manager"), dict):
+                config_dict["orphan_manager"] = {"auto_delete": False}
+                changed = True
+            elif "auto_delete" not in config_dict["orphan_manager"]:
+                config_dict["orphan_manager"]["auto_delete"] = False
+                changed = True
+
+            self.config = SymlinkConfig.model_validate(config_dict)
+
+            logger.info(f"📂 Config chargée depuis {self.config_file}")
+
+            if changed:
+                logger.info("🧩 Migration config.json : ajout automatique des clés manquantes")
+                self.save()
+
         except ValidationError as e:
             logger.error(f"❌ Validation échouée pour config.json :\n{self.format_validation_error(e)}")
             raise

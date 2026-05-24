@@ -1,13 +1,13 @@
 import asyncio
 import logging
-import json
 from typing import Optional, Dict, Any, List
 from sqlalchemy.orm import Session
-from integrations.seasonarr.db.models import SonarrInstance, UserSettings, ActivityLog
+from integrations.seasonarr.db.models import SonarrInstance, ActivityLog
 from integrations.seasonarr.clients.sonarr_client import SonarrClient
 from integrations.seasonarr.core.websocket_manager import manager
 from integrations.seasonarr.services.bulk_operation_manager import bulk_operation_manager
 from datetime import datetime
+from program.settings.manager import config_manager
 
 logger = logging.getLogger(__name__)
 
@@ -218,8 +218,15 @@ class SeasonItService:
             details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count}
         )
         
-        settings = self.db.query(UserSettings).filter(UserSettings.user_id == self.user_id).first()
-        skip_season_pack_check = settings and settings.disable_season_pack_check
+        ssd_config = config_manager.config
+
+        disable_season_pack_check = bool(
+            getattr(ssd_config, "disable_season_pack_check", False)
+        )
+
+        skip_episode_deletion = bool(
+            getattr(ssd_config, "skip_episode_deletion", False)
+        )
         
         # Step 5: Determine processing strategy
         await manager.send_enhanced_progress_update(
@@ -232,7 +239,7 @@ class SeasonItService:
             details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count}
         )
         
-        if skip_season_pack_check:
+        if disable_season_pack_check:
             # Strategy: Skip season pack search
             await manager.send_enhanced_progress_update(
                 self.user_id, 
@@ -244,7 +251,7 @@ class SeasonItService:
                 details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count}
             )
             
-            if settings and settings.skip_episode_deletion:
+            if skip_episode_deletion:
                 # Step 6a: Skip deletion path
                 await manager.send_enhanced_progress_update(
                     self.user_id, 
@@ -346,7 +353,7 @@ class SeasonItService:
                     details={"poster_url": poster_url, "season_number": season_number, "missing_count": missing_count, "releases_found": len(releases)}
                 )
                 
-                if settings and settings.skip_episode_deletion:
+                if skip_episode_deletion:
                     # Step 9a: Skip deletion with season packs
                     await manager.send_enhanced_progress_update(
                         self.user_id, 
@@ -818,12 +825,20 @@ class SeasonItService:
             return {"status": "no_missing_episodes", "message": "No missing episodes found"}
         
         missing_count = len(seasons_with_missing[season_number])
-        settings = self.db.query(UserSettings).filter(UserSettings.user_id == self.user_id).first()
-        skip_season_pack_check = settings and settings.disable_season_pack_check
+
+        ssd_config = config_manager.config
+
+        disable_season_pack_check = bool(
+            getattr(ssd_config, "disable_season_pack_check", False)
+        )
+
+        skip_episode_deletion = bool(
+            getattr(ssd_config, "skip_episode_deletion", False)
+        )
         
-        if skip_season_pack_check:
+        if disable_season_pack_check:
             await progress_callback(50, f"Season pack check disabled for {show_title}, proceeding with regular search", poster_url)
-            if not (settings and settings.skip_episode_deletion):
+            if not skip_episode_deletion:
                 await progress_callback(60, f"Deleting individual episodes from {show_title}", poster_url)
                 await client.delete_season_episodes(show_id, season_number)
         else:
@@ -833,7 +848,7 @@ class SeasonItService:
             if not releases:
                 await progress_callback(60, f"No season packs found for {show_title}, proceeding with regular search", poster_url)
             else:
-                if not (settings and settings.skip_episode_deletion):
+                if not skip_episode_deletion:
                     await progress_callback(70, f"Deleting individual episodes from {show_title}", poster_url)
                     await client.delete_season_episodes(show_id, season_number)
         
@@ -1047,9 +1062,11 @@ class SeasonItService:
                 details={"poster_url": poster_url, "season_number": season_number}
             )
 
-            # Check user settings
-            settings = self.db.query(UserSettings).filter(UserSettings.user_id == self.user_id).first()
-            skip_deletion = settings and settings.skip_episode_deletion
+            # Check SSD global settings
+            ssd_config = config_manager.config
+            skip_deletion = bool(
+                getattr(ssd_config, "skip_episode_deletion", False)
+            )
 
             if not skip_deletion:
                 # Delete existing episodes

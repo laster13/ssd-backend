@@ -142,6 +142,10 @@ class SymlinkConfig(BaseModel):
     orphan_manager: OrphanManagerConfig = OrphanManagerConfig()
     auto_repair_broken_symlinks: bool = False
 
+    # Options Seasonarr intégrées
+    disable_season_pack_check: bool = False
+    skip_episode_deletion: bool = False
+
     # API externes
     radarr_api_key: Optional[str] = None
     sonarr_api_key: Optional[str] = None

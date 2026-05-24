@@ -7,6 +7,7 @@ import logging
 import os
 from datetime import timedelta
 from fastapi.responses import JSONResponse
+from program.settings.manager import settings_manager
 
 
 # FastAPI
@@ -76,13 +77,33 @@ router_ws = APIRouter(tags=["seasonarr-ws"])    # WebSocket
 @router.websocket("/ws/{user_id}")
 async def websocket_secure(websocket: WebSocket, user_id: int, db: Session = Depends(get_db)):
     try:
-        # ✅ Récupère le token depuis les cookies
+        auth_enabled = getattr(settings_manager.settings, "auth_enabled", True)
+
+        # ------------------------------------------------------------
+        # Auth désactivée : on accepte le WebSocket sans cookie JWT
+        # ------------------------------------------------------------
+        if not auth_enabled:
+            await manager.connect(websocket, user_id)
+            logger.info(f"WebSocket connecté sans auth (auth_enabled=False) user_id={user_id}")
+
+            try:
+                while True:
+                    data = await websocket.receive_text()
+                    logger.debug(f"WebSocket reçu sans auth user_id={user_id}: {data}")
+            except WebSocketDisconnect:
+                manager.disconnect(websocket, user_id)
+                logger.info(f"WebSocket déconnecté sans auth user_id={user_id}")
+
+            return
+
+        # ------------------------------------------------------------
+        # Auth activée : comportement normal avec access_token
+        # ------------------------------------------------------------
         token = websocket.cookies.get("access_token")
         if not token:
             await websocket.close(code=1008, reason="Missing token")
             return
 
-        # ✅ Décoder le JWT avec ta fonction standard
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username = payload.get("sub")
         if not username:
@@ -94,18 +115,43 @@ async def websocket_secure(websocket: WebSocket, user_id: int, db: Session = Dep
             await websocket.close(code=1008, reason="Unauthorized user")
             return
 
-        # Connexion au manager
         await manager.connect(websocket, user_id)
         logger.info(f"WebSocket connecté: {username} (id={user_id})")
 
-        while True:
-            data = await websocket.receive_text()
+        try:
+            while True:
+                data = await websocket.receive_text()
+                logger.debug(f"WebSocket reçu user_id={user_id}: {data}")
+        except WebSocketDisconnect:
+            manager.disconnect(websocket, user_id)
+            logger.info(f"WebSocket déconnecté user_id={user_id}")
 
-    except WebSocketDisconnect:
-        manager.disconnect(websocket, user_id)
-        logger.info("WebSocket déconnecté")
+    except ExpiredSignatureError:
+        logger.warning(f"WebSocket token expiré user_id={user_id}")
+        try:
+            await websocket.close(code=1008, reason="Token expired")
+        except Exception:
+            pass
+
+    except JWTError as e:
+        logger.warning(f"WebSocket token invalide user_id={user_id}: {e}")
+        try:
+            await websocket.close(code=1008, reason="Invalid token")
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.error(f"Erreur WebSocket user_id={user_id}: {e}", exc_info=True)
+        try:
+            await websocket.close(code=1011, reason="Internal websocket error")
+        except Exception:
+            pass
+
     finally:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass
 
 # -------------------------------------------------------------------
 # Health / Setup / Auth basique

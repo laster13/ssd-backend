@@ -324,6 +324,38 @@ class SonarrClient:
             logger.error(f"Erreur lors du déclenchement de la recherche de saison : {e}")
             raise
 
+    async def search_episode(self, episode_id: int):
+        """Trigger an episode search command for Sonarr."""
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+                search_data = {
+                    "name": "EpisodeSearch",
+                    "episodeIds": [episode_id],
+                }
+
+                response = await client.post(
+                    f"{self.base_url}/api/v3/command",
+                    headers=self.headers,
+                    json=search_data,
+                )
+
+                if response.status_code != 201:
+                    logger.error(
+                        f"Échec de la commande EpisodeSearch :: "
+                        f"{response.status_code} - {response.text}"
+                    )
+                    raise Exception(f"EpisodeSearch command failed: {response.status_code}")
+
+                command_id = response.json()["id"]
+
+                await self._wait_for_command(command_id)
+
+                return command_id
+
+        except Exception as e:
+            logger.error(f"Erreur lors du déclenchement de la recherche épisode : {e}")
+            raise
+
     async def monitor_download_progress(self, series_id: int, season_number: int, max_wait: int = 300, user_id: int = None) -> Dict[str, Any]:
         """Monitor for successful downloads after a season search"""
         import asyncio

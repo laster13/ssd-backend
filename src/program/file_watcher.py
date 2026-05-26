@@ -29,6 +29,9 @@ initial_scan_done = Event()
 broken_monitor_cycle_done = Event()
 broken_monitor_running = Event()
 
+symlink_watcher_started = False
+symlink_watcher_lock = threading.Lock()
+
 USER = os.getenv("USER") or os.getlogin()
 YAML_PATH = f"/home/{USER}/.ansible/inventories/group_vars/all.yml"
 VAULT_PASSWORD_FILE = f"/home/{USER}/.vault_pass"
@@ -86,6 +89,9 @@ def start_yaml_watcher():
 class SymlinkEventHandler(FileSystemEventHandler):
     def __init__(self):
         self._lock = threading.Lock()
+        self._recent_deleted_events = {}
+        self._recent_created_events = {}
+        self._event_dedupe_seconds = 5
 
     def on_any_event(self, event):
         if event.is_directory:
@@ -159,6 +165,26 @@ class SymlinkEventHandler(FileSystemEventHandler):
 
             root, manager = None, "unknown"
             symlink_path_str = str(symlink_path)
+
+            now_ts = time.monotonic()
+
+            with self._lock:
+                last_ts = self._recent_created_events.get(symlink_path_str)
+
+                if last_ts is not None and now_ts - last_ts < self._event_dedupe_seconds:
+                    logger.info(
+                        f"⏭️ Création watcher déjà reçue récemment, ignorée : {symlink_path}"
+                    )
+                    return
+
+                self._recent_created_events[symlink_path_str] = now_ts
+
+                cutoff = now_ts - self._event_dedupe_seconds
+                self._recent_created_events = {
+                    path: ts
+                    for path, ts in self._recent_created_events.items()
+                    if ts >= cutoff
+                }
 
             for ld, mgr in links_dirs:
                 if symlink_path_str.startswith(str(ld)):
@@ -284,6 +310,12 @@ class SymlinkEventHandler(FileSystemEventHandler):
                 except Exception:
                     return ""
 
+            def is_episode_path(path_value: str) -> bool:
+                try:
+                    return bool(re.search(r"S\d{1,2}E\d{1,2}", str(path_value), re.IGNORECASE))
+                except Exception:
+                    return False
+
             def is_generic_name(value: str) -> bool:
                 raw = (value or "").strip().lower()
                 norm = normalize(raw)
@@ -377,9 +409,12 @@ class SymlinkEventHandler(FileSystemEventHandler):
                             return deleted, "imdbId"
 
                 # 4️⃣ Match par dossier parent exact.
-                for deleted in candidates:
-                    if parent_dir(deleted.path) == new_parent_dir:
-                        return deleted, "parent_dir"
+                # Interdit pour les épisodes Sonarr : le parent est le dossier Season XX,
+                # donc ce match peut confondre S02E06 avec S02E02.
+                if not is_episode_path(symlink_path_str):
+                    for deleted in candidates:
+                        if parent_dir(deleted.path) == new_parent_dir:
+                            return deleted, "parent_dir"
 
                 # 5️⃣ Match par nom parent normalisé exact.
                 if new_parent_norm and not is_generic_name(new_parent_name):
@@ -675,6 +710,26 @@ class SymlinkEventHandler(FileSystemEventHandler):
         symlink_path_str = str(symlink_path)
         removed_item = None
 
+        now_ts = time.monotonic()
+
+        with self._lock:
+            last_ts = self._recent_deleted_events.get(symlink_path_str)
+
+            if last_ts is not None and now_ts - last_ts < self._event_dedupe_seconds:
+                logger.info(
+                    f"⏭️ Suppression watcher déjà reçue récemment, ignorée : {symlink_path}"
+                )
+                return
+
+            self._recent_deleted_events[symlink_path_str] = now_ts
+
+            cutoff = now_ts - self._event_dedupe_seconds
+            self._recent_deleted_events = {
+                path: ts
+                for path, ts in self._recent_deleted_events.items()
+                if ts >= cutoff
+            }
+
         with self._lock:
             for idx in range(len(symlink_store) - 1, -1, -1):
                 if symlink_store[idx].get("symlink") == symlink_path_str:
@@ -779,6 +834,19 @@ class SymlinkEventHandler(FileSystemEventHandler):
                         "existing_event": recent_manual_deleted.event,
                     })
 
+                return
+
+            recent_watcher_deleted = db.query(SystemActivity).filter(
+                SystemActivity.action == "deleted",
+                SystemActivity.path == symlink_path_str,
+                SystemActivity.event == "symlink_removed",
+                SystemActivity.created_at >= datetime.utcnow() - timedelta(seconds=5),
+            ).first()
+
+            if recent_watcher_deleted:
+                logger.info(
+                    f"⏭️ Suppression watcher déjà enregistrée récemment : {symlink_path}"
+                )
                 return
 
             db.add(SystemActivity(
@@ -1370,6 +1438,15 @@ def start_symlink_watcher():
     - Lance le monitor léger seulement après activation des watchers.
     - Lance Decypharr/orphans ensuite en arrière-plan.
     """
+    global symlink_watcher_started
+
+    with symlink_watcher_lock:
+        if symlink_watcher_started:
+            logger.warning("⏭️ Symlink watcher déjà démarré, lancement ignoré")
+            return
+
+        symlink_watcher_started = True
+
     from routers.secure.symlinks import scan_symlinks, symlink_store
     from watchdog.observers import Observer
     from watchdog.observers.polling import PollingObserver
@@ -1516,7 +1593,7 @@ def start_symlink_watcher():
                     time.sleep(5)
 
                 logger.info("⏱️ Orphelins : stabilisation après cycle brisés terminé...")
-                time.sleep(5 * 60)
+                time.sleep(2 * 60)
 
                 logger.info("🧹 Orphelins : lancement après cycle brisés terminé.")
                 run_orphans_process()
@@ -2377,6 +2454,12 @@ def start_replacement_cleanup_task(interval_hours: float = 1.0, expiry_hours: in
         except Exception:
             return ""
 
+    def is_episode_path(path_value: str) -> bool:
+        try:
+            return bool(re.search(r"S\d{1,2}E\d{1,2}", str(path_value), re.IGNORECASE))
+        except Exception:
+            return False
+
     def is_generic_name(value: str) -> bool:
         """
         Évite les matches dangereux sur des noms vagues :
@@ -2470,7 +2553,9 @@ def start_replacement_cleanup_task(interval_hours: float = 1.0, expiry_hours: in
                     return created, "imdbId"
 
         # 3️⃣ Match par dossier parent exact.
-        if deleted_parent_dir:
+        # Interdit pour les épisodes Sonarr : le parent est le dossier Season XX,
+        # donc ce match peut confondre S02E06 avec S02E02.
+        if deleted_parent_dir and not is_episode_path(deleted_path):
             for created in createds:
                 if parent_dir(created.path) == deleted_parent_dir:
                     return created, "parent_dir"
@@ -2817,6 +2902,11 @@ def start_light_broken_symlink_monitor():
         Protection anti-race.
         Le watcher live peut avoir recréé le symlink pendant que le monitor
         travaille encore sur une ancienne copie de symlink_store.
+
+        Important :
+        Cette fonction est conservée pour la détection des réparations.
+        Elle ne doit plus empêcher un symlink détecté brisé par target_exists_fast()
+        d'être ajouté à broken_now, écrit en DB, puis comptabilisé.
         """
         try:
             for current in list(symlink_store):
@@ -3105,12 +3195,6 @@ def start_light_broken_symlink_monitor():
                     if repaired_by_auto or auto_action_handled:
                         continue
 
-                    if is_currently_ok_in_store_or_disk(symlink_path):
-                        logger.info(
-                            f"⏭️ Symlink redevenu valide pendant le cycle, ignoré côté broken_now : {symlink_path}"
-                        )
-                        continue
-
                     broken_now.append(item)
 
                 elif exists and symlink_path in already_notified:
@@ -3134,12 +3218,6 @@ def start_light_broken_symlink_monitor():
                     for item in broken_now:
                         symlink_path = str(item["symlink"])
 
-                        if is_currently_ok_in_store_or_disk(symlink_path):
-                            logger.info(
-                                f"⏭️ Broken ignoré avant écriture DB car déjà réparé : {symlink_path}"
-                            )
-                            continue
-
                         exists_db = db.query(SystemActivity).filter(
                             SystemActivity.path == symlink_path,
                             SystemActivity.action == "broken"
@@ -3162,12 +3240,11 @@ def start_light_broken_symlink_monitor():
 
                         for x in symlink_store:
                             if x.get("symlink") == symlink_path:
-                                if not is_currently_ok_in_store_or_disk(symlink_path):
-                                    x["broken"] = True
-                                    x["target_exists"] = False
-                                    x["ref_count"] = 0
-                                    updated_store += 1
-                                    changed = True
+                                x["broken"] = True
+                                x["target_exists"] = False
+                                x["ref_count"] = 0
+                                updated_store += 1
+                                changed = True
                                 break
 
                         if changed:

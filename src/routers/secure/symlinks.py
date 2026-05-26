@@ -1404,6 +1404,11 @@ async def auto_repair_sonarr_symlink(
         # ------------------------------------------------------------------
         service = SeasonItService(db, default_user.id)
         local_resolver = SonarrService()
+        sonarr_client = SonarrClient(
+            base_url=instance.url,
+            api_key=instance.api_key,
+            instance_id=FIXED_INSTANCE_ID,
+        )
 
         # ------------------------------------------------------------------
         # 4) Résolution série / saison
@@ -1538,29 +1543,29 @@ async def auto_repair_sonarr_symlink(
         # 7) Mode SAFE
         # ------------------------------------------------------------------
         try:
-            settings = db.query(UserSettings).filter(
-                UserSettings.user_id == default_user.id
-            ).first()
+            skip_episode_deletion = bool(
+                getattr(config_manager.config, "skip_episode_deletion", False)
+            )
 
-            if settings:
-                settings.skip_episode_deletion = False
-                settings.disable_season_pack_check = False
+            disable_season_pack_check = bool(
+                getattr(config_manager.config, "disable_season_pack_check", False)
+            )
 
-                db.commit()
-                db.refresh(settings)
-
-                logger.info(
-                    f"🛡️ Auto-repair Sonarr : mode SAFE activé "
-                    f"pour user={default_user.id}"
-                )
+            logger.info(
+                f"🛡️ Auto-repair Sonarr : réglages actifs "
+                f"skip_episode_deletion={skip_episode_deletion}, "
+                f"disable_season_pack_check={disable_season_pack_check}, "
+                f"user={default_user.id}"
+            )
 
         except Exception as e:
-            db.rollback()
-
             logger.warning(
-                f"⚠️ Auto-repair Sonarr : impossible d'activer le mode SAFE : {e}",
+                f"⚠️ Auto-repair Sonarr : impossible de lire les réglages SAFE : {e}",
                 exc_info=True,
             )
+
+            skip_episode_deletion = False
+            disable_season_pack_check = False
 
         # ------------------------------------------------------------------
         # 8) Refresh Sonarr
@@ -1582,15 +1587,91 @@ async def auto_repair_sonarr_symlink(
         seasonit_result = None
 
         try:
-            logger.info(
-                f"🎬 Auto-repair Sonarr : relance SeasonIt {title} S{season_number}"
-            )
 
-            seasonit_result = await service.process_season_it(
-                series_id,
-                season_number,
-                FIXED_INSTANCE_ID,
-            )
+            if skip_episode_deletion:
+                episode_match = re.search(r"[Ss](\d{1,2})[Ee](\d{1,2})", symlink_path.name)
+                episode_number = int(episode_match.group(2)) if episode_match else None
+
+                if episode_number is None:
+                    logger.warning(
+                        f"⚠️ Auto-repair SAFE : épisode introuvable dans le nom, "
+                        f"pas de SeasonIt complet : {symlink_path}"
+                    )
+
+                    seasonit_result = {
+                        "status": "safe_skipped",
+                        "reason": "episode_not_found_in_filename",
+                    }
+
+                else:
+                    missing_data = await sonarr_client.get_missing_episodes(
+                        series_id,
+                        season_number,
+                    )
+
+                    season_missing = missing_data.get("seasons_with_missing", {}).get(
+                        season_number,
+                        [],
+                    )
+
+                    target_episode = next(
+                        (
+                            ep for ep in season_missing
+                            if ep.get("episodeNumber") == episode_number
+                        ),
+                        None,
+                    )
+
+                    if not target_episode:
+                        logger.warning(
+                            f"⚠️ Auto-repair SAFE : épisode cible non trouvé comme manquant : "
+                            f"{title} S{season_number:02d}E{episode_number:02d}"
+                        )
+
+                        seasonit_result = {
+                            "status": "safe_skipped",
+                            "reason": "target_episode_not_missing",
+                        }
+
+                    else:
+                        episode_id = target_episode.get("id")
+
+                        if not episode_id:
+                            logger.warning(
+                                f"⚠️ Auto-repair SAFE : ID épisode absent pour "
+                                f"{title} S{season_number:02d}E{episode_number:02d}"
+                            )
+
+                            seasonit_result = {
+                                "status": "safe_skipped",
+                                "reason": "episode_id_missing",
+                            }
+
+                        else:
+                            logger.info(
+                                f"🎯 Auto-repair SAFE : recherche épisode ciblée "
+                                f"{title} S{season_number:02d}E{episode_number:02d}"
+                            )
+
+                            command_id = await sonarr_client.search_episode(episode_id)
+
+                            seasonit_result = {
+                                "status": "safe_episode_search",
+                                "command_id": command_id,
+                                "episode_id": episode_id,
+                                "episode": episode_number,
+                            }
+
+            else:
+                logger.info(
+                    f"🎬 Auto-repair Sonarr : relance SeasonIt {title} S{season_number}"
+                )
+
+                seasonit_result = await service.process_season_it(
+                    series_id,
+                    season_number,
+                    FIXED_INSTANCE_ID,
+                )
 
         except Exception as e:
             logger.error(
@@ -1824,6 +1905,7 @@ async def get_sonarr_series_url(
 async def delete_symlink_sonarr(
     symlink_path: str,
     root: Optional[str] = Query(None, description="Nom de la racine (ex: shows)"),
+    db: Session = Depends(get_db),
     sonarr: SonarrService = Depends(SonarrService)
 ):
     """
@@ -1985,6 +2067,12 @@ async def delete_symlink_sonarr(
 
         series_id = series["id"]
 
+        FIXED_INSTANCE_ID = 1
+
+        instance: SonarrInstance = db.query(SonarrInstance).get(FIXED_INSTANCE_ID)
+        if not instance:
+            raise HTTPException(status_code=500, detail="Instance Sonarr 1 introuvable")
+
         # 5️⃣ Déterminer saison / épisode
         filename = Path(symlink_path).name
         episode_match = re.search(r"[Ss](\d{1,2})[Ee](\d{1,2})", filename)
@@ -2003,8 +2091,26 @@ async def delete_symlink_sonarr(
                     None
                 )
                 if ep:
-                    sonarr.search_season(series_id, season)  # Sonarr ne supporte pas recherche épisode direct
-                    logger.info(f"📥 Recherche relancée pour {series['title']} S{season:02d}E{episode:02d}")
+                    episode_id = ep.get("id")
+
+                    if episode_id:
+                        sonarr_client = SonarrClient(
+                            base_url=instance.url,
+                            api_key=instance.api_key,
+                            instance_id=FIXED_INSTANCE_ID,
+                        )
+
+                        await sonarr_client.search_episode(episode_id)
+
+                        logger.info(
+                            f"🎯 Recherche épisode ciblée pour "
+                            f"{series['title']} S{season:02d}E{episode:02d}"
+                        )
+                    else:
+                        logger.warning(
+                            f"⚠️ ID épisode absent pour "
+                            f"{series['title']} S{season:02d}E{episode:02d}"
+                        )
             elif season_match:
                 season = int(season_match.group(1))
                 sonarr.refresh_series(series_id)
@@ -2035,7 +2141,7 @@ async def delete_broken_sonarr_symlinks(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    logger.info("🚀 Suppression des symlinks Sonarr cassés + réparation SeasonIt")
+    logger.info("🚀 Suppression des symlinks Sonarr cassés + réparation Sonarr")
 
     if not symlink_store:
         raise HTTPException(status_code=503, detail="Cache vide : lancez un scan d'abord.")
@@ -2122,7 +2228,8 @@ async def delete_broken_sonarr_symlinks(
 
     deleted_count = 0
     errors = []
-    tasks = []  # (series_id, title, season_number)
+    tasks = []  # (series_id, title, season_number, episode_number)
+    seen_tasks = set()
 
     # ----------------------------------------------------------------------
     # 5) PHASE 1 : suppression + collecte des tâches SeasonIt
@@ -2246,7 +2353,23 @@ async def delete_broken_sonarr_symlinks(
             season_number = int(m.group(1))
 
             # Stocker la tâche à exécuter plus tard
-            tasks.append((series_id, resolved["title"], season_number))
+            episode_number = None
+
+            episode_match = re.search(r"[Ss](\d{1,2})[Ee](\d{1,2})", symlink_path.name)
+            if episode_match:
+                episode_number = int(episode_match.group(2))
+
+            task_key = (series_id, season_number, episode_number)
+
+            if task_key not in seen_tasks:
+                seen_tasks.add(task_key)
+                tasks.append((series_id, resolved["title"], season_number, episode_number))
+            else:
+                logger.info(
+                    f"⏭️ Tâche Sonarr déjà prévue pour {resolved['title']} "
+                    f"S{season_number:02d}"
+                    + (f"E{episode_number:02d}" if episode_number else "")
+                )
 
             # Event SSE immédiat (symlink supprimé)
             payload = {
@@ -2263,7 +2386,7 @@ async def delete_broken_sonarr_symlinks(
     # ----------------------------------------------------------------------
     # 6) PHASE 2 : Refresh Sonarr pour toutes les séries
     # ----------------------------------------------------------------------
-    unique_series = {series_id for (series_id, _, _) in tasks}
+    unique_series = {series_id for (series_id, _, _, _) in tasks}
 
     for sid in unique_series:
         try:
@@ -2277,28 +2400,89 @@ async def delete_broken_sonarr_symlinks(
     # 7) PHASE 3 : SeasonIt
     # ----------------------------------------------------------------------
 
-    # Forcer le mode SAFE
-    settings = db.query(UserSettings).filter(UserSettings.user_id == current_user.id).first()
-    if settings:
-        settings.skip_episode_deletion = True
-        settings.disable_season_pack_check = True
-        db.commit()
-        db.refresh(settings)
-        logger.info(f"🛡️ Mode SAFE activé : skip_episode_deletion=True pour user={current_user.id}")
+    skip_episode_deletion = bool(
+        getattr(config_manager.config, "skip_episode_deletion", False)
+    )
 
-    for (series_id, title, season_number) in tasks:
+    disable_season_pack_check = bool(
+        getattr(config_manager.config, "disable_season_pack_check", False)
+    )
+
+    logger.info(
+        f"🛡️ Réglages réparation Sonarr : "
+        f"skip_episode_deletion={skip_episode_deletion}, "
+        f"disable_season_pack_check={disable_season_pack_check}"
+    )
+
+    if skip_episode_deletion:
+        logger.info(
+            "🛡️ Mode SAFE actif : recherche épisode ciblée, "
+            "pas de SeasonIt saison complète"
+        )
+
+    for (series_id, title, season_number, episode_number) in tasks:
         try:
+            if skip_episode_deletion:
+                if episode_number is None:
+                    logger.warning(
+                        f"⚠️ SAFE actif mais épisode introuvable dans le nom : "
+                        f"{title} S{season_number}. Aucune recherche saison complète lancée."
+                    )
+                    continue
+
+                missing_data = await sonarr_client.get_missing_episodes(
+                    series_id,
+                    season_number,
+                )
+
+                season_missing = missing_data.get("seasons_with_missing", {}).get(
+                    season_number,
+                    [],
+                )
+
+                target_episode = next(
+                    (
+                        ep for ep in season_missing
+                        if ep.get("episodeNumber") == episode_number
+                    ),
+                    None,
+                )
+
+                if not target_episode:
+                    logger.warning(
+                        f"⚠️ Épisode cible non trouvé comme manquant : "
+                        f"{title} S{season_number:02d}E{episode_number:02d}"
+                    )
+                    continue
+
+                episode_id = target_episode.get("id")
+
+                if not episode_id:
+                    logger.warning(
+                        f"⚠️ ID épisode absent pour "
+                        f"{title} S{season_number:02d}E{episode_number:02d}"
+                    )
+                    continue
+
+                logger.info(
+                    f"🎯 SAFE : recherche épisode ciblée "
+                    f"{title} S{season_number:02d}E{episode_number:02d}"
+                )
+
+                await sonarr_client.search_episode(episode_id)
+                continue
+
             logger.info(f"🎬 SeasonIt: {title} S{season_number}")
             await service.process_season_it(series_id, season_number, FIXED_INSTANCE_ID)
 
         except Exception as e:
-            errors.append(f"{title} S{season_number} : SeasonIt failed — {e}")
+            errors.append(f"{title} S{season_number} : réparation Sonarr failed — {e}")
 
     # ----------------------------------------------------------------------
     # FIN
     # ----------------------------------------------------------------------
     return {
-        "message": f"{deleted_count} symlinks supprimés (Sonarr) + SeasonIt exécuté",
+        "message": f"{deleted_count} symlinks supprimés (Sonarr) + réparation lancée",
         "deleted": deleted_count,
         "errors": errors,
     }

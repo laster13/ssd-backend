@@ -123,6 +123,7 @@ class ConfigManager:
                     "auto_repair_broken_symlinks": False,
                     "disable_season_pack_check": False,
                     "skip_episode_deletion": False,
+                    "require_cached_pack_before_deletion": True,
 
                     "radarr_api_key": None,
                     "sonarr_api_key": None,
@@ -178,6 +179,8 @@ class ConfigManager:
                 "auto_repair_broken_symlinks": False,
                 "disable_season_pack_check": False,
                 "skip_episode_deletion": False,
+                "require_cached_pack_before_deletion": True,
+
 
                 "radarr_api_key": None,
                 "sonarr_api_key": None,
@@ -187,6 +190,17 @@ class ConfigManager:
 
             for key, value in defaults.items():
                 if key not in config_dict:
+                    config_dict[key] = value
+                    changed = True
+
+            forced_secure_values = {
+                "disable_season_pack_check": False,
+                "skip_episode_deletion": False,
+                "require_cached_pack_before_deletion": True,
+            }
+
+            for key, value in forced_secure_values.items():
+                if config_dict.get(key) != value:
                     config_dict[key] = value
                     changed = True
 

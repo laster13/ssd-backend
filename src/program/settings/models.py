@@ -145,6 +145,7 @@ class SymlinkConfig(BaseModel):
     # Options Seasonarr intégrées
     disable_season_pack_check: bool = False
     skip_episode_deletion: bool = False
+    require_cached_pack_before_deletion: bool = True
 
     # API externes
     radarr_api_key: Optional[str] = None

@@ -546,7 +546,13 @@ class SonarrClient:
                 
                 await asyncio.sleep(1)
 
-    async def _get_releases(self, series_id: int, season_number: int) -> List[Dict]:
+    async def _get_releases(
+        self,
+        series_id: int,
+        season_number: int,
+        show_title: Optional[str] = None,
+    ) -> List[Dict]:
+
         import asyncio
         max_retries = 2
         for attempt in range(max_retries + 1):
@@ -557,7 +563,11 @@ class SonarrClient:
                     raise asyncio.CancelledError()
                 
                 async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-                    logger.info(f"Récupération des Releases pour la série {series_id} saison {season_number} (attempt {attempt + 1})")
+                    display_name = show_title or f"ID {series_id}"
+                    logger.info(
+                        f"Récupération des Releases pour {display_name} S{season_number} "
+                        f"(attempt {attempt + 1})"
+                    )
                     response = await client.get(
                         f"{self.base_url}/api/v3/release",
                         params={"seriesId": series_id, "seasonNumber": season_number},

@@ -109,17 +109,15 @@ class SeasonItService:
 
     def _get_primary_alldebrid_api_key(self) -> Optional[str]:
         """
-        Récupère une clé AllDebrid depuis la config SSD.
+        Récupère une clé AllDebrid depuis les instances SSD.
 
-        Compatible avec :
-        - config.alldebrid_api_key
-        - config.alldebrid_instances en objets
-        - config.alldebrid_instances en dicts
+        Priorité :
+        - config.alldebrid_instances activées
+        - tri par priority
+        - première instance valide
+
+        L'ancien champ config.alldebrid_api_key est volontairement ignoré.
         """
-        direct_key = getattr(config_manager.config, "alldebrid_api_key", None)
-        if direct_key:
-            return str(direct_key)
-
         instances = getattr(config_manager.config, "alldebrid_instances", []) or []
 
         enabled_instances = []
@@ -141,6 +139,7 @@ class SeasonItService:
         def get_priority(inst):
             if isinstance(inst, dict):
                 return inst.get("priority", 9999)
+
             return getattr(inst, "priority", 9999)
 
         enabled_instances.sort(key=get_priority)

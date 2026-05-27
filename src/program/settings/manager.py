@@ -121,6 +121,9 @@ class ConfigManager:
                     "orphan_manager": {"auto_delete": False},
 
                     "auto_repair_broken_symlinks": False,
+                    "auto_seasonarr_missing_enabled": False,
+                    "auto_seasonarr_missing_run_interval_minutes": 180,
+                    "auto_seasonarr_missing_max_shows_per_run": 50,
                     "disable_season_pack_check": False,
                     "skip_episode_deletion": False,
                     "require_cached_pack_before_deletion": True,
@@ -177,6 +180,9 @@ class ConfigManager:
                 "orphan_manager": {"auto_delete": False},
 
                 "auto_repair_broken_symlinks": False,
+                "auto_seasonarr_missing_enabled": False,
+                "auto_seasonarr_missing_run_interval_minutes": 180,
+                "auto_seasonarr_missing_max_shows_per_run": 50,
                 "disable_season_pack_check": False,
                 "skip_episode_deletion": False,
                 "require_cached_pack_before_deletion": True,
@@ -212,8 +218,6 @@ class ConfigManager:
                 changed = True
 
             self.config = SymlinkConfig.model_validate(config_dict)
-
-            logger.info(f"📂 Config chargée depuis {self.config_file}")
 
             if changed:
                 logger.info("🧩 Migration config.json : ajout automatique des clés manquantes")

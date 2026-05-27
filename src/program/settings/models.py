@@ -146,6 +146,9 @@ class SymlinkConfig(BaseModel):
     disable_season_pack_check: bool = False
     skip_episode_deletion: bool = False
     require_cached_pack_before_deletion: bool = True
+    auto_seasonarr_missing_enabled: bool = False
+    auto_seasonarr_missing_run_interval_minutes: int = 180
+    auto_seasonarr_missing_max_shows_per_run: int = 50
 
     # API externes
     radarr_api_key: Optional[str] = None

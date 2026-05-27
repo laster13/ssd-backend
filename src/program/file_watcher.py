@@ -24,10 +24,13 @@ from program.utils.discord_notifier import send_discord_summary, send_discord_me
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import program.radarr_cache as radarr_cache
 from program.radarr_cache import enrich_from_radarr_index
+from integrations.seasonarr.services.auto_seasonarr_missing_service import AutoSeasonarrMissingService
 
 initial_scan_done = Event()
 broken_monitor_cycle_done = Event()
 broken_monitor_running = Event()
+auto_seasonarr_missing_scheduler_started = False
+auto_seasonarr_missing_scheduler_lock = threading.Lock()
 
 symlink_watcher_started = False
 symlink_watcher_lock = threading.Lock()
@@ -1428,6 +1431,174 @@ def _ensure_radarr_index_ready(force: bool = False):
                 exc_info=True,
             )
 
+def start_auto_seasonarr_missing_scheduler():
+    """
+    Lance Auto Seasonarr Missing en tâche de fond.
+
+    Le switch config :
+    auto_seasonarr_missing_enabled=false -> rien ne se lance
+
+    Réglages config :
+    auto_seasonarr_missing_run_interval_minutes -> intervalle entre deux runs
+    auto_seasonarr_missing_max_shows_per_run    -> limite de séries par run
+    """
+    global auto_seasonarr_missing_scheduler_started
+
+    with auto_seasonarr_missing_scheduler_lock:
+        if auto_seasonarr_missing_scheduler_started:
+            logger.warning("⏭️ Auto Seasonarr missing scheduler déjà démarré")
+            return
+
+        auto_seasonarr_missing_scheduler_started = True
+
+    initial_delay_seconds = 5 * 60
+    check_every_seconds = 60
+    default_run_interval_minutes = 180
+    default_max_shows_per_run = 50
+
+    def _read_scheduler_settings():
+        """
+        Lit les réglages depuis config.json avec garde-fous.
+        """
+        run_interval_minutes = getattr(
+            config_manager.config,
+            "auto_seasonarr_missing_run_interval_minutes",
+            default_run_interval_minutes,
+        )
+
+        max_shows_per_run = getattr(
+            config_manager.config,
+            "auto_seasonarr_missing_max_shows_per_run",
+            default_max_shows_per_run,
+        )
+
+        try:
+            run_interval_minutes = int(
+                run_interval_minutes or default_run_interval_minutes
+            )
+        except Exception:
+            run_interval_minutes = default_run_interval_minutes
+
+        try:
+            max_shows_per_run = int(
+                max_shows_per_run or default_max_shows_per_run
+            )
+        except Exception:
+            max_shows_per_run = default_max_shows_per_run
+
+        # Sécurité :
+        # - pas de run toutes les 1 ou 2 minutes en automatique
+        # - pas de traitement illimité
+        run_interval_minutes = max(15, run_interval_minutes)
+        max_shows_per_run = max(1, min(500, max_shows_per_run))
+
+        return run_interval_minutes, max_shows_per_run
+
+    def loop():
+        last_run_started_at = None
+
+        try:
+            config_manager.load()
+        except Exception as e:
+            logger.debug(
+                f"⚠️ Auto Seasonarr missing : impossible de recharger la config au démarrage : {e}"
+            )
+
+        run_interval_minutes, max_shows_per_run = _read_scheduler_settings()
+        run_every_seconds = run_interval_minutes * 60
+
+        logger.info(
+            "🕒 Auto Seasonarr missing scheduler démarré "
+            f"(initial_delay={initial_delay_seconds}s, "
+            f"check_every={check_every_seconds}s, "
+            f"run_interval={run_interval_minutes}min, "
+            f"max_shows={max_shows_per_run})"
+        )
+
+        time.sleep(initial_delay_seconds)
+
+        while True:
+            try:
+                try:
+                    config_manager.load()
+                except Exception as e:
+                    logger.debug(
+                        f"⚠️ Auto Seasonarr missing : impossible de recharger la config : {e}"
+                    )
+
+                enabled = bool(
+                    getattr(
+                        config_manager.config,
+                        "auto_seasonarr_missing_enabled",
+                        False,
+                    )
+                )
+
+                run_interval_minutes, max_shows_per_run = _read_scheduler_settings()
+                run_every_seconds = run_interval_minutes * 60
+
+                if not enabled:
+                    time.sleep(check_every_seconds)
+                    continue
+
+                now = datetime.utcnow()
+
+                should_run = (
+                    last_run_started_at is None
+                    or (now - last_run_started_at).total_seconds() >= run_every_seconds
+                )
+
+                if not should_run:
+                    time.sleep(check_every_seconds)
+                    continue
+
+                last_run_started_at = now
+
+                db = None
+
+                try:
+                    logger.info(
+                        "🚀 Auto Seasonarr missing : démarrage du run automatique "
+                        f"(interval={run_interval_minutes}min, max_shows={max_shows_per_run})"
+                    )
+
+                    db = SessionLocal()
+                    service = AutoSeasonarrMissingService(db)
+
+                    result = asyncio.run(
+                        service.run_once(max_shows_per_run=max_shows_per_run)
+                    )
+
+                    logger.info(
+                        "✅ Auto Seasonarr missing : run terminé status=%s processed=%s",
+                        result.get("status"),
+                        result.get("processed"),
+                    )
+
+                except Exception as e:
+                    logger.error(
+                        f"💥 Auto Seasonarr missing : erreur pendant le run : {e}",
+                        exc_info=True,
+                    )
+
+                finally:
+                    if db is not None:
+                        try:
+                            db.close()
+                        except Exception:
+                            pass
+
+                time.sleep(check_every_seconds)
+
+            except Exception as e:
+                logger.error(
+                    f"💥 Auto Seasonarr missing scheduler : erreur boucle : {e}",
+                    exc_info=True,
+                )
+                time.sleep(60)
+
+    threading.Thread(target=loop, daemon=True).start()
+
 def start_symlink_watcher():
     """
     🛰️ Watcher principal des symlinks :
@@ -1564,6 +1735,7 @@ def start_symlink_watcher():
         # ✅ Signal uniquement quand scan + watchers sont prêts
         initial_scan_done.set()
         logger.info("🔔 Signal envoyé : scan initial terminé + watchers actifs")
+        start_auto_seasonarr_missing_scheduler()
 
         # --- 5️⃣ Monitor léger après watchers actifs ---
         broken_monitor_cycle_done.clear()
@@ -3098,7 +3270,7 @@ def start_light_broken_symlink_monitor():
                 else:
                     ignored_count += 1
 
-                if not exists and symlink_path not in already_notified:
+                if not exists:
                     repaired_by_auto = False
                     auto_action_handled = False
 
@@ -3195,7 +3367,12 @@ def start_light_broken_symlink_monitor():
                     if repaired_by_auto or auto_action_handled:
                         continue
 
-                    broken_now.append(item)
+                    if symlink_path not in already_notified:
+                        broken_now.append(item)
+                    else:
+                        logger.debug(
+                            f"⏭️ Symlink déjà signalé broken, auto-repair tenté si activé : {symlink_path}"
+                        )
 
                 elif exists and symlink_path in already_notified:
                     if is_currently_ok_in_store_or_disk(symlink_path):

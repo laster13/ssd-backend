@@ -22,7 +22,7 @@ scheduler = AsyncIOScheduler(timezone=ZoneInfo("Europe/Paris"))
 
 FRONTEND_VERSION_URL = "https://raw.githubusercontent.com/laster13/ssd-frontend/main/version.json"
 BACKEND_VERSION_URL = "https://raw.githubusercontent.com/laster13/ssd-backend/main/version.json"
-
+SAISON_FRONTEND_VERSION_URL = "https://raw.githubusercontent.com/laster13/saison-frontend/main/version.json"
 
 
 # ==========================================================
@@ -118,6 +118,33 @@ async def run_update_frontend(db: Session = Depends(get_db)):
         sse_manager.publish_event("update_error", {"message": str(e)})
         return {"status": "error", "message": f"Erreur MAJ frontend : {e}"}
 
+# ==========================================================
+# 🎬 Lancer uniquement la mise à jour SAISON FRONTEND
+# ==========================================================
+@router.post("/run/saison_frontend")
+async def run_update_saison_frontend(db: Session = Depends(get_db)):
+    """
+    Met à jour uniquement le frontend Saison/Seasonarr.
+    """
+    logger.info("🎬 Mise à jour SAISON FRONTEND déclenchée")
+
+    try:
+        run_auto_update(target="saison_frontend")
+
+        # 🔔 Notifie tous les clients via SSE
+        sse_manager.publish_event(
+            "update_finished",
+            {"message": "✅ Mise à jour SAISON FRONTEND terminée."}
+        )
+
+        logger.success("✅ Mise à jour SAISON FRONTEND terminée avec succès")
+        return {"status": "ok", "message": "Mise à jour SAISON FRONTEND terminée"}
+
+    except Exception as e:
+        logger.error(f"❌ Erreur MAJ saison frontend : {e}")
+        sse_manager.publish_event("update_error", {"message": str(e)})
+        return {"status": "error", "message": f"Erreur MAJ saison frontend : {e}"}
+
 
 # ==========================================================
 # 🔍 3. Obtenir la version backend + frontend (pour /admin/update)
@@ -128,9 +155,10 @@ async def get_versions():
     Retourne la version locale du backend et la version distante du frontend.
     """
     try:
-        versions = get_version()  # 🔥 on récupère ton dict propre {'backend': '1.0.1', 'frontend': '1.0.0'}
-        backend_version = versions["backend"]
-        frontend_version = versions["frontend"]
+        versions = get_version()
+        backend_version = versions.get("backend", "—")
+        frontend_version = versions.get("frontend", "—")
+        saison_frontend_version = versions.get("saison_frontend", "—")
 
         # Vérifie aussi la version distante du frontend
         try:
@@ -141,15 +169,24 @@ async def get_versions():
         except Exception as e:
             logger.warning(f"⚠️ Impossible de récupérer la version distante du frontend : {e}")
 
-        return {"backend": backend_version, "frontend": frontend_version}
+        return {
+            "backend": backend_version,
+            "frontend": frontend_version,
+            "saison_frontend": saison_frontend_version,
+        }
 
     except Exception as e:
         logger.error(f"💥 Erreur lors de la récupération des versions : {e}")
-        return {"backend": "0.0.0", "frontend": "0.0.0"}
+        return {
+            "backend": "0.0.0",
+            "frontend": "0.0.0",
+            "saison_frontend": "0.0.0",
+        }
 
 def perform_update_check(db: Session):
     """
-    Vérifie s’il existe une nouvelle version du backend et du frontend.
+    Vérifie s’il existe une nouvelle version du backend, du frontend principal
+    et du frontend Saison.
     Compare les fichiers version.json locaux et distants,
     et enregistre une notification persistante si une mise à jour est disponible.
     Supprime les notifications obsolètes si tout est à jour.
@@ -162,12 +199,14 @@ def perform_update_check(db: Session):
         local = get_version()
         local_backend = local.get("backend", "—")
         local_frontend = local.get("frontend", "—")
+        local_saison_frontend = local.get("saison_frontend", "—")
 
         # =====================================================
         # 🧩 2. Versions distantes (GitHub)
         # =====================================================
         remote_backend = "—"
         remote_frontend = "—"
+        remote_saison_frontend = "—"
 
         try:
             with urllib.request.urlopen(BACKEND_VERSION_URL, timeout=5) as response:
@@ -183,66 +222,104 @@ def perform_update_check(db: Session):
         except Exception as e:
             logger.warning(f"⚠️ Impossible de récupérer la version FRONTEND distante : {e}")
 
-        # =====================================================
-        # 🧠 3. Si tout est à jour → nettoyage complet 
-        # =====================================================
-        if local_backend == remote_backend and local_frontend == remote_frontend:
-            deleted = db.query(Notification).filter(
-                Notification.message_type == "system_update"
-            ).delete()
-            db.commit()
-            return {
-                "update_available": False,
-                "message": "✅ Toutes les versions sont à jour.",
-                "backend": {
-                    "current": local_backend,
-                    "remote": remote_backend,
-                    "has_update": False
-                },
-                "frontend": {
-                    "current": local_frontend,
-                    "remote": remote_frontend,
-                    "has_update": False
-                },
-            }
+        try:
+            with urllib.request.urlopen(SAISON_FRONTEND_VERSION_URL, timeout=5) as response:
+                data = json.load(response)
+                remote_saison_frontend = data.get("version", "—")
+        except Exception as e:
+            logger.warning(f"⚠️ Impossible de récupérer la version SAISON FRONTEND distante : {e}")
 
         # =====================================================
-        # 🧮 4. Comparaison intelligente
+        # 🧮 3. Comparaison intelligente
         # =====================================================
         def compare_versions(local_v, remote_v):
             try:
+                if local_v in ("—", None) or remote_v in ("—", None):
+                    return False
+
                 return version.parse(remote_v) > version.parse(local_v)
             except Exception:
                 return remote_v != local_v
 
         backend_has_update = compare_versions(local_backend, remote_backend)
         frontend_has_update = compare_versions(local_frontend, remote_frontend)
-        update_available = backend_has_update or frontend_has_update
+        saison_frontend_has_update = compare_versions(
+            local_saison_frontend,
+            remote_saison_frontend,
+        )
+
+        update_available = (
+            backend_has_update
+            or frontend_has_update
+            or saison_frontend_has_update
+        )
+
+        # =====================================================
+        # 🧠 4. Si tout est à jour → nettoyage complet
+        # =====================================================
+        if not update_available:
+            db.query(Notification).filter(
+                Notification.message_type == "system_update"
+            ).delete()
+            db.commit()
+
+            return {
+                "update_available": False,
+                "message": "✅ Toutes les versions sont à jour.",
+                "backend": {
+                    "current": local_backend,
+                    "remote": remote_backend,
+                    "has_update": False,
+                },
+                "frontend": {
+                    "current": local_frontend,
+                    "remote": remote_frontend,
+                    "has_update": False,
+                },
+                "saison_frontend": {
+                    "current": local_saison_frontend,
+                    "remote": remote_saison_frontend,
+                    "has_update": False,
+                },
+            }
 
         # =====================================================
         # 💬 5. Message dynamique
         # =====================================================
-        if backend_has_update and frontend_has_update:
-            message = f"🚀 Nouvelle version BACKEND {remote_backend} et FRONTEND {remote_frontend} disponibles"
-        elif backend_has_update:
-            message = f"🚀 Nouvelle version BACKEND {remote_backend} disponible"
-        elif frontend_has_update:
-            message = f"🎨 Nouvelle version FRONTEND {remote_frontend} disponible"
-        else:
-            message = "✅ Toutes les versions sont à jour."
+        updates = []
+
+        if backend_has_update:
+            updates.append(f"BACKEND {remote_backend}")
+
+        if frontend_has_update:
+            updates.append(f"FRONTEND {remote_frontend}")
+
+        if saison_frontend_has_update:
+            updates.append(f"SAISON FRONTEND {remote_saison_frontend}")
+
+        message = "🚀 Nouvelle version disponible : " + ", ".join(updates)
 
         # =====================================================
         # 🧱 6. Persistance en base (Notification)
         # =====================================================
         if backend_has_update:
             save_update_notification(db, "backend", remote_backend, message)
+
         if frontend_has_update:
             save_update_notification(db, "frontend", remote_frontend, message)
+
+        if saison_frontend_has_update:
+            save_update_notification(
+                db,
+                "saison_frontend",
+                remote_saison_frontend,
+                message,
+            )
 
         # =====================================================
         # 🧾 7. Log + retour
         # =====================================================
-        result = {
+        return {
             "update_available": update_available,
             "backend": {
                 "current": local_backend,
@@ -254,18 +331,36 @@ def perform_update_check(db: Session):
                 "remote": remote_frontend,
                 "has_update": frontend_has_update,
             },
+            "saison_frontend": {
+                "current": local_saison_frontend,
+                "remote": remote_saison_frontend,
+                "has_update": saison_frontend_has_update,
+            },
             "message": message,
         }
 
-        return result
-
     except Exception as e:
         logger.error(f"💥 Erreur pendant la vérification de mise à jour : {e}")
+
         return {
             "update_available": False,
             "message": "❌ Erreur pendant la vérification des mises à jour.",
+            "backend": {
+                "current": "—",
+                "remote": "—",
+                "has_update": False,
+            },
+            "frontend": {
+                "current": "—",
+                "remote": "—",
+                "has_update": False,
+            },
+            "saison_frontend": {
+                "current": "—",
+                "remote": "—",
+                "has_update": False,
+            },
         }
-
 
 def scheduled_check_updates():
     """
@@ -281,6 +376,7 @@ def scheduled_check_updates():
         if result.get("update_available"):
             backend = result.get("backend", {}) or {}
             frontend = result.get("frontend", {}) or {}
+            saison_frontend = result.get("saison_frontend", {}) or {}
 
             if backend.get("has_update"):
                 sse_manager.publish_event(
@@ -297,6 +393,15 @@ def scheduled_check_updates():
                     {
                         "message": result.get("message", ""),
                         "version": frontend.get("remote"),
+                    },
+                )
+
+            if saison_frontend.get("has_update"):
+                sse_manager.publish_event(
+                    "update_available_saison_frontend",
+                    {
+                        "message": result.get("message", ""),
+                        "version": saison_frontend.get("remote"),
                     },
                 )
 

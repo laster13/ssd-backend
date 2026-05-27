@@ -11,14 +11,18 @@ from src.version import get_version
 
 # ====== CONFIG ======
 PROJECT_ROOT = Path(__file__).resolve().parents[1].parent
+
 BACKEND_PATH = PROJECT_ROOT / "ssd-backend"
 FRONTEND_PATH = PROJECT_ROOT / "ssd-frontend"
+SAISON_FRONTEND_PATH = PROJECT_ROOT / "saison-frontend"
+
 BACKEND_VERSION_FILE = BACKEND_PATH / "version.json"
+
 BACKEND_NOTIFY_URL = "http://localhost:8080/api/v1/sse/update_finished"
 
 REMOTE_BACKEND_URL = "https://raw.githubusercontent.com/laster13/ssd-backend/main/version.json"
 REMOTE_FRONTEND_URL = "https://raw.githubusercontent.com/laster13/ssd-frontend/main/version.json"
-
+REMOTE_SAISON_FRONTEND_URL = "https://raw.githubusercontent.com/laster13/saison-frontend/main/version.json"
 
 # ==========================================================
 # ⚙️ OUTILS
@@ -67,69 +71,89 @@ def update_backend():
 # 🎨 MISE À JOUR FRONTEND
 # ==========================================================
 
-def update_frontend():
-    """Met à jour, reconstruit et redémarre le frontend (pnpm ou npm), sans bruit de console."""
-    if not FRONTEND_PATH.exists():
-        logger.warning("⚠️ Aucun dossier frontend trouvé — mise à jour ignorée.")
+def update_node_frontend(path: Path, pm2_name: str, label: str):
+    """
+    Met à jour, reconstruit et redémarre un frontend Node/Svelte.
+    """
+    if not path.exists():
+        logger.warning(f"⚠️ Dossier {label} introuvable — mise à jour ignorée : {path}")
         return
 
-    logger.info("🎨 Mise à jour du frontend en cours...")
+    logger.info(f"🔄 Mise à jour de {label} en cours...")
 
-    run("git fetch --all > /dev/null 2>&1", cwd=FRONTEND_PATH)
-    run("git reset --hard origin/main > /dev/null 2>&1", cwd=FRONTEND_PATH)
+    run("git fetch --all > /dev/null 2>&1", cwd=path)
+    run("git reset --hard origin/main > /dev/null 2>&1", cwd=path)
 
-    # ======================================================
-    # 🧹 Nettoyage avant installation
-    # ======================================================
-    logger.info("🧹 Nettoyage du frontend avant installation...")
+    logger.info(f"🧹 Nettoyage de {label} avant installation...")
+
     import shutil
 
-    node_modules = FRONTEND_PATH / "node_modules"
+    node_modules = path / "node_modules"
+
     if node_modules.exists():
         try:
             shutil.rmtree(node_modules)
-            logger.debug("🗑️ node_modules supprimé.")
+            logger.debug(f"node_modules supprimé pour {label}.")
         except Exception as e:
-            logger.warning(f"⚠️ Impossible de supprimer node_modules : {e}")
+            logger.warning(f"⚠️ Impossible de supprimer node_modules pour {label} : {e}")
 
-    lockfile = FRONTEND_PATH / "package-lock.json"
+    lockfile = path / "package-lock.json"
+
     if lockfile.exists():
         try:
             lockfile.unlink()
-            logger.debug("🗑️ package-lock.json supprimé.")
+            logger.debug(f"package-lock.json supprimé pour {label}.")
         except Exception as e:
-            logger.warning(f"⚠️ Impossible de supprimer package-lock.json : {e}")
+            logger.warning(f"⚠️ Impossible de supprimer package-lock.json pour {label} : {e}")
 
-    # ======================================================
-    # 📦 Installation des dépendances (PNPM ou NPM)
-    # ======================================================
-    logger.info("📦 Vérification de PNPM...")
+    logger.info(f"📦 Installation des dépendances pour {label}...")
+
     has_pnpm = run("command -v pnpm >/dev/null 2>&1")
 
     if has_pnpm:
-        logger.info("📦 PNPM détecté — installation avec pnpm.")
-        if not run("pnpm install --frozen-lockfile > /dev/null 2>&1", cwd=FRONTEND_PATH):
-            logger.warning("⚠️ Erreur pendant l'installation PNPM — tentative avec NPM.")
-            run("npm install --silent > /dev/null 2>&1", cwd=FRONTEND_PATH)
+        logger.info(f"PNPM détecté — installation avec pnpm pour {label}.")
+        if not run("pnpm install --frozen-lockfile > /dev/null 2>&1", cwd=path):
+            logger.warning(f"⚠️ Erreur PNPM pour {label} — tentative avec NPM.")
+            run("npm install --silent > /dev/null 2>&1", cwd=path)
     else:
-        logger.warning("⚠️ PNPM non trouvé — utilisation de NPM.")
-        run("npm install --silent > /dev/null 2>&1", cwd=FRONTEND_PATH)
+        logger.warning(f"⚠️ PNPM non trouvé — utilisation de NPM pour {label}.")
+        run("npm install --silent > /dev/null 2>&1", cwd=path)
 
-    # ======================================================
-    # 🏗️ Build du frontend
-    # ======================================================
-    logger.info("🏗️ Construction du frontend...")
-    if not run("npm run build --silent > /dev/null 2>&1", cwd=FRONTEND_PATH):
-        logger.error("❌ Échec de la construction du frontend.")
+    logger.info(f"🏗️ Construction de {label}...")
+
+    if not run("npm run build --silent > /dev/null 2>&1", cwd=path):
+        logger.error(f"❌ Échec de la construction de {label}.")
         return
 
-    # ======================================================
-    # 🔁 Redémarrage du frontend
-    # ======================================================
-    logger.info("🔁 Redémarrage du frontend (pm2)...")
-    run("pm2 restart frontend > /dev/null 2>&1", cwd=FRONTEND_PATH)
-    logger.success("✅ Frontend mis à jour, reconstruit et redémarré avec succès.")
+    logger.info(f"♻️ Redémarrage PM2 de {label} ({pm2_name})...")
 
+    if not run(f"pm2 restart {pm2_name} > /dev/null 2>&1", cwd=path):
+        logger.warning(f"⚠️ Process PM2 {pm2_name} introuvable — tentative de démarrage...")
+
+        if not run(
+            f"pm2 start npm --name {pm2_name} -- run preview > /dev/null 2>&1",
+            cwd=path,
+        ):
+            logger.error(f"❌ Impossible de démarrer le process PM2 {pm2_name}.")
+            return
+
+    logger.success(f"✅ {label} mis à jour, reconstruit et redémarré avec succès.")
+
+def update_frontend():
+    """Met à jour le frontend principal."""
+    update_node_frontend(
+        path=FRONTEND_PATH,
+        pm2_name="frontend",
+        label="frontend",
+    )
+
+def update_saison_frontend():
+    """Met à jour le frontend Seasonarr/Saison."""
+    update_node_frontend(
+        path=SAISON_FRONTEND_PATH,
+        pm2_name="saison-frontend",
+        label="saison-frontend",
+    )
 
 # ==========================================================
 # 📡 NOTIFICATION SSE
@@ -171,20 +195,27 @@ def main(target: str | None = None):
             notify_backend_update_done(success=True, message="✅ Frontend mis à jour avec succès.")
             return
 
+        if target == "saison_frontend":
+            update_saison_frontend()
+            notify_backend_update_done(success=True, message="✅ Saison Frontend mis à jour avec succès.")
+            return
+
         # --- Sinon mise à jour complète ---
         local_versions = get_version()
         local_backend = local_versions.get("backend", "0.0.0")
         local_frontend = local_versions.get("frontend", "0.0.0")
+        local_saison_frontend = local_versions.get("saison_frontend", "0.0.0")
 
         remote_backend = get_remote_version(REMOTE_BACKEND_URL)
         remote_frontend = get_remote_version(REMOTE_FRONTEND_URL)
-
-        logger.info(f"📦 Backend local : {local_backend} | distant : {remote_backend}")
-        logger.info(f"💅 Frontend local : {local_frontend} | distant : {remote_frontend}")
+        remote_saison_frontend = get_remote_version(REMOTE_SAISON_FRONTEND_URL)
+        logger.info(f" Backend local : {local_backend} | distant : {remote_backend}")
+        logger.info(f" Frontend local : {local_frontend} | distant : {remote_frontend}")
+        logger.info(f" Saison Frontend local : {local_saison_frontend} | distant : {remote_saison_frontend}")
 
         backend_needs_update = local_backend != remote_backend
         frontend_needs_update = local_frontend != remote_frontend
-
+        saison_frontend_needs_update = local_saison_frontend != remote_saison_frontend
         if backend_needs_update:
             update_backend()
         else:
@@ -195,8 +226,17 @@ def main(target: str | None = None):
         else:
             logger.info("🟢 Le frontend est déjà à jour.")
 
-        if not backend_needs_update and not frontend_needs_update:
-            logger.info("🟢 Aucun composant n’avait besoin d’une mise à jour.")
+        if saison_frontend_needs_update:
+            update_saison_frontend()
+        else:
+            logger.info(" Le Saison Frontend est déjà à jour.")
+
+        if (
+            not backend_needs_update
+            and not frontend_needs_update
+            and not saison_frontend_needs_update
+        ):
+            logger.info(" Aucun composant n’avait besoin d’une mise à jour.")
 
         notify_backend_update_done(success=True)
 
@@ -206,4 +246,6 @@ def main(target: str | None = None):
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    main(sys.argv[1] if len(sys.argv) > 1 else None)

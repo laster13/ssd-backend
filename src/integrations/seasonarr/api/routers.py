@@ -8,6 +8,7 @@ import os
 from datetime import timedelta
 from fastapi.responses import JSONResponse
 from program.settings.manager import settings_manager
+from integrations.seasonarr.services.auto_seasonarr_missing_service import AutoSeasonarrMissingService
 
 
 # FastAPI
@@ -606,6 +607,30 @@ async def proxy_image(
             "Access-Control-Allow-Headers": "*",
         }
     )
+
+@router.post("/auto-seasonarr-missing/run")
+async def run_auto_seasonarr_missing(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    service = AutoSeasonarrMissingService(db)
+
+    try:
+        result = await service.run_once()
+        return {
+            "message": "Auto Seasonarr missing completed",
+            "result": result,
+        }
+    except Exception as e:
+        logger.error(
+            "Auto Seasonarr missing error: %s",
+            e,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Auto Seasonarr missing failed: {e}",
+        )
 
 # -------------------------------------------------------------------
 # Season It & bulk

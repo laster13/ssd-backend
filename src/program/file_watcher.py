@@ -24,7 +24,6 @@ from program.utils.discord_notifier import send_discord_summary, send_discord_me
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import program.radarr_cache as radarr_cache
 from program.radarr_cache import enrich_from_radarr_index
-from integrations.seasonarr.services.auto_seasonarr_missing_service import AutoSeasonarrMissingService
 
 initial_scan_done = Event()
 broken_monitor_cycle_done = Event()
@@ -1562,9 +1561,20 @@ def start_auto_seasonarr_missing_scheduler():
                         f"(interval={run_interval_minutes}min, max_shows={max_shows_per_run})"
                     )
 
+                    try:
+                        from integrations.seasonarr.services.auto_seasonarr_missing_service import (
+                            AutoSeasonarrMissingService,
+                        )
+                    except ModuleNotFoundError as e:
+                        logger.warning(
+                            "⏭️ Auto Seasonarr missing indisponible : "
+                            f"service absent dans cette version backend ({e})"
+                        )
+                        time.sleep(check_every_seconds)
+                        continue
+
                     db = SessionLocal()
                     service = AutoSeasonarrMissingService(db)
-
                     result = asyncio.run(
                         service.run_once(max_shows_per_run=max_shows_per_run)
                     )

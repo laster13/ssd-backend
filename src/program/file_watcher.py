@@ -1626,8 +1626,6 @@ def start_symlink_watcher():
             logger.warning("⏭️ Symlink watcher déjà démarré, lancement ignoré")
             return
 
-        symlink_watcher_started = True
-
     from routers.secure.symlinks import scan_symlinks, symlink_store
     from watchdog.observers import Observer
     from watchdog.observers.polling import PollingObserver
@@ -1723,6 +1721,16 @@ def start_symlink_watcher():
             results = list(executor.map(start_observer, links_dirs))
 
         observers = [obs for obs in results if obs]
+
+        if not observers:
+            logger.error(
+                "🚨 Aucun watcher symlink n'a pu démarrer. "
+                "Le lancement sera retenté au prochain appel."
+            )
+            return
+
+        with symlink_watcher_lock:
+            symlink_watcher_started = True
 
         duration_watchers = round(time.time() - start_watchers, 2)
 
@@ -1914,8 +1922,10 @@ def start_symlink_watcher():
             except Exception:
                 pass
 
-        logger.warning("✅ Watchers arrêtés proprement")
+        with symlink_watcher_lock:
+            symlink_watcher_started = False
 
+        logger.warning("✅ Watchers arrêtés proprement")
 
 def wait_for_decypharr_containers(min_uptime_seconds=120):
     """

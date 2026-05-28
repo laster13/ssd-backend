@@ -122,14 +122,14 @@ async def set_symlinks_config(new_config: SymlinkConfig, background_tasks: Backg
         config_manager.config = SymlinkConfig.model_validate(new_config.model_dump())
         config_manager.save()
 
-        # 2️⃣ Démarrer le watcher si pas encore actif
-        if not watcher_thread or not watcher_thread.is_alive():
-            def start_watcher():
-                logger.info("🚀 Démarrage du symlink watcher après config")
-                start_symlink_watcher()
+        # 2️⃣ Démarrer le watcher après config si nécessaire.
+        # start_symlink_watcher possède déjà son propre verrou interne.
+        def start_watcher():
+            logger.info("🚀 Vérification/démarrage du symlink watcher après config")
+            start_symlink_watcher()
 
-            watcher_thread = threading.Thread(target=start_watcher, daemon=True)
-            watcher_thread.start()
+        watcher_thread = threading.Thread(target=start_watcher, daemon=True)
+        watcher_thread.start()
 
         return {"message": "✅ Config mise à jour avec succès ! Watcher actif 🚀"}
 

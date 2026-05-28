@@ -1760,38 +1760,139 @@ def start_symlink_watcher():
 
         # --- 6️⃣ Decypharr / orphans ensuite en arrière-plan ---
         def start_decypharr_orphans_background():
-            try:
-                wait_for_decypharr_containers(min_uptime_seconds=120)
+            """
+            Surveillance silencieuse des orphelins Decypharr / AllDebrid.
 
-                if not is_decypharr_orphans_enabled():
-                    logger.info("🧩 Scan orphelins Decypharr désactivé par configuration.")
-                    return
+            Comportement :
+            - si aucune instance AllDebrid active :
+              aucun scan, aucun log de scheduler actif ;
+            - dès qu'une instance passe enabled=true :
+              lancement immédiat au prochain check ;
+            - ensuite les scans suivent orphan_scan_interval_minutes ;
+            - orphan_scan_check_every_seconds règle la fréquence de vérification
+              de la config.
+            """
+            default_check_every_seconds = 60
+            default_run_interval_minutes = 180
+            last_run_started_at = None
+            previous_enabled = False
 
-                logger.info("⏳ Orphelins : attente fin du premier cycle symlinks brisés...")
-                broken_monitor_cycle_done.wait()
-
-                while broken_monitor_running.is_set():
-                    logger.info("⏳ Orphelins : monitor brisés encore actif, attente 5s...")
-                    time.sleep(5)
-
-                logger.info("⏱️ Orphelins : stabilisation après cycle brisés terminé...")
-                time.sleep(2 * 60)
-
-                logger.info("🧹 Orphelins : lancement après cycle brisés terminé.")
-                run_orphans_process()
-
-            except Exception as e:
-                logger.error(
-                    f"💥 Erreur process Decypharr/orphans en arrière-plan : {e}",
-                    exc_info=True,
+            def _read_orphan_scheduler_settings():
+                check_every_seconds = getattr(
+                    config_manager.config,
+                    "orphan_scan_check_every_seconds",
+                    default_check_every_seconds,
                 )
+
+                run_interval_minutes = getattr(
+                    config_manager.config,
+                    "orphan_scan_interval_minutes",
+                    default_run_interval_minutes,
+                )
+
+                try:
+                    check_every_seconds = int(
+                        check_every_seconds or default_check_every_seconds
+                    )
+                except Exception:
+                    check_every_seconds = default_check_every_seconds
+
+                try:
+                    run_interval_minutes = int(
+                        run_interval_minutes or default_run_interval_minutes
+                    )
+                except Exception:
+                    run_interval_minutes = default_run_interval_minutes
+
+                # Sécurité :
+                # - éviter une boucle trop agressive sur config_manager.load()
+                # - éviter une suppression orpheline trop fréquente
+                check_every_seconds = max(10, min(3600, check_every_seconds))
+                run_interval_minutes = max(15, min(1440, run_interval_minutes))
+
+                return check_every_seconds, run_interval_minutes
+
+            while True:
+                try:
+                    try:
+                        config_manager.load()
+                    except Exception as e:
+                        logger.debug(
+                            f"⚠️ Orphelins : impossible de recharger la config : {e}"
+                        )
+
+                    check_every_seconds, run_interval_minutes = (
+                        _read_orphan_scheduler_settings()
+                    )
+
+                    enabled = is_decypharr_orphans_enabled()
+                    enabled_just_activated = enabled and not previous_enabled
+                    previous_enabled = enabled
+
+                    if not enabled:
+                        time.sleep(check_every_seconds)
+                        continue
+
+                    run_every_seconds = run_interval_minutes * 60
+                    now = datetime.utcnow()
+
+                    should_run = (
+                        enabled_just_activated
+                        or last_run_started_at is None
+                        or (now - last_run_started_at).total_seconds() >= run_every_seconds
+                    )
+
+                    if not should_run:
+                        time.sleep(check_every_seconds)
+                        continue
+
+                    try:
+                        wait_for_decypharr_containers(min_uptime_seconds=120)
+                    except Exception as e:
+                        logger.warning(
+                            f"⚠️ Orphelins : Decypharr non prêt, run reporté : {e}"
+                        )
+                        time.sleep(check_every_seconds)
+                        continue
+
+                    logger.info("⏳ Orphelins : attente fin du premier cycle symlinks brisés...")
+                    broken_monitor_cycle_done.wait()
+
+                    while broken_monitor_running.is_set():
+                        logger.info("⏳ Orphelins : monitor brisés encore actif, attente 5s...")
+                        time.sleep(5)
+
+                    last_run_started_at = datetime.utcnow()
+
+                    if enabled_just_activated:
+                        logger.info(
+                            "🧹 Orphelins : instance AllDebrid activée, "
+                            "lancement immédiat du scan "
+                            f"(check_every={check_every_seconds}s, "
+                            f"interval={run_interval_minutes}min)"
+                        )
+                    else:
+                        logger.info(
+                            "🧹 Orphelins : lancement planifié "
+                            f"(check_every={check_every_seconds}s, "
+                            f"interval={run_interval_minutes}min)"
+                        )
+
+                    run_orphans_process()
+
+                    time.sleep(check_every_seconds)
+
+                except Exception as e:
+                    logger.error(
+                        f"💥 Erreur boucle orphelins Decypharr : {e}",
+                        exc_info=True,
+                    )
+                    time.sleep(60)
 
         threading.Thread(
             target=start_decypharr_orphans_background,
             daemon=True,
         ).start()
-
-        logger.info("🧹 Process Decypharr/orphans lancé en arrière-plan.")
 
         # --- 7️⃣ Boucle passive ---
         logger.info("♻️ Boucle passive active (watchers en veille).")
@@ -2366,13 +2467,17 @@ def run_orphans_process():
         return
 
     try:
-        auto_delete = getattr(config_manager.config.orphan_manager, "auto_delete", False)
-
-        if not auto_delete:
-            logger.info("🧪 orphan_manager.auto_delete=False → scan uniquement, aucune suppression lancée.")
+        if not is_decypharr_orphans_enabled():
+            logger.info(
+                "⏸️ Suppression orphelins ignorée : aucune instance AllDebrid active "
+                "avec enabled=true + api_key + mount_path"
+            )
             return
 
-        logger.info("🧪 Suppression des orphelins...")
+        logger.info(
+            "🧪 Suppression des orphelins autorisée par instance AllDebrid active "
+            "(enabled=true)."
+        )
 
         before_torrents = list_torrent_names_from_webdav()
         logger.info(f"📦 Dossiers WebDAV avant suppression : {len(before_torrents)}")
@@ -3746,4 +3851,3 @@ def start_all_watchers():
     threading.Thread(target=start_symlink_watcher, daemon=True).start()
     start_discord_flusher()
     start_replacement_cleanup_task(interval_hours=0.25, expiry_hours=12)
-    start_periodic_orphans_task(interval_hours=24.0)

@@ -149,6 +149,8 @@ class SymlinkConfig(BaseModel):
     auto_seasonarr_missing_enabled: bool = False
     auto_seasonarr_missing_run_interval_minutes: int = 180
     auto_seasonarr_missing_max_shows_per_run: int = 50
+    orphan_scan_check_every_seconds: int = 60
+    orphan_scan_interval_minutes: int = 180
 
     # API externes
     radarr_api_key: Optional[str] = None

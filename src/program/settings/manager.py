@@ -127,6 +127,8 @@ class ConfigManager:
                     "disable_season_pack_check": False,
                     "skip_episode_deletion": False,
                     "require_cached_pack_before_deletion": True,
+                    "orphan_scan_check_every_seconds": 60,
+                    "orphan_scan_interval_minutes": 180,
 
                     "radarr_api_key": None,
                     "sonarr_api_key": None,
@@ -186,6 +188,8 @@ class ConfigManager:
                 "disable_season_pack_check": False,
                 "skip_episode_deletion": False,
                 "require_cached_pack_before_deletion": True,
+                "orphan_scan_check_every_seconds": 60,
+                "orphan_scan_interval_minutes": 180,
 
 
                 "radarr_api_key": None,

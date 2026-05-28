@@ -249,8 +249,9 @@ async def scan_instance(instance) -> dict:
             },
             "orphans": orphans,
             "actions": {
-                "auto_delete": getattr(config_manager.config.orphan_manager, "auto_delete", False),
+                "auto_delete": True,
                 "deletable": len(orphans),
+                "source": "alldebrid_instance_enabled",
             },
         }
 

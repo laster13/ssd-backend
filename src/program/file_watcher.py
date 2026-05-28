@@ -463,50 +463,33 @@ class SymlinkEventHandler(FileSystemEventHandler):
                 replaced_from = old_path
 
                 if same_path_repair:
-                    repair_extra = {
+                    recreate_extra = {
                         "old_path": old_path,
                         "new_path": symlink_path_str,
                         "match_reason": match_reason,
                         "same_path": True,
                         "created_extra": item,
                         "deleted_extra": get_extra_dict(similar_deleted),
+                        "source": "same_path_recreation",
                     }
 
-                    existing_repair = db.query(SystemActivity).filter(
-                        SystemActivity.action == "repaired",
-                        SystemActivity.path == symlink_path_str,
-                        SystemActivity.created_at >= now - timedelta(seconds=30),
-                    ).first()
-
-                    if not existing_repair:
-                        db.add(SystemActivity(
-                            event="symlink_repaired_same_path",
-                            action="repaired",
-                            path=symlink_path_str,
-                            manager=manager or similar_deleted.manager or "unknown",
-                            replaced=None,
-                            replaced_at=None,
-                            message=f"Symlink réparé/recréé : {symlink_path_str}",
-                            extra=repair_extra,
-                        ))
-
                     logger.info(
-                        f"🛠️ Réparation détectée même chemin ({match_reason}) "
+                        f"♻️ Symlink recréé au même chemin ({match_reason}) "
                         f"({old_path})"
                     )
 
                     sse_manager.publish_event(
                         "symlink_update",
                         {
-                            "event": "symlink_repaired_same_path",
-                            "action": "repaired",
+                            "event": "symlink_recreated_same_path",
+                            "action": "created",
                             "old_path": old_path,
                             "new_path": symlink_path_str,
                             "path": symlink_path_str,
                             "manager": manager,
-                            "message": f"Symlink réparé/recréé : {symlink_path_str}",
-                            "replaced": None,
-                            "replaced_at": None,
+                            "message": f"Symlink recréé au même chemin : {symlink_path_str}",
+                            "replaced": True,
+                            "replaced_at": now.isoformat(),
                             "match_reason": match_reason,
                             "same_path": True,
                         },

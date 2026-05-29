@@ -857,7 +857,6 @@ class SonarrClient:
         """Download a specific release by GUID and indexer_id directly"""
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-                logger.info(f"Téléchargement de la sortie avec le GUID : {release_guid} et indexer_id : {indexer_id}")
                 
                 # Validate indexer_id
                 if not indexer_id or indexer_id <= 0:
@@ -874,7 +873,7 @@ class SonarrClient:
                     logger.error(f"Échec du téléchargement de la sortie : {response.status_code} - {response.text}")
                     raise Exception(f"Échec du téléchargement de la sortie : {response.status_code}")
                 
-                logger.info(f"Release download initiated successfully")
+                logger.info(f"Téléchargement de la version lancé avec succès")
                 return response.json()
                     
         except Exception as e:

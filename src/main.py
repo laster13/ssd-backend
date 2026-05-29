@@ -35,7 +35,8 @@ ICON_MAP = {
     "SSD": "🖥️",
     "WEBSOCKET": "🔌",
     "API": "📡",
-    "DEFAULT": "📝"
+    "DEFAULT": "📝",
+    "ALLDEBRID": "🟢",
 }
 
 def safe_log(self, level_id, from_decorator, options, message, args, kwargs):
@@ -86,6 +87,7 @@ LEVEL_STYLES = {
     "ERROR": {"color": "<fg #FF6B6B>", "icon": ICON_MAP["ERROR"]},
     "CRITICAL": {"color": "<fg #FF0000><bold>", "icon": ICON_MAP["CRITICAL"]},
     "SEASONARR": {"color": "<fg #5DAEFF>", "icon": ICON_MAP["SEASONARR"]},
+    "ALLDEBRID": {"color": "<fg #32CD32><bold>", "icon": ICON_MAP["ALLDEBRID"]},
     "WATCHER": {"color": "<fg #A1C4FD>", "icon": ICON_MAP["WATCHER"]},
     "SYSTEM": {"color": "<fg #FF9800>", "icon": ICON_MAP["SYSTEM"]},
     "CONTAINER": {"color": "<fg #00CED1>", "icon": ICON_MAP["CONTAINER"]},
@@ -110,6 +112,7 @@ def ensure_level(name, no=None):
 
 # Niveaux custom
 ensure_level("SEASONARR", 25)
+ensure_level("ALLDEBRID", 25)
 ensure_level("WATCHER", 25)
 ensure_level("SYSTEM", 26)
 ensure_level("CONTAINER", 24)
@@ -128,7 +131,7 @@ def mask_sensitive_data(msg: str) -> str:
 
 def custom_format(record):
     allowed_modules = ("src.", "program.", "routers.", "integrations.")
-    excluded_levels = ("SEASONARR", "WEBSOCKET", "API")
+    excluded_levels = ("SEASONARR", "ALLDEBRID", "WEBSOCKET", "API")
 
     if record["name"].startswith(allowed_modules) and record["level"].name not in excluded_levels:
         location = f"| <magenta>{record['name']}</magenta>:<cyan>{record['function']}</cyan>:<yellow>{record['line']}</yellow> "
@@ -163,23 +166,26 @@ class InterceptHandler(logging.Handler):
     ALLOWED_MODULES = ("src.main", "program.file_watcher", "routers", "integrations")
 
     def emit(self, record):
-        if not record.name.startswith(self.ALLOWED_MODULES):
-            return
+        if record.name == "ALLDEBRID":
+            level = "ALLDEBRID"
 
-        if ".websocket" in record.name.lower():
-            level = "WEBSOCKET"
-        elif record.name.startswith("integrations.seasonarr"):
-            level = "SEASONARR"
-        elif record.name.startswith("program.file_watcher"):
-            level = "WATCHER"
         else:
-            try:
-                level = logger.level(record.levelname).name
-            except ValueError:
-                level = "DEFAULT"
+            if not record.name.startswith(self.ALLOWED_MODULES):
+                return
+
+            if ".websocket" in record.name.lower():
+                level = "WEBSOCKET"
+            elif record.name.startswith("integrations.seasonarr"):
+                level = "SEASONARR"
+            elif record.name.startswith("program.file_watcher"):
+                level = "WATCHER"
+            else:
+                try:
+                    level = logger.level(record.levelname).name
+                except ValueError:
+                    level = "DEFAULT"
 
         logger.opt(depth=6, exception=record.exc_info).log(level, record.getMessage())
-
 
 def setup_logging():
     log_level = os.getenv("LOG_LEVEL", "DEBUG").upper()

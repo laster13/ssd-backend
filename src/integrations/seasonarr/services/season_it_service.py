@@ -11,6 +11,7 @@ from program.settings.manager import config_manager
 from integrations.seasonarr.clients.alldebrid_cache_client import AllDebridCacheClient
 
 logger = logging.getLogger(__name__)
+alldebrid_logger = logging.getLogger("ALLDEBRID")
 
 class SeasonItService:
     def __init__(self, db: Session, user_id: int):
@@ -380,7 +381,8 @@ class SeasonItService:
                     else "accepté car refus uniquement dû aux fichiers déjà présents"
                 )
 
-                logger.info(
+                alldebrid_logger.log(
+                    25,
                     "SeasonIt - Pack retenu : %s | mode=%s | score=%s | seeders=%s",
                     release.get("title"),
                     mode,

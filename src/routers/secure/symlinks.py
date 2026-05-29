@@ -1006,13 +1006,16 @@ async def delete_broken_symlinks(
                     existing_bulk_deleted.manager = "radarr"
                     existing_bulk_deleted.message = f"Symlink cassé supprimé en masse : {symlink_path}"
                     existing_bulk_deleted.extra = {
-                        "source": "delete_broken_endpoint",
+                        "source": "auto_repair_relaunch",
+                        "origin": "delete_broken_endpoint",
                         "folder": folder,
                         "target": item.get("target"),
                         "title": item.get("title"),
                         "tmdbId": item.get("tmdbId"),
                         "imdbId": item.get("imdbId"),
                         "imdb_id": item.get("imdb_id"),
+                        "auto_repair_pending": True,
+                        "repair_status": "pending_recreation",
                         "deduplicated": True,
                         "deduplicated_from": "existing_bulk",
                     }
@@ -1031,13 +1034,16 @@ async def delete_broken_symlinks(
                         existing_watcher_deleted.manager = "radarr"
                         existing_watcher_deleted.message = f"Symlink cassé supprimé en masse : {symlink_path}"
                         existing_watcher_deleted.extra = {
-                            "source": "delete_broken_endpoint",
+                            "source": "auto_repair_relaunch",
+                            "origin": "delete_broken_endpoint",
                             "folder": folder,
                             "target": item.get("target"),
                             "title": item.get("title"),
                             "tmdbId": item.get("tmdbId"),
                             "imdbId": item.get("imdbId"),
                             "imdb_id": item.get("imdb_id"),
+                            "auto_repair_pending": True,
+                            "repair_status": "pending_recreation",
                             "deduplicated": True,
                             "deduplicated_from": "symlink_removed",
                         }
@@ -1053,13 +1059,16 @@ async def delete_broken_symlinks(
                             replaced_at=None,
                             message=f"Symlink cassé supprimé en masse : {symlink_path}",
                             extra={
-                                "source": "delete_broken_endpoint",
+                                "source": "auto_repair_relaunch",
+                                "origin": "delete_broken_endpoint",
                                 "folder": folder,
                                 "target": item.get("target"),
                                 "title": item.get("title"),
                                 "tmdbId": item.get("tmdbId"),
                                 "imdbId": item.get("imdbId"),
                                 "imdb_id": item.get("imdb_id"),
+                                "auto_repair_pending": True,
+                                "repair_status": "pending_recreation",
                             },
                             created_at=now,
                             updated_at=now,
@@ -2365,7 +2374,8 @@ async def delete_broken_sonarr_symlinks(
                     existing_bulk_deleted.manager = "sonarr"
                     existing_bulk_deleted.message = f"Symlink Sonarr cassé supprimé en masse : {symlink_path}"
                     existing_bulk_deleted.extra = {
-                        "source": "delete_broken_sonarr_endpoint",
+                        "source": "auto_repair_relaunch",
+                        "origin": "delete_broken_sonarr_endpoint",
                         "folder": folder,
                         "target": item.get("target"),
                         "series": item.get("series"),
@@ -2373,6 +2383,8 @@ async def delete_broken_sonarr_symlinks(
                         "tmdbId": item.get("tmdbId"),
                         "imdbId": item.get("imdbId"),
                         "imdb_id": item.get("imdb_id"),
+                        "auto_repair_pending": True,
+                        "repair_status": "pending_recreation",
                         "deduplicated": True,
                         "deduplicated_from": "existing_bulk",
                     }
@@ -2391,7 +2403,8 @@ async def delete_broken_sonarr_symlinks(
                         existing_watcher_deleted.manager = "sonarr"
                         existing_watcher_deleted.message = f"Symlink Sonarr cassé supprimé en masse : {symlink_path}"
                         existing_watcher_deleted.extra = {
-                            "source": "delete_broken_sonarr_endpoint",
+                            "source": "auto_repair_relaunch",
+                            "origin": "delete_broken_sonarr_endpoint",
                             "folder": folder,
                             "target": item.get("target"),
                             "series": item.get("series"),
@@ -2399,6 +2412,8 @@ async def delete_broken_sonarr_symlinks(
                             "tmdbId": item.get("tmdbId"),
                             "imdbId": item.get("imdbId"),
                             "imdb_id": item.get("imdb_id"),
+                            "auto_repair_pending": True,
+                            "repair_status": "pending_recreation",
                             "deduplicated": True,
                             "deduplicated_from": "symlink_removed",
                         }
@@ -2414,7 +2429,8 @@ async def delete_broken_sonarr_symlinks(
                             replaced_at=None,
                             message=f"Symlink Sonarr cassé supprimé en masse : {symlink_path}",
                             extra={
-                                "source": "delete_broken_sonarr_endpoint",
+                                "source": "auto_repair_relaunch",
+                                "origin": "delete_broken_sonarr_endpoint",
                                 "folder": folder,
                                 "target": item.get("target"),
                                 "series": item.get("series"),
@@ -2422,6 +2438,8 @@ async def delete_broken_sonarr_symlinks(
                                 "tmdbId": item.get("tmdbId"),
                                 "imdbId": item.get("imdbId"),
                                 "imdb_id": item.get("imdb_id"),
+                                "auto_repair_pending": True,
+                                "repair_status": "pending_recreation",
                             },
                             created_at=now,
                             updated_at=now,

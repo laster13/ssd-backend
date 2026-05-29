@@ -5,6 +5,7 @@ from typing import Any, List, Optional, Set
 import httpx
 
 logger = logging.getLogger(__name__)
+alldebrid_logger = logging.getLogger("ALLDEBRID")
 
 
 class AllDebridCacheClient:
@@ -214,14 +215,16 @@ class AllDebridCacheClient:
                             continue
 
                         if ready and returned_hash:
-                            logger.info(
-                                "AllDebrid - Cache confirmé : %s",
+                            alldebrid_logger.log(
+                                25,
+                                "Cache confirmé : %s",
                                 name,
                             )
                             cached_hashes.add(returned_hash)
                         else:
-                            logger.info(
-                                "AllDebrid - Cache non confirmé : %s",
+                            alldebrid_logger.log(
+                                25,
+                                "Cache non confirmé : %s",
                                 name,
                             )
 

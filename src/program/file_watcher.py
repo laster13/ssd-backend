@@ -435,6 +435,11 @@ class SymlinkEventHandler(FileSystemEventHandler):
                 return None, None
 
             similar_deleted, match_reason = find_similar_deleted()
+            deleted_extra = get_extra_dict(similar_deleted) if similar_deleted else {}
+
+            created_after_broken = False
+            created_after_auto_repair = False
+            repaired_activity_created = False
 
             if similar_deleted:
                 old_path = str(similar_deleted.path)
@@ -482,7 +487,7 @@ class SymlinkEventHandler(FileSystemEventHandler):
                         "symlink_update",
                         {
                             "event": "symlink_recreated_same_path",
-                            "action": "created",
+                            "action": "updated",
                             "old_path": old_path,
                             "new_path": symlink_path_str,
                             "path": symlink_path_str,
@@ -544,12 +549,55 @@ class SymlinkEventHandler(FileSystemEventHandler):
                         },
                     )
 
-            broken_deleted = db.query(SystemActivity).filter(
+            broken_rows = db.query(SystemActivity).filter(
                 SystemActivity.path == symlink_path_str,
                 SystemActivity.action == "broken"
-            ).delete()
+            ).all()
 
-            if broken_deleted:
+            broken_deleted = len(broken_rows)
+
+            broken_extra = {}
+            for broken_row in broken_rows:
+                if isinstance(broken_row.extra, dict):
+                    broken_extra.update(broken_row.extra)
+
+            if broken_deleted or (
+                similar_deleted
+                and (
+                    match_reason == "same_path"
+                    or deleted_extra.get("auto_repair_pending") is True
+                    or deleted_extra.get("source") in {
+                        "auto_repair",
+                        "auto_repair_relaunch",
+                        "sonarr_auto_repair",
+                        "radarr_auto_repair",
+                    }
+                )
+            ):
+                created_after_broken = True
+                created_after_auto_repair = bool(
+                    broken_extra.get("auto_repair") is True
+                    or broken_extra.get("auto_repair_pending") is True
+                    or deleted_extra.get("auto_repair_pending") is True
+                    or broken_extra.get("source") in {
+                        "light_monitor",
+                        "auto_repair",
+                        "auto_repair_relaunch",
+                        "sonarr_auto_repair",
+                        "radarr_auto_repair",
+                    }
+                    or deleted_extra.get("source") in {
+                        "auto_repair",
+                        "auto_repair_relaunch",
+                        "sonarr_auto_repair",
+                        "radarr_auto_repair",
+                    }
+                )
+
+                db.query(SystemActivity).filter(
+                    SystemActivity.path == symlink_path_str,
+                    SystemActivity.action == "broken"
+                ).delete()
                 with self._lock:
                     for x in symlink_store:
                         if x.get("symlink") == symlink_path_str:
@@ -572,10 +620,16 @@ class SymlinkEventHandler(FileSystemEventHandler):
                         manager=manager,
                         message=f"Symlink réparé par recréation : {symlink_path}",
                         extra={
-                            "auto_repair": False,
+                            "auto_repair": created_after_auto_repair,
                             "reason": "created_after_broken",
+                            "source": "auto_repair_recreation" if created_after_auto_repair else "manual_recreation",
+                            "created_extra": item,
+                            "broken_extra": broken_extra,
+                            "deleted_extra": deleted_extra,
+                            "match_reason": match_reason,
                         },
                     ))
+                    repaired_activity_created = True
 
                 sse_manager.publish_event(
                     "symlink_update",
@@ -585,37 +639,40 @@ class SymlinkEventHandler(FileSystemEventHandler):
                         "path": symlink_path_str,
                         "manager": manager,
                         "message": f"Symlink réparé par recréation : {symlink_path}",
+                        "auto_repair": created_after_auto_repair,
                     },
                 )
 
                 logger.info(f"🧩 Symlink brisé réparé et nettoyé en base : {symlink_path}")
 
-            db.add(SystemActivity(
-                event="symlink_added",
-                action="created",
-                path=symlink_path_str,
-                manager=manager,
-                message=f"Symlink ajouté : {symlink_path}",
-                extra=item,
-            ))
+            if not created_after_broken:
+                db.add(SystemActivity(
+                    event="symlink_added",
+                    action="created",
+                    path=symlink_path_str,
+                    manager=manager,
+                    message=f"Symlink ajouté : {symlink_path}",
+                    extra=item,
+                ))
 
             db.commit()
 
-            sse_manager.publish_event(
-                "symlink_update",
-                {
-                    "event": "symlink_added",
-                    "action": "created",
-                    "path": symlink_path_str,
-                    "item": item,
-                    "id": str(uuid.uuid4()),
-                    "count": len(symlink_store),
-                },
-            )
+            if not created_after_broken:
+                sse_manager.publish_event(
+                    "symlink_update",
+                    {
+                        "event": "symlink_added",
+                        "action": "created",
+                        "path": symlink_path_str,
+                        "item": item,
+                        "id": str(uuid.uuid4()),
+                        "count": len(symlink_store),
+                    },
+                )
 
             with buffer_lock:
                 symlink_events_buffer.append({
-                    "action": "created",
+                    "action": "repaired" if created_after_broken else "created",
                     "symlink": symlink_path_str,
                     "path": symlink_path_str,
                     "target": item.get("target"),
@@ -626,6 +683,7 @@ class SymlinkEventHandler(FileSystemEventHandler):
                     "imdbId": item.get("imdbId"),
                     "when": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                     "replaced_from": replaced_from,
+                    "auto_repair": created_after_auto_repair,
                 })
 
             logger.success(f"Symlink ajouté au cache : {symlink_path}")
@@ -2964,7 +3022,7 @@ def start_replacement_cleanup_task(interval_hours: float = 1.0, expiry_hours: in
                                 "symlink_update",
                                 {
                                     "event": "symlink_replacement_cleanup",
-                                    "action": "replaced",
+                                    "action": "updated",
                                     "path": new_path,
                                     "manager": match.manager or deleted.manager or "unknown",
                                     "replaced": True,

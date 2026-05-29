@@ -102,6 +102,107 @@ def filter_items_by_folder(items, folder: Optional[str]):
         folder_paths = [(p / folder).resolve() for p in roots]
     return [i for i in items if any(is_relative_to(Path(i["symlink"]), fp) for fp in folder_paths)]
 
+def normalize_symlink_target(link_path: str, raw_target: str) -> str:
+    """
+    Normalise la target du symlink sans toucher au filesystem distant.
+    Important:
+    - pas de Path.resolve()
+    - pas de os.path.realpath()
+    - pas de stat sur la target WebDAV/rclone
+    """
+    if os.path.isabs(raw_target):
+        return os.path.normpath(raw_target)
+
+    return os.path.normpath(os.path.join(os.path.dirname(link_path), raw_target))
+
+
+def detect_mount_dir_from_target(target: str) -> str | None:
+    """
+    Déduit le mount dir depuis la target réelle.
+
+    Exemples:
+      /mnt/alldebrid/__all__/Movie/file.mkv
+      => /mnt/alldebrid/__all__
+
+      /mnt/usenet/.ids/7/a/0/3/0/uuid
+      => /mnt/usenet/.ids
+    """
+    parts = target.split(os.sep)
+
+    if "__all__" in parts:
+        index = parts.index("__all__")
+        return os.sep.join(parts[: index + 1]) or os.sep
+
+    if ".ids" in parts:
+        index = parts.index(".ids")
+        return os.sep.join(parts[: index + 1]) or os.sep
+
+    return None
+
+
+def scan_mount_dirs_from_link_dirs() -> tuple[list[str], dict]:
+    """
+    Scanne uniquement les links_dirs et lit les targets des symlinks.
+    Ne parcourt jamais les mount dirs.
+    """
+    detected: set[str] = set()
+
+    stats = {
+        "entries_seen": 0,
+        "dirs_seen": 0,
+        "symlinks_seen": 0,
+        "mount_dirs_found": 0,
+        "unknown_targets": 0,
+        "readlink_errors": 0,
+    }
+
+    for link_dir in config_manager.config.links_dirs:
+        root = str(Path(link_dir.path).expanduser())
+
+        if not os.path.isdir(root):
+            logger.warning(f"Link dir introuvable pendant détection mount dirs: {root}")
+            continue
+
+        stack = [root]
+
+        while stack:
+            current = stack.pop()
+
+            try:
+                with os.scandir(current) as it:
+                    for entry in it:
+                        stats["entries_seen"] += 1
+
+                        try:
+                            if entry.is_symlink():
+                                stats["symlinks_seen"] += 1
+
+                                raw_target = os.readlink(entry.path)
+                                target = normalize_symlink_target(entry.path, raw_target)
+                                mount_dir = detect_mount_dir_from_target(target)
+
+                                if mount_dir:
+                                    detected.add(mount_dir)
+                                    stats["mount_dirs_found"] += 1
+                                else:
+                                    stats["unknown_targets"] += 1
+
+                                continue
+
+                            if entry.is_dir(follow_symlinks=False):
+                                stats["dirs_seen"] += 1
+                                stack.append(entry.path)
+
+                        except OSError as e:
+                            stats["readlink_errors"] += 1
+                            logger.debug(f"Entrée ignorée pendant détection mount dirs: {entry.path} | {e}")
+
+            except OSError as e:
+                stats["readlink_errors"] += 1
+                logger.warning(f"Dossier ignoré pendant détection mount dirs: {current} | {e}")
+
+    return sorted(detected), stats
+
 # -------------
 # Settings manager
 # -------------
@@ -110,6 +211,53 @@ def filter_items_by_folder(items, folder: Optional[str]):
 async def get_symlinks_config():
     """Récupérer la config symlinks depuis config.json"""
     return config_manager.config
+
+@router.post("/detect-mount-dirs", response_model=dict)
+async def detect_mount_dirs():
+    """
+    Détecte automatiquement les mount dirs depuis les targets des symlinks,
+    fusionne avec les mount_dirs déjà présents, puis sauvegarde.
+    """
+    try:
+        started_at = time.perf_counter()
+
+        detected_mount_dirs, stats = await run_in_threadpool(scan_mount_dirs_from_link_dirs)
+
+        config = config_manager.config
+
+        saved_mount_dirs = [
+            os.path.normpath(str(path))
+            for path in getattr(config, "mount_dirs", [])
+            if path and str(path).strip()
+        ]
+
+        merged_mount_dirs = sorted(set(saved_mount_dirs + detected_mount_dirs))
+
+        config.mount_dirs = merged_mount_dirs
+        config_manager.save()
+
+        elapsed = time.perf_counter() - started_at
+
+        logger.success(
+            f"✅ Mount dirs détectés: {len(detected_mount_dirs)} "
+            f"| total_config={len(merged_mount_dirs)} "
+            f"| durée={elapsed:.3f}s "
+            f"| stats={stats}"
+        )
+
+        return {
+            "message": "Mount dirs détectés avec succès",
+            "detected": detected_mount_dirs,
+            "mount_dirs": merged_mount_dirs,
+            "detected_count": len(detected_mount_dirs),
+            "total_count": len(merged_mount_dirs),
+            "elapsed": round(elapsed, 3),
+            "stats": stats,
+        }
+
+    except Exception as e:
+        logger.error(f"Erreur détection mount dirs: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 watcher_thread = None
 

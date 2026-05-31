@@ -100,6 +100,10 @@ class SymlinkEventHandler(FileSystemEventHandler):
             return
 
         path = Path(event.src_path)
+
+        if path.name.endswith(".retarget.tmp"):
+            return
+
         logger.debug(f"📂 Événement détecté : {event.event_type} -> {path}")
 
         # 🔴 Suppression d’un symlink.

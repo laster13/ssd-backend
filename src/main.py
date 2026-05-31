@@ -230,7 +230,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="SSD",
     summary="A media management system.",
-    version=get_version(),
+    version=str(get_version().get("backend", "0.0.0")),
     redoc_url=None,
     license_info={"name": "GPL-3.0", "url": "https://www.gnu.org/licenses/gpl-3.0.en.html"},
     lifespan=lifespan,

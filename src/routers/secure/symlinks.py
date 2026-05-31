@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Literal
 from pathlib import Path
 from collections import Counter
 from fastapi import APIRouter, HTTPException, Query, Request, Depends, BackgroundTasks, Header
@@ -15,6 +15,7 @@ import docker
 import threading
 import uuid
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
 from integrations.seasonarr.db.database import get_db
 from integrations.seasonarr.core.auth import get_current_user
 from integrations.seasonarr.db.models import User
@@ -57,6 +58,54 @@ router = APIRouter(
 # ⚠️ Ne JAMAIS réassigner cette liste : toujours modifier en place (clear/extend, slices, etc.)
 symlink_store = []
 VALID_MEDIA_EXTS = {".mkv", ".mp4", ".m4v"}
+
+class RetargetPreviewRequest(BaseModel):
+    source_mount: str
+    destination_mount: str
+    check_new_target_exists: bool = False
+
+class RetargetApplyRequest(BaseModel):
+    source_mount: str
+    destination_mount: str
+    expected_count: int
+    confirm: str
+    limit: int | None = None
+
+class RetargetItem(BaseModel):
+    symlink: str
+    manager: str | None = None
+    old_target: str
+    new_target: str
+    relative_path: str
+    target_exists: bool = True
+    new_target_exists: bool | None = None
+
+
+class RetargetPreviewResponse(BaseModel):
+    source_mount: str
+    destination_mount: str
+    count: int
+    items: list[RetargetItem]
+
+class RetargetCountResponse(BaseModel):
+    source_mount: str
+    destination_mount: str
+    count: int
+
+class RetargetApplyError(BaseModel):
+    symlink: str
+    error: str
+    message: str | None = None
+
+
+class RetargetApplyResponse(BaseModel):
+    source_mount: str
+    destination_mount: str
+    expected_count: int
+    current_count: int
+    retargeted_count: int
+    error_count: int
+    errors: list[RetargetApplyError]
 
 client = docker.from_env()
 
@@ -102,6 +151,113 @@ def filter_items_by_folder(items, folder: Optional[str]):
         folder_paths = [(p / folder).resolve() for p in roots]
     return [i for i in items if any(is_relative_to(Path(i["symlink"]), fp) for fp in folder_paths)]
 
+def normalize_mount_path(path: str) -> str:
+    return os.path.normpath(os.path.abspath(os.path.expanduser(str(path).strip())))
+
+
+def path_under_base(path: str, base: str) -> bool:
+    path = normalize_mount_path(path)
+    base = normalize_mount_path(base)
+
+    return path == base or path.startswith(base + os.sep)
+
+
+def build_retarget_path(old_target: str, source_mount: str, destination_mount: str) -> str:
+    old_target = normalize_mount_path(old_target)
+    source_mount = normalize_mount_path(source_mount)
+    destination_mount = normalize_mount_path(destination_mount)
+
+    relative_path = os.path.relpath(old_target, source_mount)
+
+    return os.path.normpath(os.path.join(destination_mount, relative_path))
+
+
+def is_known_mount_dir(path: str) -> bool:
+    candidate = normalize_mount_path(path)
+
+    return any(
+        normalize_mount_path(mount_dir) == candidate
+        for mount_dir in getattr(config_manager.config, "mount_dirs", [])
+        if mount_dir and str(mount_dir).strip()
+    )
+
+def is_symlink_under_links_dirs(symlink_path: str) -> bool:
+    symlink_path = normalize_mount_path(symlink_path)
+
+    for link_dir in getattr(config_manager.config, "links_dirs", []):
+        root = getattr(link_dir, "path", None)
+
+        if not root:
+            continue
+
+        if path_under_base(symlink_path, root):
+            return True
+
+    return False
+
+def build_retarget_items(
+    source_mount: str,
+    destination_mount: str,
+    check_new_target_exists: bool = False,
+) -> list[RetargetItem]:
+    source_mount = normalize_mount_path(source_mount)
+    destination_mount = normalize_mount_path(destination_mount)
+
+    items: list[RetargetItem] = []
+
+    for item in symlink_store:
+        old_target = item.get("target")
+        symlink_path = item.get("symlink")
+
+        if not old_target or not symlink_path:
+            continue
+
+        if not path_under_base(old_target, source_mount):
+            continue
+
+        new_target = build_retarget_path(
+            old_target=old_target,
+            source_mount=source_mount,
+            destination_mount=destination_mount,
+        )
+
+        relative_path = os.path.relpath(
+            normalize_mount_path(old_target),
+            source_mount,
+        )
+
+        new_target_exists = None
+
+        if check_new_target_exists:
+            new_target_exists = os.path.exists(new_target)
+
+        items.append(RetargetItem(
+            symlink=symlink_path,
+            manager=item.get("manager"),
+            old_target=normalize_mount_path(old_target),
+            new_target=new_target,
+            relative_path=relative_path,
+            target_exists=bool(item.get("target_exists", True)),
+            new_target_exists=new_target_exists,
+        ))
+
+    return items
+
+
+def safe_replace_symlink_target(symlink_path: str, new_target: str) -> None:
+    link_path = Path(symlink_path)
+
+    if not link_path.is_symlink():
+        raise RuntimeError(f"Pas un symlink valide: {symlink_path}")
+
+    tmp_link = link_path.with_name(link_path.name + ".retarget.tmp")
+
+    if tmp_link.exists() or tmp_link.is_symlink():
+        tmp_link.unlink()
+
+    os.symlink(new_target, tmp_link)
+    os.replace(tmp_link, link_path)
+
 def normalize_symlink_target(link_path: str, raw_target: str) -> str:
     """
     Normalise la target du symlink sans toucher au filesystem distant.
@@ -124,21 +280,17 @@ def detect_mount_dir_from_target(target: str) -> str | None:
       /mnt/alldebrid/__all__/Movie/file.mkv
       => /mnt/alldebrid/__all__
 
-      /mnt/usenet/.ids/7/a/0/3/0/uuid
-      => /mnt/usenet/.ids
+      /mnt/alldebrid/torrents/Movie/file.mkv
+      => /mnt/alldebrid/torrents
     """
     parts = target.split(os.sep)
 
-    if "__all__" in parts:
-        index = parts.index("__all__")
-        return os.sep.join(parts[: index + 1]) or os.sep
-
-    if ".ids" in parts:
-        index = parts.index(".ids")
-        return os.sep.join(parts[: index + 1]) or os.sep
+    for marker in ("__all__", "torrents"):
+        if marker in parts:
+            index = parts.index(marker)
+            return os.sep.join(parts[: index + 1]) or os.sep
 
     return None
-
 
 def scan_mount_dirs_from_link_dirs() -> tuple[list[str], dict]:
     """
@@ -257,6 +409,203 @@ async def detect_mount_dirs():
 
     except Exception as e:
         logger.error(f"Erreur détection mount dirs: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/retarget/count", response_model=RetargetCountResponse)
+async def count_retarget_symlinks(payload: RetargetPreviewRequest):
+    """
+    Compte les symlinks concernés par une migration de mount.
+    Ne renvoie pas la liste complète.
+    Ne modifie rien.
+    Utilise uniquement symlink_store.
+    """
+    try:
+        source_mount = normalize_mount_path(payload.source_mount)
+        destination_mount = normalize_mount_path(payload.destination_mount)
+
+        if source_mount == destination_mount:
+            raise HTTPException(status_code=400, detail="Source et destination identiques")
+
+        if not is_known_mount_dir(source_mount):
+            raise HTTPException(status_code=400, detail="Source mount inconnue dans mount_dirs")
+
+        if not is_known_mount_dir(destination_mount):
+            raise HTTPException(status_code=400, detail="Destination mount inconnue dans mount_dirs")
+
+        if not symlink_store:
+            raise HTTPException(status_code=409, detail="symlink_store vide. Lance un scan symlinks avant.")
+
+        count = 0
+
+        for item in symlink_store:
+            old_target = item.get("target")
+            symlink_path = item.get("symlink")
+
+            if not old_target or not symlink_path:
+                continue
+
+            if path_under_base(old_target, source_mount):
+                count += 1
+
+        return RetargetCountResponse(
+            source_mount=source_mount,
+            destination_mount=destination_mount,
+            count=count,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur count retarget symlinks: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/retarget/preview", response_model=RetargetPreviewResponse)
+async def preview_retarget_symlinks(payload: RetargetPreviewRequest):
+    """
+    Prépare une migration de targets de symlinks depuis un mount vers un autre.
+    Ne modifie rien.
+    Utilise uniquement symlink_store.
+    """
+    try:
+        source_mount = normalize_mount_path(payload.source_mount)
+        destination_mount = normalize_mount_path(payload.destination_mount)
+
+        if source_mount == destination_mount:
+            raise HTTPException(status_code=400, detail="Source et destination identiques")
+
+        if not is_known_mount_dir(source_mount):
+            raise HTTPException(status_code=400, detail="Source mount inconnue dans mount_dirs")
+
+        if not is_known_mount_dir(destination_mount):
+            raise HTTPException(status_code=400, detail="Destination mount inconnue dans mount_dirs")
+
+        if not symlink_store:
+            raise HTTPException(status_code=409, detail="symlink_store vide. Lance un scan symlinks avant.")
+
+        items = build_retarget_items(
+            source_mount=source_mount,
+            destination_mount=destination_mount,
+            check_new_target_exists=payload.check_new_target_exists,
+        )
+
+        return RetargetPreviewResponse(
+            source_mount=source_mount,
+            destination_mount=destination_mount,
+            count=len(items),
+            items=items,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur preview retarget symlinks: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/retarget/apply", response_model=RetargetApplyResponse)
+async def apply_retarget_symlinks(payload: RetargetApplyRequest):
+    """
+    Applique une migration de targets de symlinks depuis un mount vers un autre.
+    Modifie uniquement les symlinks locaux.
+    Ne touche jamais aux fichiers dans /mnt.
+    """
+    try:
+        source_mount = normalize_mount_path(payload.source_mount)
+        destination_mount = normalize_mount_path(payload.destination_mount)
+
+        if source_mount == destination_mount:
+            raise HTTPException(status_code=400, detail="Source et destination identiques")
+
+        if not is_known_mount_dir(source_mount):
+            raise HTTPException(status_code=400, detail="Source mount inconnue dans mount_dirs")
+
+        if not is_known_mount_dir(destination_mount):
+            raise HTTPException(status_code=400, detail="Destination mount inconnue dans mount_dirs")
+
+        if not symlink_store:
+            raise HTTPException(
+                status_code=409,
+                detail="symlink_store vide. Lance un scan symlinks avant d'appliquer une migration."
+            )
+
+        if payload.expected_count <= 0:
+            raise HTTPException(status_code=400, detail="expected_count doit être supérieur à 0")
+
+        if payload.confirm != "RETARGET":
+            raise HTTPException(
+                status_code=400,
+                detail="Confirmation invalide. Envoie confirm='RETARGET' pour appliquer."
+            )
+
+        items = build_retarget_items(
+            source_mount=source_mount,
+            destination_mount=destination_mount,
+            check_new_target_exists=False,
+        )
+
+        current_count = len(items)
+
+        if current_count != payload.expected_count:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Le nombre de symlinks concernés a changé depuis le preview: "
+                    f"attendu={payload.expected_count}, actuel={current_count}"
+                )
+            )
+
+        if payload.limit is not None:
+            if payload.limit <= 0:
+                raise HTTPException(status_code=400, detail="limit doit être supérieur à 0")
+
+            items = items[:payload.limit]
+
+        retargeted_count = 0
+        errors: list[RetargetApplyError] = []
+
+        store_by_symlink = {
+            item.get("symlink"): item
+            for item in symlink_store
+            if item.get("symlink")
+        }
+
+        for item in items:
+            try:
+                if not is_symlink_under_links_dirs(item.symlink):
+                    raise RuntimeError("symlink_outside_links_dirs")
+
+                if not path_under_base(item.new_target, destination_mount):
+                    raise RuntimeError("new_target_outside_destination_mount")
+
+                safe_replace_symlink_target(item.symlink, item.new_target)
+
+                store_item = store_by_symlink.get(item.symlink)
+                if store_item is not None:
+                    store_item["target"] = item.new_target
+                    store_item["target_exists"] = True
+
+                retargeted_count += 1
+
+            except Exception as e:
+                errors.append(RetargetApplyError(
+                    symlink=item.symlink,
+                    error=e.__class__.__name__,
+                    message=str(e),
+                ))
+
+        return RetargetApplyResponse(
+            source_mount=source_mount,
+            destination_mount=destination_mount,
+            expected_count=payload.expected_count,
+            current_count=current_count,
+            retargeted_count=retargeted_count,
+            error_count=len(errors),
+            errors=errors,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Erreur apply retarget symlinks: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 watcher_thread = None
@@ -3028,7 +3377,7 @@ async def delete_local_symlink(
         # 🗑️ Suppression du symlink
         try:
             candidate_abs.unlink(missing_ok=True)
-            logger.info(f"🗑️ Symlink supprimé : {candidate_abs}")
+            logger.info(f"  ️ Symlink supprimé : {candidate_abs}")
         except Exception as e:
             logger.warning(f"⚠️ Impossible de supprimer le symlink {candidate_abs} : {e}")
             raise HTTPException(status_code=500, detail=f"Impossible de supprimer le symlink : {e}")

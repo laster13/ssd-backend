@@ -5,19 +5,42 @@ from loguru import logger
 
 
 def _read_version_file(path: Path, label: str) -> str:
+    """
+    Lit un fichier version.json au format :
+    {
+      "version": "1.0.9"
+    }
+
+    Retourne toujours une version exploitable par la logique de mise à jour.
+    Si le fichier est absent ou invalide, retourne "0.0.0".
+    """
     if not path.exists():
         logger.warning(f"⚠️ Fichier {label}/version.json introuvable à {path}")
-        return "—"
+        return "0.0.0"
 
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        return data.get("version", "—")
+        version = data.get("version", "0.0.0")
+
+        if not isinstance(version, str):
+            logger.warning(
+                f"⚠️ Version invalide dans {label}/version.json : {version}"
+            )
+            return "0.0.0"
+
+        version = version.strip()
+
+        if not version:
+            logger.warning(f"⚠️ Version vide dans {label}/version.json")
+            return "0.0.0"
+
+        return version
 
     except Exception as e:
         logger.error(f"❌ Erreur lecture version {label} depuis {path} : {e}")
-        return "—"
+        return "0.0.0"
 
 
 def get_version() -> dict:
@@ -54,9 +77,8 @@ def get_version() -> dict:
 
     except Exception as e:
         logger.error(f"❌ Erreur lors de la lecture des fichiers version.json : {e}")
-
         return {
-            "backend": "—",
-            "frontend": "—",
-            "saison_frontend": "—",
+            "backend": "0.0.0",
+            "frontend": "0.0.0",
+            "saison_frontend": "0.0.0",
         }

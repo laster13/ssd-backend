@@ -32,6 +32,7 @@ auto_seasonarr_missing_scheduler_started = False
 auto_seasonarr_missing_scheduler_lock = threading.Lock()
 
 symlink_watcher_started = False
+symlink_watcher_starting = False
 symlink_watcher_lock = threading.Lock()
 
 USER = os.getenv("USER") or os.getlogin()
@@ -1656,7 +1657,7 @@ def start_auto_seasonarr_missing_scheduler():
 
 def start_symlink_watcher():
     """
-    🛰️ Watcher principal des symlinks :
+    ��️ Watcher principal des symlinks :
     - Charge ou construit le cache Radarr AVANT le scan initial.
     - Fait le scan initial avec les infos Radarr disponibles.
     - Démarre les watchers immédiatement après le scan.
@@ -1664,12 +1665,18 @@ def start_symlink_watcher():
     - Lance le monitor léger seulement après activation des watchers.
     - Lance Decypharr/orphans ensuite en arrière-plan.
     """
-    global symlink_watcher_started
+    global symlink_watcher_started, symlink_watcher_starting
 
     with symlink_watcher_lock:
         if symlink_watcher_started:
             logger.warning("⏭️ Symlink watcher déjà démarré, lancement ignoré")
             return
+
+        if symlink_watcher_starting:
+            logger.warning("⏭️ Symlink watcher déjà en cours de démarrage, lancement ignoré")
+            return
+
+        symlink_watcher_starting = True
 
     from routers.secure.symlinks import scan_symlinks, symlink_store
     from watchdog.observers import Observer
@@ -1685,6 +1692,10 @@ def start_symlink_watcher():
 
         if not links_dirs:
             logger.warning("⏸️ Aucun links_dirs configuré")
+
+            with symlink_watcher_lock:
+                symlink_watcher_starting = False
+
             return
 
         # --- 1️⃣ Cache Radarr obligatoire AVANT le scan initial ---
@@ -1772,10 +1783,15 @@ def start_symlink_watcher():
                 "🚨 Aucun watcher symlink n'a pu démarrer. "
                 "Le lancement sera retenté au prochain appel."
             )
+
+            with symlink_watcher_lock:
+                symlink_watcher_starting = False
+
             return
 
         with symlink_watcher_lock:
             symlink_watcher_started = True
+            symlink_watcher_starting = False
 
         duration_watchers = round(time.time() - start_watchers, 2)
 
@@ -1969,6 +1985,7 @@ def start_symlink_watcher():
 
         with symlink_watcher_lock:
             symlink_watcher_started = False
+            symlink_watcher_starting = False
 
         logger.warning("✅ Watchers arrêtés proprement")
 

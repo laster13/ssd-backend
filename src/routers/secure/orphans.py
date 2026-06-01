@@ -389,6 +389,46 @@ async def perform_deletion(instance: str, dry_run: bool = False):
     dry_label = "DRY-RUN" if dry_run else "SUPPRESSION"
     logger.info(f"[{instance}] Demarrage {dry_label} en tache de fond...")
 
+    # ═══════════════════════════════════════════════════════════
+    # GARDE-FOU SUPPRESSION MASSIVE
+    # ═══════════════════════════════════════════════════════════
+    stats = data.get("stats", {}) or {}
+    total_sources = int(stats.get("sources", 0) or 0)
+    orphan_count = len(orphans)
+
+    max_orphan_delete_ratio = 0.10  # 10 %
+
+    if not dry_run and total_sources > 0:
+        orphan_ratio = orphan_count / total_sources
+
+        if orphan_ratio > max_orphan_delete_ratio:
+            warning_message = (
+                f"[{instance}] 🚨 SUPPRESSION BLOQUEE PAR SECURITE: "
+                f"{orphan_count} orphelin(s) detecte(s) sur {total_sources} source(s) "
+                f"({orphan_ratio:.2%}), seuil autorise: {max_orphan_delete_ratio:.0%}. "
+                f"Aucune suppression effectuee. Verifie les mounts, les symlinks, "
+                f"Decypharr et la configuration avant de relancer."
+            )
+
+            logger.warning(warning_message)
+
+            return {
+                "instance": instance,
+                "dry_run": dry_run,
+                "deleted": 0,
+                "not_found": 0,
+                "skipped": orphan_count,
+                "errors": 0,
+                "blocked": True,
+                "reason": "orphan_ratio_above_safety_threshold",
+                "orphan_count": orphan_count,
+                "total_sources": total_sources,
+                "orphan_ratio": orphan_ratio,
+                "threshold": max_orphan_delete_ratio,
+                "message": warning_message,
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            }
+
     if not api_key:
         logger.error(f"[{instance}] Cle API AllDebrid manquante.")
         return {

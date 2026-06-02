@@ -9,10 +9,15 @@ from fastapi import HTTPException
 from loguru import logger
 import logging
 from program.utils.text_utils import normalize_name, clean_movie_name, clean_series_name
+import os
 
 
 RADARR_PORT = 7878
 SONARR_PORT = 8989
+
+RADARR_HOST = os.getenv("RADARR_HOST", "radarr")
+SONARR_HOST = os.getenv("SONARR_HOST", "sonarr")
+
 CONFIG_PATH = Path("data/config.json")
 logger = logging.getLogger(__name__)
 
@@ -150,10 +155,10 @@ class RadarrService:
     def __init__(self):
         config = load_config()
         self.api_key = config.get("radarr_api_key")
-        self.host = config.get("radarr_host", "localhost")
+        self.host = config.get("radarr_host") or RADARR_HOST
         self.base_url = f"http://{self.host}:{RADARR_PORT}/api/v3"
         self.headers = {"X-Api-Key": self.api_key}
-        self.profile_cache = {}  # { imdb_id: qualityProfileId }
+        self.profile_cache = {}
 
     def cache_profile(self, imdb_id: str, profile_id: int):
         """🧠 Sauvegarde le profil qualité en mémoire."""
@@ -335,8 +340,8 @@ class SonarrService:
     def __init__(self):
         config = load_config()
         self.api_key = config.get("sonarr_api_key")
-        self.host = config.get("sonarr_host", "localhost")  # Peut être en dur si localhost toujours
-        self.base_url = f"http://{self.host}:8989/api/v3"
+        self.host = config.get("sonarr_host") or SONARR_HOST
+        self.base_url = f"http://{self.host}:{SONARR_PORT}/api/v3"
         self.headers = {"X-Api-Key": self.api_key}
 
     def get_series_by_clean_title(self, raw_name: str):

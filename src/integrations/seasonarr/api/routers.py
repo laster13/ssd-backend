@@ -259,7 +259,7 @@ async def create_sonarr_instance(
     db: Session = Depends(get_db)
 ):
     # ⚡ On ignore l’URL envoyée par le frontend
-    sonarr_url = "http://172.17.0.1:8989"
+    sonarr_url = os.getenv("SONARR_URL", "http://sonarr:8989")
     user_api_key = instance_data.api_key
 
     if not await test_sonarr_connection(sonarr_url, user_api_key):

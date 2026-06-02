@@ -4,7 +4,7 @@ from sqlalchemy.orm import sessionmaker
 import os
 
 # --- DB URL (par défaut SQLite mais tu peux mettre PostgreSQL/MySQL via env var) ---
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./seasonarr.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:////app/data/seasonarr.db")
 
 # --- Engine ---
 if DATABASE_URL.startswith("sqlite"):

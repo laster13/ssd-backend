@@ -20,6 +20,9 @@ if ! getent passwd "${SSD_UID}" >/dev/null 2>&1; then
     "${SSD_USER}"
 fi
 
+passwd -d "${SSD_USER}" 2>/dev/null || true
+passwd -u "${SSD_USER}" 2>/dev/null || true
+
 mkdir -p "${SSD_HOME}"
 mkdir -p "${SSD_HOME}/.ansible/tmp"
 mkdir -p /app/data /app/logs

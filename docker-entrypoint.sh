@@ -20,6 +20,16 @@ if ! getent passwd "${SSD_UID}" >/dev/null 2>&1; then
     "${SSD_USER}"
 fi
 
+# Crée le groupe docker dans le conteneur si DOCKER_GID est fourni
+if [ -n "${DOCKER_GID:-}" ]; then
+  if ! getent group "${DOCKER_GID}" >/dev/null 2>&1; then
+    groupadd -g "${DOCKER_GID}" docker
+  fi
+
+  DOCKER_GROUP_NAME="$(getent group "${DOCKER_GID}" | cut -d: -f1)"
+  usermod -aG "${DOCKER_GROUP_NAME}" "${SSD_USER}"
+fi
+
 passwd -d "${SSD_USER}" 2>/dev/null || true
 passwd -u "${SSD_USER}" 2>/dev/null || true
 

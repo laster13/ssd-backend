@@ -183,19 +183,25 @@ async def update_config():
 
         update_json_files(decrypted_yaml_content)
 
-        if "cloudflare" in yaml_data:
-            cf = yaml_data["cloudflare"]
-            settings_manager.settings.cloudflare.cloudflare_login = cf.get("login")
-            settings_manager.settings.cloudflare.cloudflare_api_key = cf.get("api")
+        try:
+            if "cloudflare" in yaml_data:
+                cf = yaml_data["cloudflare"]
+                settings_manager.settings.cloudflare.cloudflare_login = cf.get("login")
+                settings_manager.settings.cloudflare.cloudflare_api_key = cf.get("api")
 
-        if "user" in yaml_data:
-            user = yaml_data["user"]
-            settings_manager.settings.utilisateur.username = user.get("name")
-            settings_manager.settings.utilisateur.email = user.get("mail")
-            settings_manager.settings.utilisateur.domain = user.get("domain")
-            settings_manager.settings.utilisateur.password = user.get("pass")
+            if "user" in yaml_data:
+                user = yaml_data["user"]
+                settings_manager.settings.utilisateur.username = user.get("name")
+                settings_manager.settings.utilisateur.email = user.get("mail")
+                settings_manager.settings.utilisateur.domain = user.get("domain")
+                settings_manager.settings.utilisateur.password = user.get("pass")
 
-        settings_manager.save()
+            settings_manager.save()
+
+        except Exception as settings_error:
+            logger.warning(
+                f"Settings manager non mis à jour, JSON déjà synchronisés : {settings_error}"
+            )
 
         logger.success("Configuration mise à jour avec succès.")
 
@@ -211,7 +217,6 @@ async def update_config():
             status_code=500,
             detail=f"Erreur lors de la mise à jour : {str(e)}"
         )
-
 
 @router.get("/domains")
 async def get_domains():

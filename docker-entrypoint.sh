@@ -36,4 +36,4 @@ chmod 0440 "/etc/sudoers.d/${SSD_USER}"
 export USER="${SSD_USER}"
 export HOME="${SSD_HOME}"
 
-exec gosu "${SSD_UID}:${SSD_GID}" "$@"
+exec gosu "${SSD_USER}" "$@"

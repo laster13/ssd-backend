@@ -13,8 +13,10 @@ from program.settings.manager import settings_manager
 
 USER = os.getenv("SSD_USER") or os.getenv("USER") or os.getlogin()
 
-FRONTEND_CONTAINER = os.getenv("FRONTEND_CONTAINER", "ssd-frontend")
-SCRIPTS_DIR = os.getenv("SCRIPTS_DIR", "/app/scripts")
+SCRIPTS_DIR = os.getenv(
+    "SCRIPTS_DIR",
+    f"/home/{USER}/seedbox/docker/{USER}/projet-ssd/ssd-frontend/scripts"
+)
 
 YAML_PATH = os.getenv(
     "ANSIBLE_VARS",
@@ -33,8 +35,9 @@ BACKEND_JSON_PATH = os.getenv(
 
 FRONTEND_JSON_PATH = os.getenv(
     "FRONTEND_SETTINGS_PATH",
-    "/shared/ssd-frontend/static/settings.json"
+    f"/home/{USER}/seedbox/docker/{USER}/projet-ssd/ssd-frontend/static/settings.json"
 )
+
 
 router = APIRouter(
     prefix="/scripts",
@@ -73,43 +76,15 @@ async def run_script(
 
     script_path = os.path.join(SCRIPTS_DIR, f"{script_name}.sh")
 
-    logger.info(
-        f"Exécution du script dans {FRONTEND_CONTAINER}: {script_path} avec label: {label}"
-    )
+    if not os.path.isfile(script_path):
+        logger.warning(f"Script non trouvé: {script_path}")
+        raise HTTPException(status_code=404, detail=f"Script non trouvé: {script_name}.sh")
+
+    logger.info(f"Exécution du script : {script_path} avec label: {label}")
 
     def stream_logs():
         try:
-            check_args = [
-                "docker",
-                "exec",
-                FRONTEND_CONTAINER,
-                "test",
-                "-f",
-                script_path
-            ]
-
-            check = subprocess.run(
-                check_args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-
-            if check.returncode != 0:
-                logger.warning(
-                    f"Script non trouvé dans {FRONTEND_CONTAINER}: {script_path}"
-                )
-                yield f"data: Script non trouvé: {script_name}.sh\n\n"
-                yield "event: end\ndata: Fin du script\n\n"
-                return
-
-            args = [
-                "docker",
-                "exec",
-                FRONTEND_CONTAINER,
-                "bash",
-                script_path
-            ]
+            args = ["bash", script_path]
 
             if label:
                 args.append(label)
@@ -217,6 +192,7 @@ async def update_config():
             status_code=500,
             detail=f"Erreur lors de la mise à jour : {str(e)}"
         )
+
 
 @router.get("/domains")
 async def get_domains():

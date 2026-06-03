@@ -31,6 +31,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     apache2-utils \
     procps \
+    passwd \
+    gosu \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sfn /usr/local/bin/python3 /usr/bin/python3
 
@@ -63,9 +65,14 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt \
 
 COPY . .
 
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
 RUN mkdir -p /app/data /app/logs \
-    && ln -sfn /app /ssd-backend
+    && ln -sfn /app /ssd-backend \
+    && chmod +x /usr/local/bin/docker-entrypoint.sh
 
 EXPOSE 8080
+
+ENTRYPOINT ["docker-entrypoint.sh"]
 
 CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8080"]

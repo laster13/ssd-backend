@@ -29,4 +29,4 @@ env/
 # IDE / OS
 .DS_Store
 .idea/
-.vscode/
+.vscode/docker-compose.yml

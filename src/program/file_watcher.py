@@ -1445,9 +1445,7 @@ def _launch_radarr_index(force: bool):
                     f"{index_count} clés, {catalog_count} films"
                 )
 
-                if catalog_count > 0:
-                    refresh_radarr_symlink_metadata()
-                else:
+                if catalog_count <= 0:
                     logger.warning("⚠️ Rebuild Radarr terminé mais catalogue vide")
 
             except Exception as e:
@@ -1552,63 +1550,6 @@ def _radarr_config_looks_ready() -> bool:
         logger.debug(f"⚠️ Impossible de vérifier la config Radarr: {e}")
         return False
 
-def refresh_radarr_symlink_metadata():
-    """
-    Ré-enrichit les symlinks Radarr déjà présents dans symlink_store
-    une fois que le cache Radarr devient disponible.
-    """
-    try:
-        from routers.secure.symlinks import symlink_store
-
-        updated = 0
-
-        for item in list(symlink_store):
-            if item.get("manager") != "radarr":
-                continue
-
-            symlink_path = item.get("symlink")
-            if not symlink_path:
-                continue
-
-            extra = enrich_from_radarr_index(
-                Path(symlink_path),
-                allow_fallback=True,
-            )
-
-            if not extra:
-                continue
-
-            allowed_extra = {}
-
-            for key in ("title", "tmdbId", "imdbId", "imdb_id", "year"):
-                if key in extra:
-                    allowed_extra[key] = extra[key]
-
-            if "imdbId" in allowed_extra and "imdb_id" not in allowed_extra:
-                allowed_extra["imdb_id"] = allowed_extra["imdbId"]
-
-            if "imdb_id" in allowed_extra and "imdbId" not in allowed_extra:
-                allowed_extra["imdbId"] = allowed_extra["imdb_id"]
-
-            item.update(allowed_extra)
-            updated += 1
-
-        logger.success(f"✅ Metadata Radarr rafraîchies sur {updated} symlink(s)")
-
-        sse_manager.publish_event(
-            "symlink_update",
-            {
-                "event": "radarr_cache_ready",
-                "action": "refresh",
-                "message": "Cache Radarr prêt, metadata symlinks rafraîchies",
-                "updated": updated,
-            },
-        )
-
-    except Exception as e:
-        logger.error(f"💥 Erreur refresh metadata Radarr: {e}", exc_info=True)
-
-
 def start_radarr_cache_retry_scheduler():
     """
     Relance périodiquement la construction du cache Radarr
@@ -1651,7 +1592,6 @@ def start_radarr_cache_retry_scheduler():
 
                     if ok:
                         logger.success("✅ Cache Radarr construit après configuration")
-                        refresh_radarr_symlink_metadata()
                         return
 
                     time.sleep(delay)

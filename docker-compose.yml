@@ -1,0 +1,84 @@
+services:
+  ssd-backend:
+    image: ghcr.io/laster13/ssd-backend:latest
+    container_name: ssd-backend
+    restart: unless-stopped
+    group_add:
+      - "${DOCKER_GID}"
+
+    env_file:
+      - .env
+
+    environment:
+      # Utilisateur principal
+      SSD_USER: ${SSD_USER}
+      SSD_UID: ${SSD_UID}
+      SSD_GID: ${SSD_GID}
+      SSD_DOMAIN: ${SSD_DOMAIN}
+
+      # Compatibilité scripts SSDv2
+      USER: ${SSD_USER}
+      HOME: /home/${SSD_USER}
+
+      # Obligatoire car generique.yml utilise MYUID/MYGID
+      MYUID: ${SSD_UID}
+      MYGID: ${SSD_GID}
+      DATABASE_URL: ${DATABASE_URL}
+
+      # Backend Python
+      PYTHONPATH: /app/src
+      PYTHONUNBUFFERED: "1"
+      FORCE_COLOR: "1"
+
+      # Ansible / Vault
+      ANSIBLE_VAULT_PASSWORD_FILE: /home/${SSD_USER}/.vault_pass
+      ANSIBLE_INVENTORY: /home/${SSD_USER}/.ansible/inventories/local
+      ANSIBLE_VARS: /home/${SSD_USER}/.ansible/inventories/group_vars/all.yml
+      ANSIBLE_PYTHON_INTERPRETER: /usr/local/bin/python3
+      ANSIBLE_LOCALHOST_WARNING: "False"
+      ANSIBLE_INVENTORY_UNPARSED_WARNING: "False"
+      ANSIBLE_ACTION_WARNINGS: "False"
+      ACTION_WARNINGS: "False"
+      ANSIBLE_COMMAND_WARNINGS: "False"
+      ANSIBLE_CONNECTION: local
+      ANSIBLE_REMOTE_TEMP: /tmp/.ansible/tmp
+      ANSIBLE_LOCAL_TEMP: /tmp/.ansible/tmp
+
+      # SSDv2
+      SETTINGS_SOURCE: ${SETTINGS_SOURCE}
+      SETTINGS_STORAGE: ${SETTINGS_STORAGE}
+
+      # ARR
+      RADARR_HOST: ${RADARR_HOST}
+      SONARR_HOST: ${SONARR_HOST}
+      SONARR_URL: ${SONARR_URL}
+
+      TZ: ${TZ}
+
+    ports:
+      - "8080:8080"
+
+    networks:
+      - traefik_proxy
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+      - /home/${SSD_USER}/.ansible:/home/${SSD_USER}/.ansible
+      - /home/${SSD_USER}/.vault_pass:/home/${SSD_USER}/.vault_pass:ro
+
+      - /home/${SSD_USER}/seedbox:/home/${SSD_USER}/seedbox
+      - /home/${SSD_USER}/seedbox-compose:/home/${SSD_USER}/seedbox-compose
+      - /home/${SSD_USER}/seedbox/docker/${SSD_USER}/projet-ssd/ssd-frontend:/ssd-frontend:ro
+      - /home/${SSD_USER}/seedbox/docker/${SSD_USER}/projet-ssd/saison-frontend:/saison-frontend:ro
+
+      - /home/${SSD_USER}/Medias:/home/${SSD_USER}/Medias
+      - /home/${SSD_USER}/Backups:/home/${SSD_USER}/Backups
+      - /mnt/alldebrid/__all__:/mnt/alldebrid/__all__:rshared
+
+      - ./data:/app/data
+      - ./logs:/app/logs
+
+networks:
+  traefik_proxy:
+    external: true

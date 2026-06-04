@@ -69,9 +69,28 @@ class YAMLFileEventHandler(FileSystemEventHandler):
                 decrypted_yaml_content = result.stdout
                 update_json_files(decrypted_yaml_content)
 
+                try:
+                    config_manager.load()
+
+                    if _radarr_config_looks_ready():
+                        logger.info(
+                            "🎯 Config Radarr mise à jour, rebuild cache Radarr immédiat"
+                        )
+                        _launch_radarr_index(force=True)
+                    else:
+                        logger.info(
+                            "⏳ Config Radarr mise à jour mais encore incomplète"
+                        )
+                        start_radarr_cache_retry_scheduler()
+
+                except Exception as e:
+                    logger.error(
+                        f"💥 Impossible de déclencher le rebuild Radarr après update YAML: {e}",
+                        exc_info=True,
+                    )
+
             except Exception as e:
                 logger.exception(f"💥 Exception YAML: {e}")
-
 
 def start_yaml_watcher():
     logger.info("🛰️ YAML watcher démarré")
@@ -443,6 +462,7 @@ class SymlinkEventHandler(FileSystemEventHandler):
             deleted_extra = get_extra_dict(similar_deleted) if similar_deleted else {}
 
             created_after_broken = False
+            created_after_replacement = False
             created_after_auto_repair = False
             repaired_activity_created = False
 
@@ -491,14 +511,13 @@ class SymlinkEventHandler(FileSystemEventHandler):
                     sse_manager.publish_event(
                         "symlink_update",
                         {
-                            "event": "symlink_recreated_same_path",
-                            "action": "updated",
+                            "event": "symlink_repaired",
+                            "action": "repaired",
                             "old_path": old_path,
                             "new_path": symlink_path_str,
                             "path": symlink_path_str,
                             "manager": manager,
-                            "message": f"Symlink recréé au même chemin : {symlink_path_str}",
-                            "replaced": True,
+                            "message": f"Symlink réparé par recréation au même chemin : {symlink_path_str}",                            "replaced": True,
                             "replaced_at": now.isoformat(),
                             "match_reason": match_reason,
                             "same_path": True,
@@ -506,6 +525,7 @@ class SymlinkEventHandler(FileSystemEventHandler):
                     )
 
                 else:
+                    created_after_replacement = True
                     replacement_extra = {
                         "old_path": old_path,
                         "new_path": symlink_path_str,
@@ -650,7 +670,7 @@ class SymlinkEventHandler(FileSystemEventHandler):
 
                 logger.info(f"🧩 Symlink brisé réparé et nettoyé en base : {symlink_path}")
 
-            if not created_after_broken:
+            if not created_after_broken and not created_after_replacement:
                 db.add(SystemActivity(
                     event="symlink_added",
                     action="created",
@@ -662,7 +682,7 @@ class SymlinkEventHandler(FileSystemEventHandler):
 
             db.commit()
 
-            if not created_after_broken:
+            if not created_after_broken and not created_after_replacement:
                 sse_manager.publish_event(
                     "symlink_update",
                     {
@@ -675,9 +695,16 @@ class SymlinkEventHandler(FileSystemEventHandler):
                     },
                 )
 
+            if created_after_broken:
+                buffer_action = "repaired"
+            elif created_after_replacement:
+                buffer_action = "replaced"
+            else:
+                buffer_action = "created"
+
             with buffer_lock:
                 symlink_events_buffer.append({
-                    "action": "repaired" if created_after_broken else "created",
+                    "action": buffer_action,
                     "symlink": symlink_path_str,
                     "path": symlink_path_str,
                     "target": item.get("target"),
@@ -1418,19 +1445,23 @@ def _launch_radarr_index(force: bool):
                     f"{index_count} clés, {catalog_count} films"
                 )
 
+                if catalog_count > 0:
+                    refresh_radarr_symlink_metadata()
+                else:
+                    logger.warning("⚠️ Rebuild Radarr terminé mais catalogue vide")
+
             except Exception as e:
                 logger.error(f"💥 Erreur rebuild Radarr: {e}", exc_info=True)
 
     threading.Thread(target=runner, daemon=True).start()
 
-def _ensure_radarr_index_ready(force: bool = False):
+def _ensure_radarr_index_ready(force: bool = False) -> bool:
     """
-    Charge ou reconstruit le cache Radarr de maniere bloquante.
+    Charge ou reconstruit le cache Radarr de manière bloquante.
 
-    Important:
-    - au premier lancement, si le cache disque n'existe pas, on attend la construction complete
-    - si le cache disque existe et est valide, le chargement est tres rapide
-    - le scan initial des symlinks ne doit demarrer qu'apres cette fonction
+    Retourne :
+    - True si le cache Radarr contient au moins un film
+    - False si la config Radarr est absente/invalide ou si le build échoue
     """
     if _radarr_building.locked():
         logger.info("⏳ Cache Radarr deja en construction, attente de la fin...")
@@ -1442,11 +1473,18 @@ def _ensure_radarr_index_ready(force: bool = False):
             index_count = len(radarr_cache._radarr_index)
             catalog_count = len(radarr_cache._radarr_catalog)
 
-        logger.success(
-            f"✅ Cache Radarr pret apres attente: "
+        if catalog_count > 0:
+            logger.success(
+                f"✅ Cache Radarr pret apres attente: "
+                f"{index_count} cles, {catalog_count} films"
+            )
+            return True
+
+        logger.warning(
+            f"⚠️ Cache Radarr vide apres attente: "
             f"{index_count} cles, {catalog_count} films"
         )
-        return
+        return False
 
     with _radarr_building:
         start = time.time()
@@ -1465,16 +1503,170 @@ def _ensure_radarr_index_ready(force: bool = False):
                 index_count = len(radarr_cache._radarr_index)
                 catalog_count = len(radarr_cache._radarr_catalog)
 
+            if catalog_count <= 0:
+                logger.warning(
+                    f"⚠️ Cache Radarr vide apres build: "
+                    f"{index_count} cles, {catalog_count} films | duree={duration}s"
+                )
+                return False
+
             logger.success(
                 f"✅ Cache Radarr pret avant scan initial: "
                 f"{index_count} cles, {catalog_count} films | duree={duration}s"
             )
+            return True
 
         except Exception as e:
             logger.error(
                 f"💥 Erreur chargement cache Radarr avant scan initial: {e}",
                 exc_info=True,
             )
+            return False
+
+radarr_cache_retry_started = False
+radarr_cache_retry_lock = threading.Lock()
+
+def _is_radarr_cache_ready() -> bool:
+    with radarr_cache._radarr_idx_lock:
+        return len(radarr_cache._radarr_catalog) > 0
+
+
+def _radarr_config_looks_ready() -> bool:
+    """
+    Vérifie si la configuration Radarr semble exploitable.
+
+    RadarrService utilise :
+    - radarr_api_key depuis data/config.json
+    - radarr_host depuis data/config.json si présent
+    - sinon RADARR_HOST
+    - sinon "radarr"
+    """
+    try:
+        cfg = config_manager.config
+
+        radarr_api_key = getattr(cfg, "radarr_api_key", None)
+
+        return bool(radarr_api_key)
+
+    except Exception as e:
+        logger.debug(f"⚠️ Impossible de vérifier la config Radarr: {e}")
+        return False
+
+def refresh_radarr_symlink_metadata():
+    """
+    Ré-enrichit les symlinks Radarr déjà présents dans symlink_store
+    une fois que le cache Radarr devient disponible.
+    """
+    try:
+        from routers.secure.symlinks import symlink_store
+
+        updated = 0
+
+        for item in list(symlink_store):
+            if item.get("manager") != "radarr":
+                continue
+
+            symlink_path = item.get("symlink")
+            if not symlink_path:
+                continue
+
+            extra = enrich_from_radarr_index(
+                Path(symlink_path),
+                allow_fallback=True,
+            )
+
+            if not extra:
+                continue
+
+            allowed_extra = {}
+
+            for key in ("title", "tmdbId", "imdbId", "imdb_id", "year"):
+                if key in extra:
+                    allowed_extra[key] = extra[key]
+
+            if "imdbId" in allowed_extra and "imdb_id" not in allowed_extra:
+                allowed_extra["imdb_id"] = allowed_extra["imdbId"]
+
+            if "imdb_id" in allowed_extra and "imdbId" not in allowed_extra:
+                allowed_extra["imdbId"] = allowed_extra["imdb_id"]
+
+            item.update(allowed_extra)
+            updated += 1
+
+        logger.success(f"✅ Metadata Radarr rafraîchies sur {updated} symlink(s)")
+
+        sse_manager.publish_event(
+            "symlink_update",
+            {
+                "event": "radarr_cache_ready",
+                "action": "refresh",
+                "message": "Cache Radarr prêt, metadata symlinks rafraîchies",
+                "updated": updated,
+            },
+        )
+
+    except Exception as e:
+        logger.error(f"💥 Erreur refresh metadata Radarr: {e}", exc_info=True)
+
+
+def start_radarr_cache_retry_scheduler():
+    """
+    Relance périodiquement la construction du cache Radarr
+    tant que la config n'était pas prête au premier lancement.
+    """
+    global radarr_cache_retry_started
+
+    with radarr_cache_retry_lock:
+        if radarr_cache_retry_started:
+            logger.debug("⏭️ Retry cache Radarr déjà démarré")
+            return
+
+        radarr_cache_retry_started = True
+
+    def loop():
+        global radarr_cache_retry_started
+
+        try:
+            delay = 30
+            max_delay = 300
+
+            while True:
+                try:
+                    config_manager.load()
+
+                    if _is_radarr_cache_ready():
+                        logger.info("✅ Cache Radarr déjà prêt, arrêt du retry scheduler")
+                        return
+
+                    if not _radarr_config_looks_ready():
+                        logger.info(
+                            f"⏳ Config Radarr incomplète, nouveau test dans {delay}s"
+                        )
+                        time.sleep(delay)
+                        delay = min(max_delay, delay * 2)
+                        continue
+
+                    logger.info("🎯 Config Radarr détectée, rebuild immédiat du cache")
+                    ok = _ensure_radarr_index_ready(force=True)
+
+                    if ok:
+                        logger.success("✅ Cache Radarr construit après configuration")
+                        refresh_radarr_symlink_metadata()
+                        return
+
+                    time.sleep(delay)
+                    delay = min(max_delay, delay * 2)
+
+                except Exception as e:
+                    logger.error(f"💥 Retry cache Radarr en erreur: {e}", exc_info=True)
+                    time.sleep(delay)
+                    delay = min(max_delay, delay * 2)
+
+        finally:
+            with radarr_cache_retry_lock:
+                radarr_cache_retry_started = False
+
+    threading.Thread(target=loop, daemon=True).start()
 
 def start_auto_seasonarr_missing_scheduler():
     """
@@ -1698,12 +1890,23 @@ def start_symlink_watcher():
 
             return
 
-        # --- 1️⃣ Cache Radarr obligatoire AVANT le scan initial ---
-        _ensure_radarr_index_ready(force=False)
+        # --- 1️⃣ Cache Radarr prioritaire AVANT le scan initial ---
+        radarr_ready = _ensure_radarr_index_ready(force=False)
 
-        # --- 2️⃣ Scan initial avec cache Radarr prêt ---
+        if not radarr_ready:
+            logger.warning(
+                "⚠️ Cache Radarr indisponible au démarrage. "
+                "Le scan initial continue sans enrichissement Radarr complet. "
+                "Un retry sera lancé jusqu'à ce que la configuration Radarr soit valide."
+            )
+            start_radarr_cache_retry_scheduler()
+
+        # --- 2️⃣ Scan initial avec cache Radarr si disponible ---
         try:
-            logger.info("🔍 Scan initial des symlinks avec cache Radarr prêt...")
+            if radarr_ready:
+                logger.info("🔍 Scan initial des symlinks avec cache Radarr prêt...")
+            else:
+                logger.info("🔍 Scan initial des symlinks sans cache Radarr complet...")
 
             start_scan = time.time()
             symlinks_data = scan_symlinks()
@@ -3064,6 +3267,21 @@ def start_replacement_cleanup_task(interval_hours: float = 1.0, expiry_hours: in
                         deleted.replaced_at = None
                         deleted.updated_at = now
                         marked_non_replaced += 1
+
+                        try:
+                            sse_manager.publish_event(
+                                "symlink_update",
+                                {
+                                    "event": "symlink_not_replaced",
+                                    "action": "not_replaced",
+                                    "path": deleted.path,
+                                    "manager": deleted.manager or "unknown",
+                                    "replaced": False,
+                                    "message": f"Symlink supprimé non remplacé : {deleted.path}",
+                                },
+                            )
+                        except Exception:
+                            pass
 
                 db.commit()
 

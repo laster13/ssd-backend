@@ -1537,16 +1537,13 @@ def _radarr_config_looks_ready() -> bool:
 
     RadarrService utilise :
     - radarr_api_key depuis data/config.json
-    - radarr_host depuis data/config.json si présent
+    - radarr_host si présent
     - sinon RADARR_HOST
     - sinon "radarr"
     """
     try:
         cfg = config_manager.config
-
-        radarr_api_key = getattr(cfg, "radarr_api_key", None)
-
-        return bool(radarr_api_key)
+        return bool(getattr(cfg, "radarr_api_key", None))
 
     except Exception as e:
         logger.debug(f"⚠️ Impossible de vérifier la config Radarr: {e}")
@@ -1890,23 +1887,12 @@ def start_symlink_watcher():
 
             return
 
-        # --- 1️⃣ Cache Radarr prioritaire AVANT le scan initial ---
-        radarr_ready = _ensure_radarr_index_ready(force=False)
-
-        if not radarr_ready:
-            logger.warning(
-                "⚠️ Cache Radarr indisponible au démarrage. "
-                "Le scan initial continue sans enrichissement Radarr complet. "
-                "Un retry sera lancé jusqu'à ce que la configuration Radarr soit valide."
-            )
-            start_radarr_cache_retry_scheduler()
+        # --- 1️⃣ Cache Radarr comme avant : tentative unique avant scan initial ---
+        _ensure_radarr_index_ready(force=False)
 
         # --- 2️⃣ Scan initial avec cache Radarr si disponible ---
         try:
-            if radarr_ready:
-                logger.info("🔍 Scan initial des symlinks avec cache Radarr prêt...")
-            else:
-                logger.info("🔍 Scan initial des symlinks sans cache Radarr complet...")
+            logger.info("🔍 Scan initial des symlinks avec cache Radarr si disponible...")
 
             start_scan = time.time()
             symlinks_data = scan_symlinks()

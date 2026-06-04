@@ -1592,6 +1592,24 @@ def start_radarr_cache_retry_scheduler():
 
                     if ok:
                         logger.success("✅ Cache Radarr construit après configuration")
+
+                        try:
+                            from routers.secure.symlinks import trigger_scan
+
+                            result = asyncio.run(trigger_scan())
+
+                            logger.success(
+                                f"✅ Scan rapide lancé après cache Radarr | "
+                                f"count={result.get('count')} | "
+                                f"restored_broken={result.get('restored_broken')}"
+                            )
+
+                        except Exception as e:
+                            logger.error(
+                                f"💥 Erreur scan rapide après cache Radarr: {e}",
+                                exc_info=True,
+                            )
+
                         return
 
                     time.sleep(delay)

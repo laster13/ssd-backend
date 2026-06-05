@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 from typing import Any, List, Optional, Set
 
@@ -12,6 +13,12 @@ class AllDebridCacheClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.base_url = "https://api.alldebrid.com/v4.1"
+
+        # Proxy optionnel.
+        # Si ALLDEBRID_PROXY est vide ou absent, le comportement reste identique à avant.
+        # Exemple Oracle/WARP :
+        # ALLDEBRID_PROXY=socks5h://sfr-warp:1080
+        self.proxy = os.getenv("ALLDEBRID_PROXY") or None
 
     def extract_info_hash(self, value: Any) -> Optional[str]:
         """
@@ -132,8 +139,23 @@ class AllDebridCacheClient:
 
         endpoint = f"{self.base_url}/magnet/upload"
 
+        client_kwargs = {
+            "timeout": 30.0,
+        }
+
+        if self.proxy:
+            client_kwargs["proxy"] = self.proxy
+            logger.info(
+                "AllDebrid - Proxy actif pour vérification cache : %s",
+                self.proxy,
+            )
+        else:
+            logger.info(
+                "AllDebrid - Aucun proxy actif pour vérification cache"
+            )
+
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(**client_kwargs) as client:
                 for item in unique_values:
                     info_hash = item["hash"]
                     display_name = item["name"]

@@ -43,7 +43,7 @@ requests = "^2.32.4"
 pyyaml = "^6.0.2"
 psutil = "^7.0.0"
 starlette = "0.46.0"
-httpx = "^0.28.1"
+httpx = {extras = ["socks"], version = "^0.28.1"}
 docker = "^7.1.0"
 python-jose = {extras = ["cryptography"], version = "^3.5.0"}
 sqlalchemy = "^2.0.43"
